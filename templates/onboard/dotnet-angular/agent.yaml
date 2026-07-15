@@ -1,0 +1,33 @@
+# agent.yaml — .NET + Angular onboarding template (ADR-0038, issue #191).
+#
+# A WORKED example for a .NET backend + Angular (nx) frontend monorepo — the shape of the
+# `acme/example-monorepo` target. Copy to your target repo's `.ralph/agent.yaml` and
+# edit. Strict zod (src/container/agent-contract.ts): unknown keys rejected, every field required.
+#
+# Pair it with `.ralph/agent.Dockerfile` (in this directory) and a `.dockerignore`. The .NET SDK
+# version is pinned in the repo's own `global.json` (this template installs that toolchain).
+
+# Build the solution after a restore.
+build: dotnet build
+
+# The test command the onboarding smoke-test and agents run. A monorepo with a separate Angular
+# client typically runs its frontend tests separately (e.g. `cd client && npm test` / `nx test`);
+# wrap both in a script and point `test` at it if you want one command to cover the whole repo.
+test: dotnet test
+
+# Restore dependencies — central package management resolves from Directory.Packages.props.
+restore: dotnet restore
+
+# Dependency manifests whose contents key the L2 deps-layer cache (ADR-0038). For .NET central
+# package management the versions live in Directory.Packages.props (+ global.json pins the SDK);
+# the Angular client is keyed on its own lockfile. A change to any of these rebuilds the deps
+# layer.
+depManifests:
+  - global.json
+  - Directory.Packages.props
+  - "**/*.csproj"
+  - client/package.json
+  - client/package-lock.json
+
+# The branch a PR for this target targets.
+baseBranch: master

@@ -1,0 +1,27 @@
+# agent.yaml — Node/TypeScript onboarding template (ADR-0038, issue #191).
+#
+# Copy this to your target repo's `.ralph/agent.yaml` and edit. It declares how the daemon's
+# per-run agent container builds, tests, and restores your repo, the dependency manifests that
+# key the L2 deps-layer cache, and the branch a PR targets. Strict zod
+# (src/container/agent-contract.ts): unknown keys are rejected, every field below is required.
+#
+# Pair it with `.ralph/agent.Dockerfile` (in this directory) and a `.dockerignore`.
+
+# Build after deps are restored. Adjust to your build script (or `tsc -p .`).
+build: npm run build
+
+# The test command the onboarding smoke-test and agents run.
+test: npm test
+
+# Restore dependencies — re-run on a manifest change; warmed into the L2 cache layer.
+restore: npm ci
+
+# Dependency manifests whose contents key the L2 deps-layer cache. A change to any of these
+# rebuilds the deps layer (ADR-0038). At least one is required. Use the lockfile your repo
+# actually commits (package-lock.json / yarn.lock / pnpm-lock.yaml).
+depManifests:
+  - package.json
+  - package-lock.json
+
+# The branch a PR for this target targets (e.g. main, master).
+baseBranch: main

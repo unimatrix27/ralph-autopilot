@@ -1,0 +1,14 @@
+# Build context excludes for the L0 ralph/agent-base build (Dockerfile.agent-base).
+# Keeps the context small and — critically — never ships the HOST node_modules/dist into the
+# image (node_modules is rebuilt by `npm ci` for the image's own platform; dist is rebuilt by
+# `npm run build:daemon`). Only build inputs (package*.json, tsconfig.json, src) are COPYed in.
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+web
+.wt
+.ralph
+.target-repo
+*.log

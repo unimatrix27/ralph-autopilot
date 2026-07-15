@@ -1,0 +1,93 @@
+# syntax=docker/dockerfile:1
+#
+# L0 — ralph/agent-base (ADR-0038 §"Layered per-target images (L0→L3)").
+#
+# The ralph-shipped base every per-target agent image builds `FROM`. It carries Node, the
+# `claude` CLI, and the thin in-container runner (`ralph-runner`) that hosts one agent run
+# inside the container. L1 (target toolchain) does `FROM ralph/agent-base:<ver>`; L2 bakes the
+# target's deps; L3 is the fresh per-run clone (ADR-0038). This image is target-INDEPENDENT.
+#
+# Proven by the Gate A / Gate B real-environment runs (#185/#187/#188): a container built from
+# this recipe authenticates Claude headless (OAuth, no API key), clones/pushes/opens PRs, and
+# drives the escalate→answer→resume HITL loop end-to-end.
+#
+# CLAUDE ONLY (this version). The `claude` CLI ships via the Agent SDK's vendored platform
+# binary (installed by `npm ci`, below). The `codex` CLI that ADR-0038 lists for L0 is a
+# deliberate FOLLOW-UP (issue #210): `@openai/codex-sdk` is not yet a tracked runtime dep,
+# Codex is dormant in the box config (everything routes to Claude, ADR-0033/0034), and
+# Codex-in-Docker hits the unsolved bubblewrap sandbox landmine. It lands once the rest of the
+# container path is running — not baked as dead weight now.
+FROM node:24-bookworm
+
+# git + the GitHub CLI: the runner clones/pushes runner-direct and opens/updates PRs and posts
+# `ralph-question` comments via `gh` (ADR-0038 boundary split; #187).
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Plain `npm ci` (NOT --ignore-scripts): the native postinstalls are load-bearing — it compiles
+# better-sqlite3's native addon and installs the @anthropic-ai/claude-agent-sdk-<platform>
+# binary the SDK spawns as `claude`. node:24-bookworm (non-slim) ships the python3 + build
+# toolchain node-gyp needs. (Built natively for the image's own arch — no --platform.)
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Build inputs only — never node_modules (would clobber the linux install above; see .dockerignore).
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build:daemon
+
+# uid PIN (Gate A/B finding, issue #210 / #194). The agent user MUST be uid 1000 (the host
+# creds-owner uid) AND resolve to home /home/ralph (docker-runner.ts hardcodes
+# CONTAINER_HOME=/home/ralph and bind-mounts the :ro 0600 ~/.claude there). A naïve
+# `useradd -o -u 1000 ralph` does NOT work: -o collides with node:24-bookworm's existing
+# uid-1000 `node` user, so getpwuid(1000)/$HOME/os.homedir() resolve to /home/node and the SDK
+# reads creds from the wrong home -> "Not logged in". Delete node, then own uid 1000 as ralph.
+RUN userdel -r node 2>/dev/null || true \
+ && useradd -u 1000 -m -d /home/ralph ralph
+
+# uv/uvx: the launcher for python-based stdio MCP servers, should the config-owned defs
+# (issue #264) ever name one. Copied from the official distroless uv image — static binaries,
+# nothing else to bootstrap. (Serena, the original reason for this layer, was replaced by the
+# baked codebase-memory-mcp binary below in #276; uvx stays as the generic python launcher.)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# codebase-memory-mcp (issue #276): the symbol/structure-navigation MCP server, replacing
+# serena's per-start `uvx --from git+…` fetch with a version-PINNED, checksum-VERIFIED static
+# binary — no network at container start, no unpinned git HEAD in the supply chain. The
+# PORTABLE build is deliberate: the standard build links glibc 2.38/GLIBCXX 3.4.32, newer
+# than bookworm's 2.36, and dies at load; portable is the older-glibc-compatible build. amd64-only
+# by design (the box is amd64): the `uname -m` assert makes a wrong-arch build fail loud here
+# instead of baking a dead binary that every MCP session then fails to spawn.
+RUN test "$(uname -m)" = "x86_64" \
+ && curl -fsSL -o /tmp/cbm.tar.gz \
+      https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.9.0/codebase-memory-mcp-linux-amd64-portable.tar.gz \
+ && echo "8459d5c9d1457f2c82de3de307ffc7641ecbba2dde893427be1e62eca8ef9b25  /tmp/cbm.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/cbm.tar.gz -C /tmp \
+ && install -m 0755 /tmp/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp \
+ && rm -rf /tmp/cbm.tar.gz /tmp/codebase-memory-mcp /tmp/install.sh
+
+USER ralph
+
+# Index the workspace on first MCP connection (#276): every run is a fresh clone in a fresh
+# container, so without auto_index the graph would stay empty until the agent thought to call
+# the index tool itself. Indexing is milliseconds-fast; doing it at session start makes the
+# structural tools live from the first query.
+RUN codebase-memory-mcp config set auto_index true
+
+# Warm the ralph user's npx cache with the npx-launched stdio MCP servers (morph-mcp,
+# context7), so a fresh container's first `npx -y <pkg>` is a cache hit instead of a
+# registry fetch. `npm exec --package … -- node -e` installs into ~/.npm/_npx without
+# actually starting the servers (they would block on stdio).
+RUN npm exec --yes --package=@morphllm/morphmcp -- node -e "process.exit(0)" \
+ && npm exec --yes --package=@upstash/context7-mcp -- node -e "process.exit(0)"
+
+# The in-container runner entrypoint. Reads its dispatch from $RALPH_CONTAINER_DISPATCH; with it
+# unset it prints a clear error and exits 1.
+ENTRYPOINT ["node", "/app/dist/bin/ralph-runner.js"]

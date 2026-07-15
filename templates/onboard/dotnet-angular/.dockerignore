@@ -1,0 +1,12 @@
+# Build-context excludes for a .NET + Angular target's agent image. Keeps the context small and
+# never ships host build artifacts into the image (deps are re-restored; the code is a fresh
+# per-run clone, not baked).
+.git
+**/bin
+**/obj
+**/node_modules
+**/dist
+client/.angular
+client/.nx
+TestResults
+*.log

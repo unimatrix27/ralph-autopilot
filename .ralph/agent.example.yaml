@@ -1,0 +1,26 @@
+# .ralph/agent.example.yaml — the target onboarding contract (ADR-0038, epic #182).
+#
+# This file lives in the TARGET repo (NOT in the daemon's per-deployment .ralph/config.yaml),
+# versioned with the target's own code. It declares how to build, test, and restore the target
+# in-container, the dependency manifests that key the L2 deps-layer cache, and the branch a PR
+# targets. Validated with strict zod (ADR-0010): unknown keys are rejected, every field below
+# is required. Pair it with a `.ralph/agent.Dockerfile` (`FROM ralph/agent-base` + the target's
+# L1 toolchain) and a `.dockerignore`.
+
+# Build the target after deps are restored.
+build: dotnet build
+
+# The test command agents and the onboarding smoke-test run.
+test: dotnet test
+
+# Restore dependencies. Baked into the cached L2 layer; re-run on a manifest change.
+restore: dotnet restore
+
+# Dependency manifests whose contents key the L2 deps-layer cache. A change to any of these
+# invalidates the cache and rebuilds the deps layer (ADR-0038). At least one is required.
+depManifests:
+  - "Directory.Packages.props"
+  - "**/*.csproj"
+
+# The branch a PR for this target targets.
+baseBranch: master

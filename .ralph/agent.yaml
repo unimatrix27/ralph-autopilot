@@ -1,0 +1,29 @@
+# .ralph/agent.yaml — ralph-autopilot's OWN target onboarding contract (ADR-0038, issue #191).
+#
+# This sits beside `.ralph/config.yaml` but is DISTINCT from it: `config.yaml` is the daemon's
+# per-deployment config; THIS file is the container contract for *ralph-autopilot-as-a-target* —
+# how to build, test, and restore this repo inside its per-run agent container, plus the
+# dependency manifests that key the L2 deps-layer cache and the branch a PR targets. Versioned
+# with the code so it evolves with the codebase, not in the daemon's config.
+#
+# Validated by `src/container/agent-contract.ts` with strict zod (ADR-0010): unknown keys are
+# rejected and every field below is required. Pair: `.ralph/agent.Dockerfile`
+# (`FROM ralph/agent-base` + this repo's L1/L2) and the repo-root `.dockerignore`.
+
+# Build after deps are restored (`tsc -> dist/` for the daemon + the web workspace).
+build: npm run build
+
+# The test command the onboarding smoke-test and agents run (vitest, the CI gate).
+test: npm test
+
+# Restore dependencies — re-run on a manifest change; baked/cache-warmed into the L2 layer.
+restore: npm ci
+
+# Dependency manifests whose contents key the L2 deps-layer cache (ADR-0038). A change to any of
+# these invalidates the cache and rebuilds the deps layer.
+depManifests:
+  - package.json
+  - package-lock.json
+
+# The branch a PR for this target targets.
+baseBranch: main

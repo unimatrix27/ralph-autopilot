@@ -1,0 +1,480 @@
+# ralph-autopilot configuration — copy to .ralph/config.yaml and edit.
+#
+# Every knob below is documented. Values shown for keys with a default are the
+# defaults; required keys (no default) are marked. Loaded and validated by
+# src/config/load.ts against the zod schema in src/config/schema.ts — unknown
+# keys are rejected, so a typo fails loud rather than being silently ignored.
+
+# REQUIRED. The repos the daemon operates *on*, each scheduled independently but
+# sharing the ONE global agent budget (scheduler.maxConcurrentAgents) and the one
+# SQLite store. Each entry needs at minimum a `repo` slug and build/test commands;
+# every other per-target key overrides the daemon-wide default below it.
+targets:
+  # The daemon's own repo (self-improvement / dogfood). Every agent runs in a fresh per-target
+  # container (ADR-0038 / #227); there is no in-process alternative, so there is no execution-mode
+  # knob to set — the target just needs to be onboarded + smoke-tested first.
+  - repo: unimatrix27/ralph-autopilot
+    commands:
+      build: npm run build
+      test: npm test
+    # paths default to .target-repo/<owner>-<repo> and .wt/<owner>-<repo>, so two
+    # targets never share a clone or worktree root. Override only if you must:
+    # paths:
+    #   targetClone: .target-repo/ralph-autopilot
+    #   worktreeRoot: .wt/ralph-autopilot
+
+  # The product repo.
+  - repo: acme/example-monorepo
+    commands:
+      build: <build command for example-monorepo>
+      test: <test command for example-monorepo>
+    # Per-target overrides of the global defaults are optional, e.g.:
+    # priorityLabels: [priority/p0, priority/p1]
+    # merge:
+    #   ciTimeoutMinutes: 45
+    # agent:
+    #   model: opus
+    # Every target runs in a fresh, ephemeral per-target Docker container (ADR-0038 / #227) — it
+    # must be onboarded + smoke-tested first (see docs/runbooks/container-onboarding.md). There is
+    # no in-process alternative and no `executionMode` knob.
+
+# Filesystem locations (global).
+paths:
+  # SQLite file holding rebuildable runtime state, shared across all targets.
+  # Parent dirs are created automatically on first open.
+  database: .ralph/ralph.sqlite
+
+# How the reconciler schedules agents.
+scheduler:
+  # Maximum number of agents running concurrently ACROSS ALL TARGETS. Purely the
+  # operator's plan budget — the repos compete for this one shared pool.
+  maxConcurrentAgents: 5
+  # Seconds between reconcile ticks (desired-state vs actual-state diff).
+  reconcileIntervalSeconds: 30
+  # Labels used as FIFO tie-breakers when filling slots, highest priority first.
+  # Empty means pure FIFO by issue age. A target may override this with its own
+  # `priorityLabels`.
+  priorityLabels: []
+  # Ceiling (seconds) on a graceful drain (SIGTERM/SIGINT or `ralph-daemon
+  # --drain`): how long to let in-flight agents finish review + merge before
+  # force-exiting and surfacing whatever was still running. A backstop for a
+  # genuine hang; a second signal forces an immediate stop. Default one hour.
+  drainTimeoutSeconds: 3600
+  # Liveness backstop (issue #27): an in-flight run whose row has not advanced in
+  # this many seconds is wedged (the per-session wall-clock failed to settle it) and
+  # is surfaced as a `daemon-anomaly` for a human. Must exceed agent.wallClockSeconds;
+  # the default (6h) is well beyond any single session. Set 0 to disable the backstop.
+  maxRunLifetimeSeconds: 21600
+
+# Claude USAGE-LIMIT guard (shared across all targets — one OAuth plan budget).
+# The daemon reads the SDK's live plan rate-limit windows (the 5-hour rolling window
+# and the weekly windows) and stops admitting NEW agents while any window is at/above
+# `admitBelowPercent`, OR while a hit-limit cooldown is active (tripped when a session
+# aborts with "you've hit your session limit · resets …", paused until that reset).
+# This prevents the backlog being converted to `agent-stuck` when the plan is
+# exhausted; the limit is transient, so admission self-heals when the window resets.
+# In-flight work is never interrupted — only new pickups are gated.
+usageLimit:
+  enabled: true            # on by default; a single shared safeguard, not per-target
+  admitBelowPercent: 85    # admit nothing new once any plan window hits this utilization
+  # Dual-subscription rotation (ADR-0028). Run the daemon across MORE THAN ONE Claude
+  # OAuth login so it switches to a fresh plan budget instead of pausing when one is
+  # exhausted. Each entry is a stable id + the CLAUDE_CONFIG_DIR that login's
+  # `claude login` wrote — NOT a token (the credential lives on disk in that dir, so
+  # nothing secret goes in this file). New sessions bind to the active login; the
+  # daemon flips to another when the active one hits admitBelowPercent / a cooldown,
+  # or when rotateEveryMinutes elapses, and defers only when ALL are exhausted.
+  # Omit the block (or give one entry) for the box-default single-login behaviour.
+  # Set up each store once:  CLAUDE_CONFIG_DIR=~/.claude-b claude   then  /login
+  #
+  # ADR-0037: these logins are the CLAUDE SLICE of the general `accounts` pool below —
+  # each `{ id, configDir }` here normalises to an `{ id, provider: claude, configDir }`
+  # account. Keep using this block as-is (nothing to migrate), or list the same logins
+  # under `accounts:` directly; do not list a login in BOTH (a duplicate id fails loud).
+  # subscriptions:
+  #   - { id: a, configDir: ~/.claude }      # the existing box login
+  #   - { id: b, configDir: ~/.claude-b }    # a second `claude login`
+  # rotateEveryMinutes: 60                    # optional even-wear rotation timer
+
+# The ACCOUNT POOL (ADR-0037). A flat, arbitrary registry of CREDENTIALS — the unit of
+# the pool — N per provider, including zero. Each account is `{ id, provider, <auth> }`
+# and MODEL-FREE: the model travels with a route entry, never the account, so one
+# credential serves many models. Auth is provider-shaped: `configDir` (claude — the
+# CLAUDE_CONFIG_DIR store), `codexHome` (openai — the CODEX_HOME dir), `authTokenEnv`
+# (zai — the NAME of the env var holding the API key, never the key itself). `id` is a
+# stable handle, unique across the whole pool. Daemon-wide (a credential is a box
+# credential, not per-target). Empty by default; the legacy usageLimit.subscriptions
+# logins above fold in automatically as the claude slice — list them here only if you
+# prefer one place (and then drop them from usageLimit.subscriptions). The single-block
+# `providers.openai.codexHome` / `providers.zai.authTokenEnv` fold in the same way (their
+# back-compat single-account slices). The pool is the single credential source for ALL
+# providers: route resolution reads it at every agent start (ADR-0037 P2.2).
+#
+# CAVEAT (today): for CLAUDE, listing N logins here gives full ADR-0028 rotation/failover.
+# For z.ai/openai, per-account rotation + headroom failover land in a later ADR-0037 slice —
+# until then route resolution binds only the FIRST pool account per provider, so a second
+# z.ai/Codex account is defined-but-unused (when the head account is rate-limited the daemon
+# pauses that provider's work rather than rotating to the spare). Single-account configs are
+# exact parity.
+# accounts:
+#   - { id: claude-a, provider: claude, configDir: ~/.claude }
+#   - { id: claude-b, provider: claude, configDir: ~/.claude-b }
+#   - { id: zai-1,    provider: zai,    authTokenEnv: ZAI_API_KEY }
+#   - { id: zai-2,    provider: zai,    authTokenEnv: ZAI_API_KEY_2 }
+#   - { id: codex-1,  provider: openai, codexHome: ~/.codex-ralph }
+
+# Daemon-wide DEFAULTS. Any target may override any of these in its `agent`/`merge`/
+# `review`/`priorityLabels` block; an unset target key inherits the value here.
+
+# Per-agent execution limits and tooling.
+agent:
+  # Hard wall-clock ceiling per agent, in seconds. The daemon kills an agent
+  # that overruns and marks the issue agent-stuck. Default is one hour.
+  wallClockSeconds: 3600
+  # Cadence (seconds) of the impl-session heartbeat written to the run log, so
+  # the web control plane shows live progress during the long impl phase instead
+  # of a static row. Default is 30s.
+  heartbeatSeconds: 30
+  # Model + reasoning effort for every agent session (impl, review, fix).
+  model: opus
+  effort: xhigh
+  # The curated MCP set handed to each agent. Never includes `memory` —
+  # agents run with fresh context every time.
+  # Keep this set small: github is redundant with the baked `gh` CLI, and a
+  # thinking-scaffold MCP is redundant with native extended thinking.
+  mcpServers:
+    - codebase-memory
+    - morph-mcp
+    - context7
+  # Config-owned MCP server DEFINITIONS the curated names above resolve against (issue #264).
+  # These are the ONLY definitions that reach in-container sessions — the box ~/.claude.json is
+  # never mounted into a run container (and is read only at its top level on the box). A name
+  # defined both here and in ~/.claude.json resolves to this one; a curated name defined in
+  # neither is skipped, as before.
+  #
+  # `${workspace}` in args/env values is substituted per session with the run's working tree
+  # (the container's fresh /tmp clone, or the box worktree), for servers that need a project
+  # root. `env` values are literals: this file is operator-local + gitignored; keys placed here
+  # are visible to the agent, which is inherent — the agent's own MCP server consumes them.
+  # Launcher binaries (`uvx`, `npx`) must exist in the agent image (uv/uvx: base ≥0.0.1).
+  mcpServerDefs:
+    # Symbol/structure navigation (#276): the binary is BAKED into the agent image
+    # (base ≥0.0.4, version-pinned + checksum-verified — no network at container
+    # start). No args: run bare it serves stdio and indexes the session's working
+    # directory (auto_index is enabled in the image); its graph cache lives in
+    # ~/.cache/codebase-memory-mcp, outside the worktree.
+    codebase-memory:
+      command: /usr/local/bin/codebase-memory-mcp
+      args: []
+    morph-mcp:
+      command: npx
+      args: [-y, "@morphllm/morphmcp"]
+      env:
+        MORPH_API_KEY: "<your morph api key>"
+        ENABLED_TOOLS: edit_file
+    context7:
+      command: npx
+      args: [-y, "@upstash/context7-mcp"]
+  # Claude setting layers loaded per session (ADR-0019). ["project"] reads the
+  # TARGET repo's CLAUDE.md + .claude relative to the worktree, so a run honours
+  # that repo's own conventions. "user" is deliberately excluded so the operator's
+  # personal settings + auto-memory never leak into a run. (AGENTS.md is injected
+  # separately by the harness — the SDK does not auto-load it.)
+  settingSources:
+    - project
+  # Default LLM provider for every agent type (ADR-0033/0034): claude | openai | zai.
+  # Default `claude` keeps the daemon byte-for-byte unchanged. `openai` runs sessions
+  # through the Codex SDK on a ChatGPT-subscription OAuth login (NEVER an API key). `zai`
+  # runs z.ai/GLM behind an Anthropic-compatible endpoint on the *Claude* SDK path — the
+  # first provider authenticated by an API KEY (read from an env var, never stored here).
+  # Configure each under the top-level `providers.*` block below.
+  provider: claude
+  # Per-agent-type routing (impl | review | fix | autoMode). Empty by default → every type
+  # uses `provider` above. Each type takes EITHER a single `{ provider, model }` (the model
+  # optional) OR an ordered `(provider, model)` PREFERENCE LIST (ADR-0037): a ranking of
+  # providers tried in order, where the model travels WITH each entry (model ids aren't
+  # portable — `opus` is Claude-only, `glm-5.2` z.ai-only, `gpt-5.5` Codex-only). A per-type
+  # `model` overrides the provider's default (agent.model for claude, providers.openai.model
+  # for openai, providers.zai.model for zai); a claude-provider per-type model override is
+  # applied by swapping agent.model, mirroring the autoMode.model pattern. (Falling through
+  # to a later list entry at run time is a later ADR-0037 slice; today the head is wired.)
+  #
+  # RUNTIME-MUTABLE (ADR-0037 P4.1, #166): this `types` block is editable LIVE from the web
+  # control plane (POST /api/routing/edit) with NO daemon restart. An edit lands in an
+  # in-memory overlay route resolution reads each dispatch — effect is the NEXT agent start
+  # (an in-flight container finishes on the route it began with) — and is written through to
+  # THIS file, so it survives a restart. The capability gate is enforced on the edit (impl
+  # cannot be routed to a non-tools-capable provider). The rest of the config is still
+  # read-once-at-startup; only `agent.types` is live.
+  #
+  # CAPABILITY GATE (ADR-0037) — enforced at LOAD, fails loud naming the offending type:
+  #   - impl REQUIRES in-session escalate/stuck tools, so it routes only to TOOLS-CAPABLE
+  #     providers: claude + zai (z.ai rides the Claude SDK), NOT bare openai/Codex (#146).
+  #   - review / fix / autoMode require no tools → routable to ANY provider.
+  #   - A provider's `toolsCapable` override (under `providers.*`) shifts the gate.
+  #
+  # Example — run EVERYTHING on GLM (cheap): set the global provider, no per-type block:
+  # provider: zai
+  # Or mix — GLM on review + fixes (incl. thermo Phase 2), keep impl on Claude:
+  # types:
+  #   review: { provider: zai }
+  #   fix:    { provider: zai }
+  # Or put GPT on review/fix instead (impl stays claude):
+  # types:
+  #   review: { provider: openai }
+  #   fix:    { provider: openai }
+  # Or rank a preference list — try GLM first, fall back to GPT, then Claude:
+  # types:
+  #   review:
+  #     - { provider: zai,    model: glm-5.2 }
+  #     - { provider: openai, model: gpt-5.5 }
+  #     - { provider: claude }
+  #
+  # PER-PHASE routing (ADR-0037 #169) — review/fix ONLY. Instead of one list, give an
+  # object with a required `base` (applies to every phase with no override) plus optional
+  # `phase1` (normal review/fix) and `phase2` (the behaviour-preserving THERMO pass). Each
+  # value is a single entry or a preference list, exactly like above. The per-phase list
+  # REPLACES base for that phase (whole-list replacement, not append). Phase 0 is the CI
+  # gate (no agent) and uses `base`. impl/autoMode are single-phase — a base/phaseN key on
+  # them fails loud at LOAD. Common case — normal review on cheap GLM, bump only thermo to
+  # opus:
+  # types:
+  #   review:
+  #     base:   [{ provider: zai,    model: glm-5.2 }]   # required
+  #     phase2: [{ provider: claude, model: opus   }]    # only the thermo pass bumps
+  # This object form is equally RUNTIME-MUTABLE via POST /api/routing/edit (#166/#169).
+  #
+  # PER-COMPLEXITY-TIER agent profiles (issue #278) — impl ONLY. An operator-applied
+  # `complexity:1|2|3` label on an issue selects a per-tier PROFILE for its impl runs;
+  # LOWER = MORE DEMANDING (the priority:p0 convention): 1 = hard/architectural,
+  # 2 = standard, 3 = routine/mechanical. A tier is a profile, not just a route:
+  #   - routes           REPLACES the impl preference list whole (same semantics as the
+  #                      per-phase merge above; validated at load like any impl route)
+  #   - effort           overrides agent.effort for the run's session
+  #   - wallClockSeconds overrides agent.wallClockSeconds for the run
+  # Every field optional — an absent field inherits the global. An issue with NO
+  # complexity label runs on the globals (never an admission stall), and duplicate
+  # labels resolve to the most demanding tier. Review/fix are deliberately untouched:
+  # the review loop is what makes unattended merge safe (ADR-0014). Keys are strict —
+  # a "4" or a typo fails loud at load. Example:
+  # tiers:
+  #   "1": # hard → strongest model, biggest budget
+  #     routes: [{ provider: claude, model: claude-fable-5 }]
+  #     effort: max
+  #     wallClockSeconds: 10800
+  #   "2": # standard
+  #     routes: [{ provider: claude, model: claude-opus-4-8 }]
+  #   "3": # routine → cheap and quick
+  #     routes: [{ provider: zai }]
+  #     effort: medium
+  #     wallClockSeconds: 3600
+
+# Multi-provider connection settings (ADR-0033; extended ADR-0037). Holds per-provider
+# KIND settings that are NOT credentials (those live in `accounts:` above) and NOT
+# per-agent-type. For openai/zai this is the connection detail, only needed when an agent
+# type selects that provider (selecting it without the block fails loud at LOAD time). All
+# three providers also carry an optional `toolsCapable` flag (ADR-0037 capability gate):
+# whether an agent on that provider can invoke the in-session escalate/stuck tools. Derived
+# defaults — claude: true, zai: true, openai: false (bare Codex can't host those tools yet);
+# override per provider. The `claude` block is purely this override (claude is always
+# available; its credentials are box logins in the pool), so omit it to keep the default.
+# providers:
+#   # claude: { toolsCapable: true }   # the default; set false only to bar impl from Claude
+#   openai:
+#     # CODEX_HOME dir holding the ChatGPT-subscription auth.json (the CLAUDE_CONFIG_DIR
+#     # analog). Set it up once on a machine with a browser via `codex login`, then copy
+#     # auth.json onto the box — see docs/runbooks/openai-codex-auth.md. OPTIONAL back-compat
+#     # single-account slice (ADR-0037 P2.2): present → it folds into the `accounts:` pool as
+#     # the one openai account; for N Codex logins omit it and list explicit `accounts:`
+#     # entries instead. A selected openai with no account anywhere fails loud at LOAD.
+#     codexHome: ~/.codex-ralph
+#     # Default model for openai-provider sessions; a per-type model overrides it. A
+#     # ChatGPT-subscription Codex login accepts plain gpt-5.x ids ONLY — never the
+#     # `-codex`-suffixed ids (gpt-5.5-codex, gpt-5-codex), which are API-tier and 400
+#     # under the OAuth-only stance (ADR-0033, issue #138).
+#     model: gpt-5.5
+#     # Optional OpenAI-compatible gateway base URL.
+#     # baseUrl: https://...
+#     # In-session tools capability (ADR-0037). Bare Codex defaults false; flip to true
+#     # only once escalate/stuck are re-hosted as an out-of-process MCP server.
+#     # toolsCapable: false
+#   # z.ai (GLM) — Anthropic-compatible, API-KEY based (ADR-0034 amends ADR-0008/0033).
+#   # The ONLY API key the daemon handles. It is NOT stored here: set authTokenEnv to the
+#   # NAME of the env var holding the key, and export that var in the daemon's environment
+#   # (systemd `Environment=`, shell profile, etc.) — e.g. `export ZAI_API_KEY=...`.
+#   # Selecting `provider: zai` with no zai account anywhere, or with the env var unset/empty,
+#   # fails loud at LOAD time.
+#   zai:
+#     # NAME of the env var holding the z.ai API key — never the key itself. OPTIONAL
+#     # back-compat single-account slice (ADR-0037 P2.2): present → folds into the `accounts:`
+#     # pool as the one zai account; for N z.ai keys omit it and list explicit `accounts:`.
+#     authTokenEnv: ZAI_API_KEY
+#     # Default GLM model; a per-type `model` overrides it. GLM-5.2 is tuned for
+#     # Claude-Code-style agentic loops. For the 1M-context variant use: glm-5.2[1m]
+#     model: glm-5.2
+#     # Anthropic-compatible base URL (default shown).
+#     # baseUrl: https://api.z.ai/api/anthropic
+#     # In-session tools capability (ADR-0037). z.ai rides the Claude SDK, so it defaults
+#     # true; override only for a fidelity-gated proxy variant.
+#     # toolsCapable: true
+
+# The two-phase review loop.
+review:
+  # Fix attempts allowed per review phase before the phase is review-maxed
+  # and a heal-card is surfaced.
+  maxFixAttempts: 3
+  # Bounded daemon-side re-dispatches when a review/fix container produces NO
+  # result because of an infra fault (a dropped pipe / killed / un-started
+  # container) — counted separately from maxFixAttempts, so a transient
+  # `docker run` hiccup self-heals instead of maxing the phase out with a
+  # (misleading) heal-card. 0 disables retry (terminalize on the first no-result).
+  maxContainerRetries: 2
+
+# Auto-mode — the moding pass (ADR-0021). The eligibility gate requires a mode:*
+# label; an issue marked ready-for-agent + afk but never stamped with a mode is
+# excluded (no-mode) and the backlog stalls. When enabled, a bounded pass each tick
+# finds the issues the gate rejects SOLELY for a missing mode, classifies each as
+# tdd or infra with a fresh-context SDK call, and applies the label so it becomes
+# eligible next tick. It only fills the missing label on issues a human already
+# marked ready (it does NOT auto-triage what gets worked); the tdd/infra rubric is
+# the harness's (target conventions are context, not a gate); it runs off the build
+# pool, capped at maxPerTick; an undecidable issue is left unmoded + logged, never
+# guess-labelled and never a daemon-anomaly. OFF by default — opt a target in via
+# its own `autoMode` block (deep-merged over this default, like agent/merge/review).
+autoMode:
+  # Master switch. Off by default; enable per target.
+  enabled: false
+  # Maximum issues classified per tick (a small default so a large unmoded backlog
+  # can't stampede the SDK or the plan budget — the rest wait for later ticks).
+  maxPerTick: 3
+  # Optional model for the (short) classification call; defaults to agent.model.
+  # model: opus
+
+# Harness-owned, CI-gated, rebase-aware merge (ADR-0014). The harness owns the
+# gate: it awaits CI green BEFORE review (Phase 0), runs the two review phases,
+# rebases the branch onto base, re-awaits CI if the branch moved, then merges
+# directly. On a repo with no checks the CI waits are no-ops (merges immediately).
+merge:
+  # Merge strategy passed to `gh pr merge`: squash | merge | rebase.
+  method: squash
+  # Await CI green before review and before merge. Set false to skip the CI gate
+  # (e.g. a target with no CI where you also want to skip the polling round-trip).
+  waitForChecks: true
+  # Minutes to wait for CI to reach a terminal state before giving up (→ review-maxed).
+  ciTimeoutMinutes: 30
+  # Seconds between `gh pr checks` polls while awaiting CI.
+  pollIntervalSeconds: 30
+  # Delete the head branch after a successful merge.
+  deleteBranch: true
+
+# Daemon self-update (issue #30, ADR-0018). When enabled the daemon polls its OWN
+# repo for new commits on `branch`, gracefully drains in-flight work, then exits
+# the restart code (75) so a supervisor pulls + builds + relaunches it. OFF by
+# default — only enable it when the daemon runs under ops/ralph-supervisor.sh
+# (see docs/SELF-UPDATE.md). A bare daemon that exits 75 with no supervisor stops.
+# Independent of which targets the daemon works (it tracks the daemon's own repo).
+selfUpdate:
+  # Master switch. Off by default; turn on only under the supervisor.
+  enabled: false
+  # Run the update check every N reconcile ticks (~5 min at the default 30s tick).
+  checkEveryTicks: 10
+  # The daemon's own branch to track (compared against origin/<branch>).
+  branch: main
+  # Hard ceiling (seconds) on the self-update drain before a forced restart. Once
+  # draining the daemon restarts the instant it is idle; if an agent hangs it
+  # restarts anyway after this, and the next startup rehydrates in-flight work
+  # from GitHub (ADR-0003), so nothing is abandoned.
+  drainTimeoutSeconds: 1800
+  # Path to the daemon's own git checkout (where `git fetch`/compare runs).
+  # Defaults to the process working directory the supervisor launches from.
+  repoDir: .
+
+# Structured logging.
+logging:
+  # Minimum level emitted: debug | info | warn | error.
+  level: info
+  # Optional path to also write log lines to a file. Omit for stdout only.
+  # file: .ralph/ralph.log
+
+# The embedded web control plane (ADR-0029/0031/0032). An HTTP server running
+# INSIDE the daemon process (not a sidecar) that serves the built SPA. It is an
+# isolated edge: the reconcile tick never awaits it and it reads only through
+# ports, so a web fault can never wedge the daemon. Bound to loopback by default
+# and reached remotely over Tailscale (single-user tailnet = identity; no managed
+# auth — a pluggable auth seam is reserved in front of write routes).
+web:
+  # Master switch. On by default; set false to run the daemon fully headless.
+  enabled: true
+  # Bind address. Loopback by default. Set to a Tailscale IP (or 0.0.0.0 behind
+  # the tailnet firewall) to reach the UI from a laptop/phone — doing so logs a
+  # loud exposure warning, since nothing managed authenticates in front of it.
+  host: 127.0.0.1
+  # TCP port the SPA + API are served on.
+  port: 4280
+  # Directory holding the built SPA (Vite output), served statically with an
+  # SPA fallback to index.html. Resolved against the daemon's working directory.
+  # The UI is in the build gate (ADR-0018/0031) so a real deployment always has
+  # this; if it is missing the server still starts and serves a placeholder.
+  staticDir: web/dist
+  # Extra origins the Origin guard accepts on mutating routes (confused-deputy
+  # hygiene). The served SPA's own origin is always allowed; add entries only if
+  # you front the UI from another host.
+  allowedOrigins: []
+
+# Agent transcript capture + retention (ADR-0030). Every impl/resume/review/fix/
+# moding session's SDK messages are captured (redacted) onto a dedicated per-run
+# stream `transcript:<repo>#<issue>:<runId>` — the verbose, two-tier companion to
+# the permanent domain timeline. CAPTURE IS ALWAYS ON (transcripts are owned data,
+# not an SDK-internal artifact); only the retention budget for the verbose tier is
+# configurable. Pruning is oldest-first and leaves a "transcript pruned" marker;
+# the domain timeline is never pruned.
+transcript:
+  # Prune a run's verbose transcript once its newest message ages past this many days.
+  retentionDays: 30
+  # Optional total size cap (MB) across all un-pruned transcripts; when exceeded the
+  # oldest runs are pruned first until back under the cap. Omit → age is the only budget.
+  # maxTotalMb: 2048
+  # Run the retention prune every N reconcile ticks (the grouped scan is cheap, so it
+  # need not run every tick). At the default 30s tick, 120 ≈ once an hour.
+  pruneEveryTicks: 120
+
+# Out-of-app notification sink (issue #117). An edge module subscribed to the same
+# after-commit event stream as the live SSE feed (ADR-0029) fires best-effort ntfy /
+# webhook notifications when the daemon needs the operator and the UI is not open: a
+# new escalation / heal / stuck, a daemon-anomaly, and a stalled daemon. Dispatch is
+# fire-and-forget — it never blocks or awaits inside the reconcile tick. OFF BY
+# DEFAULT: notifications push data to an external endpoint, so they are opt-in.
+notifications:
+  enabled: false
+  # One or more delivery endpoints. Each notification is POSTed to every endpoint
+  # (fan-out, best-effort). `ntfy` POSTs the message text with Title/Priority/Tags
+  # headers (the ntfy.sh protocol); `webhook` POSTs a JSON payload. An empty list
+  # with enabled: true is a valid no-op (the sink runs but dispatches nowhere).
+  endpoints: []
+  # Example:
+  # endpoints:
+  #   - kind: ntfy
+  #     url: https://ntfy.sh/ralph-alerts
+  #     # NAME of an env var holding a bearer token (never the token itself) — optional.
+  #     tokenEnv: NTFY_TOKEN
+  #   - kind: webhook
+  #     url: https://hooks.example.com/ralph
+  # Liveness backstop: notify when no reconcile tick has landed for this many seconds.
+  # 0 disables the stall probe. Default 5 min — well past two tick intervals, so a
+  # single slow tick never false-fires.
+  stallSeconds: 300
+  # Web Push (issue #119): the PWA's native push channel — another delivery target for
+  # the same escalation/anomaly/stall events. Subscriptions are registered from the
+  # installable PWA UI and persisted; this block only carries the VAPID identity.
+  # Requires notifications.enabled: true above (the sink must run). `endpoints: []`
+  # with webpush.enabled: true is a valid push-only setup. OFF BY DEFAULT.
+  webpush:
+    enabled: false
+    # Contact URI for the push services (VAPID `sub` claim) — required when enabled.
+    # A mailto: address is the norm.
+    # subject: mailto:operator@example.com
+    # NAME of the env var holding the VAPID private key (base64url 32-octet P-256
+    # scalar — NOT the key itself). Generate one and export it, e.g.:
+    #   export RALPH_VAPID_PRIVATE_KEY="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
+    # The matching public key is derived and served to the browser at /api/webpush/vapid.
+    # privateKeyEnv: RALPH_VAPID_PRIVATE_KEY

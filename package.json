@@ -1,0 +1,51 @@
+{
+  "name": "ralph-autopilot",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Locally-running daemon that autonomously implements GitHub issues end-to-end across one or more target repositories.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "web"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "ralph-answer": "dist/bin/ralph-answer.js",
+    "ralph-daemon": "dist/bin/ralph-daemon.js",
+    "ralph-onboard": "dist/bin/ralph-onboard.js",
+    "ralph-runner": "dist/bin/ralph-runner.js"
+  },
+  "scripts": {
+    "build": "npm run build:daemon && npm run build:web",
+    "build:daemon": "tsc -p tsconfig.json",
+    "build:web": "npm run build --workspace web",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck --workspace web",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "web:dev": "npm run dev --workspace web",
+    "ralph-answer": "node dist/bin/ralph-answer.js",
+    "ralph-daemon": "node dist/bin/ralph-daemon.js",
+    "ralph-onboard": "node dist/bin/ralph-onboard.js",
+    "ralph-runner": "node dist/bin/ralph-runner.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.183",
+    "@event-driven-io/emmett": "0.42.3",
+    "@event-driven-io/emmett-sqlite": "0.42.3",
+    "better-sqlite3": "^11.8.1",
+    "yaml": "^2.7.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.141.0"
+  }
+}

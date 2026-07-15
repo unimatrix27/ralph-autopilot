@@ -1,0 +1,110 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens (ADR-0031) — established before any feature component so nothing is
+ * one-off styled. Dark-first: the dark palette is the default theme (the app boots
+ * with `class="dark"` on <html>); the light palette is available by removing it.
+ * This palette belongs to the web control plane, not the retired Ink UI.
+ *
+ * The `--status-*` tokens are the semantic status palette mapped to the daemon's
+ * label state machine (see src/lib/status.ts):
+ *   eligible  → ready-for-agent (queued)        running  → in-flight agent
+ *   waiting   → awaiting-ci / awaiting-merge     attention→ awaiting-answer (HITL)
+ *   danger    → review-maxed / agent-stuck / daemon-anomaly
+ *   success   → merged + issue closed
+ */
+
+@layer base {
+  /* Light theme (available; not the default). */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 32% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 32% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 32% 12%;
+
+    --primary: 221 83% 53%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 32% 18%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 220 14% 94%;
+    --accent-foreground: 222 32% 18%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 220 13% 90%;
+    --input: 220 13% 90%;
+    --ring: 221 83% 53%;
+
+    --status-eligible: 215 16% 47%;
+    --status-eligible-foreground: 210 40% 98%;
+    --status-running: 217 91% 60%;
+    --status-running-foreground: 210 40% 98%;
+    --status-waiting: 38 92% 50%;
+    --status-waiting-foreground: 26 83% 14%;
+    --status-attention: 262 83% 58%;
+    --status-attention-foreground: 210 40% 98%;
+    --status-danger: 0 72% 51%;
+    --status-danger-foreground: 210 40% 98%;
+    --status-success: 142 71% 45%;
+    --status-success-foreground: 144 80% 10%;
+
+    --radius: 0.6rem;
+  }
+
+  /* Dark theme — the default (see <html class="dark">). */
+  .dark {
+    --background: 222 30% 7%;
+    --foreground: 213 31% 91%;
+
+    --card: 222 28% 10%;
+    --card-foreground: 213 31% 91%;
+    --popover: 222 30% 9%;
+    --popover-foreground: 213 31% 91%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 222 20% 16%;
+    --secondary-foreground: 213 31% 91%;
+    --muted: 222 20% 15%;
+    --muted-foreground: 218 11% 60%;
+    --accent: 222 20% 18%;
+    --accent-foreground: 213 31% 91%;
+    --destructive: 0 63% 50%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 222 18% 20%;
+    --input: 222 18% 22%;
+    --ring: 217 91% 60%;
+
+    --status-eligible: 215 20% 65%;
+    --status-eligible-foreground: 222 47% 11%;
+    --status-running: 213 94% 68%;
+    --status-running-foreground: 222 47% 11%;
+    --status-waiting: 41 96% 60%;
+    --status-waiting-foreground: 26 83% 14%;
+    --status-attention: 258 90% 72%;
+    --status-attention-foreground: 222 47% 11%;
+    --status-danger: 0 72% 60%;
+    --status-danger-foreground: 222 47% 11%;
+    --status-success: 142 69% 58%;
+    --status-success-foreground: 144 80% 10%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    -webkit-font-smoothing: antialiased;
+  }
+}

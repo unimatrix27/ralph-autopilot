@@ -1,0 +1,20 @@
+# no trailing slash: `node_modules/` matches only a DIRECTORY, so a node_modules
+# SYMLINK (e.g. linked into a throwaway worktree) slips past `git add -A` and, once
+# committed, materializes on the live checkout as a self-pointing ELOOP that fails
+# the supervisor's build gate (quarantined d9b87d3d, 2026-07-05).
+node_modules
+dist/
+*.log
+.env
+*.sqlite
+*.sqlite-*
+.wt/
+# local runtime: per-operator config + the daemon's local clone of the target
+.ralph/config.yaml
+.ralph/daemon.pid
+.ralph/tmp/
+# self-update coordination record (supervisor writes, daemon reads/clears, #30)
+.ralph/quarantine
+.target-repo/
+# local Serena MCP tooling scaffolding (auto-generated per-operator; not repo state)
+.serena/

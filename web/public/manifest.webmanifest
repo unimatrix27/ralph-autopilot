@@ -1,0 +1,27 @@
+{
+  "name": "ralph-autopilot control plane",
+  "short_name": "ralph-autopilot",
+  "description": "The operator control plane for the ralph-autopilot daemon — liveness, the queue, live runs, and the escalation inbox.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "categories": ["developer-tools", "productivity"],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

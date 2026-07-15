@@ -1,0 +1,10 @@
+# Build-context excludes for a Node target's agent image. Keeps the context small and never
+# ships host build artifacts into the image (deps are re-warmed by the agent.Dockerfile; the
+# code is a fresh per-run clone, not baked).
+.git
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+*.log

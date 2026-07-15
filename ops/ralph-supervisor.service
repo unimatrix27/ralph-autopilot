@@ -1,0 +1,55 @@
+# systemd unit template for the self-updating ralph-autopilot daemon (issue #30).
+#
+# The supervisor (ops/ralph-supervisor.sh) owns pull + build + relaunch and the
+# build-gate / rollback; systemd's job is only to keep the SUPERVISOR alive. Two
+# layers, on purpose: the supervisor restarts the daemon smartly (drain-aware,
+# build-gated); systemd restarts the supervisor if it ever dies.
+#
+# ExecStart is ops/ralph-start.sh, not the supervisor directly: the front-end
+# pulls + rebuilds before handing off, so a cold start (or a systemd-level restart)
+# can never launch stale dist. The supervisor keeps it fresh thereafter.
+#
+# Install:
+#   1. Copy this file to /etc/systemd/system/ralph-supervisor.service and edit the
+#      User / WorkingDirectory / ExecStart paths / Environment lines for your box.
+#   2. systemctl daemon-reload && systemctl enable --now ralph-supervisor
+#   3. Set `selfUpdate.enabled: true` in .ralph/config.yaml (off by default).
+# Logs: journalctl -u ralph-supervisor -f   (daemon-anomalies appear on stderr).
+
+[Unit]
+Description=ralph-autopilot self-updating autonomous daemon (supervised)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- EDIT THESE for your install -------------------------------------------
+# A dedicated, credential-free user (see docs/OPERATING.md — the box is the
+# blast radius). Must own the checkout and have the GitHub + Claude OAuth creds.
+User=ralph
+Group=ralph
+# The daemon's own git checkout (where the supervisor pulls + builds).
+WorkingDirectory=/opt/ralph-autopilot
+Environment=RALPH_BRANCH=main
+# Seconds a freshly-updated daemon must survive before it is deemed healthy.
+Environment=RALPH_HEALTH_WINDOW=60
+# ---------------------------------------------------------------------------
+
+# Pull + build on every (re)start, then hand off to the supervisor.
+ExecStart=/opt/ralph-autopilot/ops/ralph-start.sh
+
+# Keep the supervisor itself alive; it in turn keeps the daemon alive.
+Restart=always
+RestartSec=5
+
+# Allow in-flight drains time to finish on `systemctl stop` before SIGKILL.
+# Must EXCEED the daemon's drainTimeoutSeconds (box config: 3600) or systemd
+# SIGKILLs a still-draining daemon and kills its in-flight runs.
+TimeoutStopSec=3700
+# SIGTERM the supervisor, then the whole control group, so the daemon and every
+# agent subprocess are reaped on stop.
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
