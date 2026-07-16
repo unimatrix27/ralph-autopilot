@@ -76,8 +76,11 @@ export type BacklogEligibleItem = z.infer<typeof backlogEligibleItemSchema>;
 /** One `## Blocked by` dependency edge: the referenced issue + whether it is satisfied (closed-and-merged). */
 export const backlogBlockerSchema = z
   .object({
-    /** The referenced (depended-on) issue number. */
-    ref: issueNumber,
+    /**
+     * The referenced (depended-on) issue number, or the verbatim `owner/repo#n` of
+     * a cross-repo ref the gate cannot evaluate (always unsatisfied — issue #8).
+     */
+    ref: z.union([issueNumber, z.string()]),
     /** True once the dep is closed-and-merged (the gate's satisfaction test). */
     satisfied: z.boolean(),
   })

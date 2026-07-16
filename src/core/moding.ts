@@ -105,9 +105,10 @@ export interface ModeClassifier {
 export async function gateWithSyntheticMode(
   issue: Issue,
   resolveDep: (issueNumber: number) => Promise<boolean>,
+  repo: string,
 ): Promise<GateResult> {
   const synthetic: Issue = { ...issue, labels: [...issue.labels, LABEL_MODE_TDD] };
-  return gateOne(synthetic, resolveDep);
+  return gateOne(synthetic, resolveDep, repo);
 }
 
 /**
@@ -118,7 +119,7 @@ export async function gateWithSyntheticMode(
  * The "only the mode is missing" test reuses the gate so it can never drift from
  * admission: an issue qualifies iff it carries no mode today AND a synthetic copy
  * *with* a mode would pass the full gate (OPEN + `ready-for-agent` + `afk` + not
- * `hitl` + not paused + not `[log]` + every `## Blocked by #n` dep closed-and-merged).
+ * `hitl` + not paused + not `[log]` + every `## Blocked by` dep closed-and-merged).
  * Already-moded, paused, in-flight (held by a run row, which the gate's paused/`hitl`
  * labels and the reconciler's own in-flight check exclude), or blocked issues are
  * never touched. Idempotent: a moded issue stops qualifying the instant its label lands.
@@ -130,6 +131,7 @@ export async function selectModingCandidates(
   issues: Issue[],
   isDependencySatisfied: (issueNumber: number) => Promise<boolean>,
   maxPerTick: number,
+  repo: string,
 ): Promise<Issue[]> {
   if (maxPerTick <= 0) {
     return [];
@@ -156,7 +158,7 @@ export async function selectModingCandidates(
     // projection uses (issue #113), so the two can never drift — owns the dep
     // resolution. An eligible verdict means the mode is the ONLY thing missing; every
     // other condition, including deps, already holds.
-    if ((await gateWithSyntheticMode(issue, resolveDep)).eligible) {
+    if ((await gateWithSyntheticMode(issue, resolveDep, repo)).eligible) {
       candidates.push(issue);
     }
   }

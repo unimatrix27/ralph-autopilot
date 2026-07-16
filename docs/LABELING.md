@@ -27,8 +27,12 @@ Optionally add:
 | `hitl` | Explicitly bars the issue from unattended pickup even while `ready-for-agent` is present (e.g. specced but you want to be around when it runs). Remove it to release. |
 
 Dependencies go in the **issue body**, not labels: a `## Blocked by` heading followed by
-`#123`-style references. Every listed issue must be closed **and** its PR merged before
-the gate opens (`src/github/blocked.ts`).
+references written as `#123`, a same-repo issue URL
+(`https://github.com/<owner>/<repo>/issues/123`, including as a markdown link), or
+`<owner>/<repo>#123` shorthand — all gate identically (issue #8). Every listed issue must
+be closed **and** its PR merged before the gate opens (`src/github/blocked.ts`). A
+cross-repo reference cannot be evaluated: it holds the issue blocked and is warned every
+tick, and a section whose list items parse to zero references is warned the same way.
 
 ## Choosing the mode
 

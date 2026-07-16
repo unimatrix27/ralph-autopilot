@@ -6,7 +6,8 @@
  *
  *   1. the pure label gate (OPEN + `ready-for-agent` + `afk` + not `hitl` +
  *      not paused + not a `[log]` issue + carries a `mode:*` + every
- *      `## Blocked by #n` dependency satisfied) — the {@link gateOne} seam, also
+ *      `## Blocked by` dependency satisfied — `#n`, same-repo issue URL, or
+ *      `owner/repo#n`; a cross-repo ref fails closed, issue #8) — the {@link gateOne} seam, also
  *      shared by the moding/backlog synthetic-mode gate so they never re-implement it;
  *   2. the in-flight / active-run exclusions — an issue already running, or held
  *      by a still-active run row, is not admittable (a terminal `agent-stuck` /
@@ -130,6 +131,12 @@ export interface World {
    * never probes the meter. The reconciler backs it with `resolveRoute(…, "impl", …)`.
    */
   hasImplProviderHeadroom: () => boolean;
+  /**
+   * The `owner/repo` slug this reconciler works. Scopes the `## Blocked by` parse
+   * (issue #8): URL / `owner/repo#n` references to this repo gate as local issue
+   * numbers; references to any other repo cannot be evaluated and fail closed.
+   */
+  repo: string;
 }
 
 /** Why the pure label gate rejected an issue (the {@link gateOne} seam). */
@@ -200,7 +207,7 @@ export async function admit(issues: Issue[], world: World): Promise<LaunchPlan> 
       excluded.push({ issue, reason: "held" });
       continue;
     }
-    const verdict = await gateOne(issue, resolveDep);
+    const verdict = await gateOne(issue, resolveDep, world.repo);
     if (verdict.eligible) {
       eligible.push({ issue, mode: verdict.mode });
     } else if (verdict.reason === "blocked") {
@@ -284,24 +291,43 @@ function blockedVerdict(blockers: BacklogBlockerRef[], pass: GateResult): GateRe
 }
 
 /**
+ * Append each cross-repo `## Blocked by` ref as an unsatisfiable blocker: a
+ * dependency the gate cannot evaluate fails CLOSED (issue #8) — mirroring the
+ * failed-query rule in `GhCliClient.isDependencySatisfied` — so the issue is
+ * excluded as `blocked` with the verbatim ref visible in the read model, never
+ * launched past a prerequisite the gate could not check. Shared by both gate
+ * finishers so the fail-closed rule lives once.
+ */
+function withCrossRepoBlockers(blockers: BacklogBlockerRef[], crossRepo: string[]): BacklogBlockerRef[] {
+  return [...blockers, ...crossRepo.map((ref) => ({ ref, satisfied: false }))];
+}
+
+/**
  * The pure label gate — admit's async gate finisher, and the canonical seam the
  * moding/backlog synthetic-mode gate ({@link import("./moding").gateWithSyntheticMode})
  * delegates to, so neither hand-rolls the parse→resolve dance. Cheap synchronous
  * checks first, so a blocker is resolved (the only async, GitHub-touching step)
  * only when an issue is otherwise eligible and reaches the `## Blocked by` test.
  * Every `## Blocked by` ref is resolved (cached across the tick) so the read model can
- * show each one's status; the issue is blocked if any is unsatisfied.
+ * show each one's status; the issue is blocked if any is unsatisfied. `repo` scopes the
+ * parse (issue #8): refs may be `#n`, a same-repo issue URL, or `owner/repo#n`, and a
+ * cross-repo ref joins the blockers unsatisfiable ({@link withCrossRepoBlockers}).
  */
-export async function gateOne(issue: Issue, resolveDep: (n: number) => Promise<boolean>): Promise<GateResult> {
+export async function gateOne(
+  issue: Issue,
+  resolveDep: (n: number) => Promise<boolean>,
+  repo: string,
+): Promise<GateResult> {
   const labelVerdict = gateLabels(issue);
   if (!labelVerdict.eligible) {
     return labelVerdict;
   }
+  const parsed = parseBlockedBy(issue.body, repo);
   const blockers: BacklogBlockerRef[] = [];
-  for (const ref of parseBlockedBy(issue.body)) {
+  for (const ref of parsed.refs) {
     blockers.push({ ref, satisfied: await resolveDep(ref) });
   }
-  return blockedVerdict(blockers, labelVerdict);
+  return blockedVerdict(withCrossRepoBlockers(blockers, parsed.crossRepo), labelVerdict);
 }
 
 /**
@@ -313,12 +339,16 @@ export async function gateOne(issue: Issue, resolveDep: (n: number) => Promise<b
  * fold is {@link blockedVerdict}, both shared with the lazy async path; only the
  * blocked-by *resolution* (a sync map here vs the async loop there) differs.
  */
-export function evaluateGate(issue: Issue, isDependencySatisfied: (n: number) => boolean): GateResult {
+export function evaluateGate(issue: Issue, isDependencySatisfied: (n: number) => boolean, repo: string): GateResult {
   const labelVerdict = gateLabels(issue);
   if (!labelVerdict.eligible) {
     return labelVerdict;
   }
-  const blockers = parseBlockedBy(issue.body).map((ref) => ({ ref, satisfied: isDependencySatisfied(ref) }));
+  const parsed = parseBlockedBy(issue.body, repo);
+  const blockers = withCrossRepoBlockers(
+    parsed.refs.map((ref) => ({ ref, satisfied: isDependencySatisfied(ref) })),
+    parsed.crossRepo,
+  );
   return blockedVerdict(blockers, labelVerdict);
 }
 

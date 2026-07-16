@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Issue } from "../github/types";
 import type { Run, RunStatus } from "../store/types";
-import { admit, type World } from "./admission";
+import { admit, evaluateGate, type World } from "./admission";
 
 function issue(overrides: Partial<Issue> = {}): Issue {
   return {
@@ -38,6 +38,7 @@ function world(overrides: Partial<World> = {}): World {
     openSlots: 10,
     priorityLabels: [],
     hasImplProviderHeadroom: () => true,
+    repo: "owner/repo",
     ...overrides,
   };
 }
@@ -112,6 +113,106 @@ describe("admit — the eligibility gate seam", () => {
     const blocked = issue({ body: "## Blocked by\n- #1\n" });
     const plan = await admit([blocked], world({ isDependencySatisfied: async (n) => n === 1 }));
     expect(plan.picked).toEqual([{ issue: blocked, mode: "tdd" }]);
+  });
+
+  // Issue #8: URL-form and owner/repo#n-form same-repo refs gate identically to #n refs.
+  it.each([
+    ["a markdown-link issue URL", "## Blocked by\n- [prereq](https://github.com/owner/repo/issues/2)\n"],
+    ["a bare issue URL", "## Blocked by\n- https://github.com/owner/repo/issues/2\n"],
+    ["owner/repo#n shorthand", "## Blocked by\n- owner/repo#2\n"],
+  ])("gates on %s exactly like a #n ref", async (_desc, body) => {
+    const blocked = issue({ body });
+    const unsatisfied = await admit([blocked], world({ isDependencySatisfied: async () => false }));
+    expect(unsatisfied.picked).toEqual([]);
+    expect(unsatisfied.excluded).toEqual([
+      { issue: blocked, reason: "blocked", blockers: [{ ref: 2, satisfied: false }] },
+    ]);
+
+    const satisfied = await admit([blocked], world({ isDependencySatisfied: async (n) => n === 2 }));
+    expect(satisfied.picked).toEqual([{ issue: blocked, mode: "tdd" }]);
+  });
+
+  it("gates a mixed list of all three ref formats as one dependency set", async () => {
+    const blocked = issue({
+      body: ["## Blocked by", "- #1", "- [p](https://github.com/owner/repo/issues/2)", "- owner/repo#3"].join("\n"),
+    });
+    const plan = await admit([blocked], world({ isDependencySatisfied: async (n) => n !== 3 }));
+    expect(plan.excluded).toEqual([
+      {
+        issue: blocked,
+        reason: "blocked",
+        blockers: [
+          { ref: 1, satisfied: true },
+          { ref: 2, satisfied: true },
+          { ref: 3, satisfied: false },
+        ],
+      },
+    ]);
+  });
+
+  // Issue #8: a cross-repo ref is a dependency the gate cannot evaluate — it fails
+  // CLOSED (an unsatisfiable blocker), never launches past it, and is never resolved
+  // against the local repo (it would gate on an unrelated local issue).
+  it("excludes an issue with a cross-repo ref as blocked, without resolving it locally", async () => {
+    const resolved: number[] = [];
+    const blocked = issue({ body: "## Blocked by\n- [dep](https://github.com/other/thing/issues/5)\n" });
+    const plan = await admit(
+      [blocked],
+      world({
+        isDependencySatisfied: async (n) => {
+          resolved.push(n);
+          return true;
+        },
+      }),
+    );
+    expect(plan.picked).toEqual([]);
+    expect(plan.excluded).toEqual([
+      { issue: blocked, reason: "blocked", blockers: [{ ref: "other/thing#5", satisfied: false }] },
+    ]);
+    expect(resolved).toEqual([]);
+  });
+
+  it("keeps an issue blocked on a cross-repo ref even when every local dep is satisfied", async () => {
+    const blocked = issue({ body: "## Blocked by\n- #1\n- other/thing#5\n" });
+    const plan = await admit([blocked], world({ isDependencySatisfied: async () => true }));
+    expect(plan.excluded).toEqual([
+      {
+        issue: blocked,
+        reason: "blocked",
+        blockers: [
+          { ref: 1, satisfied: true },
+          { ref: "other/thing#5", satisfied: false },
+        ],
+      },
+    ]);
+  });
+});
+
+describe("evaluateGate — the sync gate mirrors admit on ref formats", () => {
+  const REPO = "owner/repo";
+
+  it("gates URL-form and shorthand refs identically to #n refs", () => {
+    const body = ["## Blocked by", "- [p](https://github.com/owner/repo/issues/2)", "- owner/repo#3"].join("\n");
+    const iss = issue({ body });
+    expect(evaluateGate(iss, () => true, REPO).eligible).toBe(true);
+    const verdict = evaluateGate(iss, (n) => n === 2, REPO);
+    expect(verdict).toEqual({
+      eligible: false,
+      reason: "blocked",
+      blockers: [
+        { ref: 2, satisfied: true },
+        { ref: 3, satisfied: false },
+      ],
+    });
+  });
+
+  it("fails closed on a cross-repo ref", () => {
+    const iss = issue({ body: "## Blocked by\n- [dep](https://github.com/other/thing/issues/5)\n" });
+    expect(evaluateGate(iss, () => true, REPO)).toEqual({
+      eligible: false,
+      reason: "blocked",
+      blockers: [{ ref: "other/thing#5", satisfied: false }],
+    });
   });
 });
 

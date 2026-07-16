@@ -49,10 +49,18 @@ with **fresh context** every time, no `memory` MCP. ([ADR-0008](adr/0008-oauth-f
 ## 2. The eligibility gate
 
 An issue is picked up iff: `state == OPEN` **and** labelled `ready-for-agent`
-**and** `afk` **and** not `hitl` **and** every `## Blocked by #n` dependency is
+**and** `afk` **and** not `hitl` **and** every `## Blocked by` dependency is
 `CLOSED` with a merged closing PR **and** it carries a **mode** (`mode:tdd`
 default if absent, `mode:infra`, or `mode:ui`). Not labelled `[log] *`
 (milestone-log issues). ([ADR-0006](adr/0006-mode-routing.md))
+
+A `## Blocked by` reference may be written as `#n`, a same-repo GitHub issue URL
+(the form GitHub itself renders), or `owner/repo#n` shorthand — all three gate
+identically (issue #8). The gate **fails loud and closed** on anything else in
+the section: a cross-repo reference is a dependency it cannot evaluate, so the
+issue is held `blocked` (the ref surfaces verbatim in the backlog view) and a
+warning is logged each tick; a section whose non-empty list items parse to zero
+references is warned the same way, never treated as "no dependencies".
 
 The `## Blocked by` graph is also how we **avoid the parallel-edit pileup**: when
 authoring a batch of issues, foundational/cross-cutting work and heavy

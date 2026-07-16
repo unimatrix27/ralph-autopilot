@@ -55,14 +55,16 @@ import type {
  * rows by their scheduling tie-break; `isDependencySatisfied` resolves the
  * `## Blocked by` deps of admission's `no-mode` exclusions (which the gate
  * short-circuited before resolving) so a blocked-and-unmoded issue is classified
- * as blocked, not as a moding candidate (issue #113). Async only for that one
- * resolution; the rest is a pure map of the plan.
+ * as blocked, not as a moding candidate (issue #113); `repo` scopes that parse to
+ * the owning `owner/repo` (issue #8). Async only for that one resolution; the
+ * rest is a pure map of the plan.
  */
 export async function projectBacklog(
   issues: Issue[],
   plan: LaunchPlan,
   priorityLabels: string[],
   isDependencySatisfied: (issueNumber: number) => Promise<boolean>,
+  repo: string,
   noProviderResetsAt: string | null = null,
 ): Promise<BacklogView> {
   const eligible: BacklogEligible[] = plan.eligible.map((p) => {
@@ -100,7 +102,7 @@ export async function projectBacklog(
     if (e.reason !== "no-mode") {
       continue;
     }
-    const verdict = await gateWithSyntheticMode(e.issue, resolveDep);
+    const verdict = await gateWithSyntheticMode(e.issue, resolveDep, repo);
     if (verdict.eligible) {
       modingCandidates.push({ issueNumber: e.issue.number, title: e.issue.title });
     } else {

@@ -291,13 +291,14 @@ describe("snapshotToBacklog", () => {
       openSlots: 5,
       priorityLabels: ["priority:p0", "priority:p1"],
       hasImplProviderHeadroom: () => true,
+      repo: "owner/repo",
     };
 
     return admit([lower, prioritized], world).then(async (plan) => {
       // Admission's pick-order: #50 (p0) before #10 (p1), despite the lower number.
       expect(plan.eligible.map((p) => p.issue.number)).toEqual([50, 10]);
 
-      const view = await projectBacklog([lower, prioritized], plan, world.priorityLabels, world.isDependencySatisfied);
+      const view = await projectBacklog([lower, prioritized], plan, world.priorityLabels, world.isDependencySatisfied, world.repo);
       // Wrap the repo-less projection into the aggregate (repo-tagged) snapshot shape,
       // exactly as buildSnapshot's tagRepo does.
       const tag = <T>(items: T[]) => items.map((i) => ({ ...i, repo: "owner/repo" }));

@@ -251,7 +251,9 @@ function DependencyGraph({ blockers }: { blockers: BacklogBlockedItem["blockers"
               : "border-status-danger/50 text-status-danger",
           )}
         >
-          <span aria-hidden>{dep.satisfied ? "✓" : "○"}</span>#{dep.ref}
+          {/* A string ref is a verbatim cross-repo `owner/repo#n` the gate cannot evaluate. */}
+          <span aria-hidden>{dep.satisfied ? "✓" : "○"}</span>
+          {typeof dep.ref === "number" ? `#${dep.ref}` : dep.ref}
         </span>
       ))}
     </div>

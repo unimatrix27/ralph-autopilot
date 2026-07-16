@@ -62,7 +62,7 @@ function gateEligibleFor(labels: string[], state: IssueState | "gone"): boolean 
     return false;
   }
   const issue: Issue = { number: 1, title: "t", body: "", state, labels, createdAt: "2026-01-01T00:00:00Z" };
-  return evaluateGate(issue, () => true).eligible;
+  return evaluateGate(issue, () => true, "owner/repo").eligible;
 }
 
 /** Every combination in the matrix, as fully-resolved snapshots. */
