@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  accountsResponseSchema,
   analyticsResponseSchema,
   API_BASE,
   API_ROUTES,
@@ -355,6 +356,87 @@ describe("health + usage contract", () => {
     expect(healthUsageResponseSchema.safeParse({ ...valid, daemon: { ...valid.daemon, cap: -1 } }).success).toBe(false);
     const badIssue = { ...valid, anomalies: [{ ...valid.anomalies[0], issue: 0 }] };
     expect(healthUsageResponseSchema.safeParse(badIssue).success).toBe(false);
+  });
+});
+
+describe("accounts contract (issue #11)", () => {
+  const valid = {
+    generatedAt: "2026-07-16T12:00:00.000Z",
+    admitBelowPercent: 85,
+    accounts: [
+      {
+        id: "main",
+        provider: "claude" as const,
+        enabled: true,
+        identity: { emailAddress: "ada@example.com", displayName: "Ada Lovelace", organizationName: "Analytical Engines" },
+        usage: {
+          active: true,
+          gated: false,
+          cooldownUntil: null,
+          windows: [
+            { type: "five_hour", utilization: 40, resetsAt: "2026-07-16T13:00:00.000Z" },
+            { type: "seven_day", utilization: null, resetsAt: null },
+          ],
+        },
+      },
+      // A parked claude account with NO identity (graceful absence) and a never-used null convention.
+      {
+        id: "second",
+        provider: "claude" as const,
+        enabled: false,
+        usage: { active: false, gated: false, cooldownUntil: null, windows: [] },
+      },
+      // A key-based zai account: id + provider + the env-var NAME (never its value), no identity.
+      {
+        id: "glm",
+        provider: "zai" as const,
+        enabled: true,
+        authTokenEnvName: "ZAI_API_KEY",
+        usage: { active: false, gated: true, cooldownUntil: "2026-07-16T12:30:00.000Z", windows: [] },
+      },
+    ],
+  };
+
+  it("round-trips a full, valid payload (parse → serialize is identity)", () => {
+    const parsed = accountsResponseSchema.parse(valid);
+    expect(parsed).toEqual(valid);
+    // Serialize → re-parse is also identity (the wire crossing both sides perform, ADR-0031).
+    expect(accountsResponseSchema.parse(JSON.parse(JSON.stringify(parsed)))).toEqual(valid);
+  });
+
+  it("omits an absent identity rather than emitting null (graceful absence, issue #11)", () => {
+    const parsed = accountsResponseSchema.parse(valid);
+    expect("identity" in parsed.accounts[1]!).toBe(false);
+    // A profile missing a field carries only the fields it has (never a guessed placeholder).
+    const partial = {
+      ...valid,
+      accounts: [{ ...valid.accounts[0]!, identity: { emailAddress: "ada@example.com" } }],
+    };
+    expect(accountsResponseSchema.parse(partial).accounts[0]!.identity).toEqual({ emailAddress: "ada@example.com" });
+  });
+
+  it("rejects unknown keys anywhere (strict, so a leaked credential field is a parse error)", () => {
+    expect(accountsResponseSchema.safeParse({ ...valid, extra: "nope" }).success).toBe(false);
+    // A credential field smuggled onto an account (configDir / authTokenEnv) is rejected outright.
+    const leaked = { ...valid, accounts: [{ ...valid.accounts[0]!, configDir: "/home/op/.claude" }] };
+    expect(accountsResponseSchema.safeParse(leaked).success).toBe(false);
+    const leakedToken = { ...valid, accounts: [{ ...valid.accounts[2]!, authTokenEnv: "SECRET_VALUE" }] };
+    expect(accountsResponseSchema.safeParse(leakedToken).success).toBe(false);
+    const badIdentity = {
+      ...valid,
+      accounts: [{ ...valid.accounts[0]!, identity: { emailAddress: "a@b.c", accountUuid: "leak" } }],
+    };
+    expect(accountsResponseSchema.safeParse(badIdentity).success).toBe(false);
+  });
+
+  it("rejects an unknown provider and a non-integer threshold", () => {
+    const badProvider = { ...valid, accounts: [{ ...valid.accounts[0]!, provider: "anthropic" }] };
+    expect(accountsResponseSchema.safeParse(badProvider).success).toBe(false);
+    expect(accountsResponseSchema.safeParse({ ...valid, admitBelowPercent: 85.5 }).success).toBe(false);
+  });
+
+  it("namespaces the accounts route under the API base", () => {
+    expect(API_ROUTES.accounts.startsWith(`${API_BASE}/`)).toBe(true);
   });
 });
 

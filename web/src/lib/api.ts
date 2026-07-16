@@ -5,6 +5,7 @@
  * (`/api/health`); slices 1+ add fetchers here over the same contract.
  */
 import {
+  accountsResponseSchema,
   analyticsResponseSchema,
   API_ROUTES,
   answerResponseSchema,
@@ -24,6 +25,7 @@ import {
   subscribeResponseSchema,
   unsubscribeResponseSchema,
   vapidPublicKeyResponseSchema,
+  type AccountsResponse,
   type AnalyticsResponse,
   type AnswerRequestBody,
   type AnswerResponse,
@@ -112,6 +114,16 @@ export function fetchAnalytics(repo: string | undefined, windowDays: number): Pr
  */
 export function fetchHealthUsage(): Promise<HealthUsageResponse> {
   return getJson(API_ROUTES.healthUsage, (raw) => healthUsageResponseSchema.parse(raw));
+}
+
+/**
+ * Fetch the account panel (issue #11): every resolved pool account with its identity (claude OAuth
+ * email/name/org, omitted on graceful absence), operator-park state (#10), and live plan usage.
+ * Daemon-wide — no repo filter. Parsed through the shared contract leaf so a server/client drift
+ * surfaces here. Carries no secret material.
+ */
+export function fetchAccounts(): Promise<AccountsResponse> {
+  return getJson(API_ROUTES.accounts, (raw) => accountsResponseSchema.parse(raw));
 }
 
 /**

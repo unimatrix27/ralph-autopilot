@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../../log/logger";
 import {
+  accountsResponseSchema,
   analyticsResponseSchema,
   answerResponseSchema,
   backlogResponseSchema,
@@ -99,6 +100,33 @@ const ports: WebControlPlanePorts = {
       paused: false,
       logins: [{ id: "default", active: true, gated: false, disabled: false, windows: [], cooldownUntil: null }],
     },
+  }),
+  // The account panel (issue #11): one claude account with identity + usage and one parked zai key
+  // (env-var NAME only, no value), so the route test can assert the shape parses and no secret leaks.
+  accounts: () => ({
+    generatedAt: "2026-06-21T00:00:00.000Z",
+    admitBelowPercent: 85,
+    accounts: [
+      {
+        id: "main",
+        provider: "claude",
+        enabled: true,
+        identity: { emailAddress: "ada@example.com", displayName: "Ada", organizationName: "AE" },
+        usage: {
+          active: true,
+          gated: false,
+          cooldownUntil: null,
+          windows: [{ type: "five_hour", utilization: 40, resetsAt: "2026-06-21T05:00:00.000Z" }],
+        },
+      },
+      {
+        id: "glm",
+        provider: "zai",
+        enabled: false,
+        authTokenEnvName: "ZAI_API_KEY",
+        usage: { active: false, gated: false, cooldownUntil: null, windows: [] },
+      },
+    ],
   }),
   // Likewise echoes the repo filter; minimal contract-valid backlog payload.
   backlog: (query) => ({
@@ -354,6 +382,16 @@ describe("WebServer", () => {
     expect(res.status).toBe(200);
     expect(res.contentType).toMatch(/application\/json/);
     expect(healthUsageResponseSchema.safeParse(JSON.parse(res.body)).success).toBe(true);
+  });
+
+  it("serves /api/accounts as a valid, contract-shaped response with no secret material (issue #11)", async () => {
+    const res = await req(port, "/api/accounts");
+    expect(res.status).toBe(200);
+    expect(res.contentType).toMatch(/application\/json/);
+    expect(accountsResponseSchema.safeParse(JSON.parse(res.body)).success).toBe(true);
+    // The env-var NAME may appear (a name, not a value); no credential *value* ever does.
+    expect(res.body).toContain("ZAI_API_KEY");
+    expect(res.body).not.toMatch(/sk-ant|Bearer |configDir|codexHome/);
   });
 
   it("serves /api/overview as a contract-shaped response, forwarding the repo filter", async () => {
