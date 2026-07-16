@@ -16,6 +16,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Logger } from "../../log/logger";
 import type { WebSettings } from "../../config/schema";
 import {
+  accountsResponseSchema,
   analyticsResponseSchema,
   answerRequestBodySchema,
   answerResponseSchema,
@@ -238,6 +239,7 @@ export class WebServer {
         }),
       ],
       [API_ROUTES.healthUsage, getJsonRoute(healthUsageResponseSchema, () => deps.ports.healthUsage())],
+      [API_ROUTES.accounts, getJsonRoute(accountsResponseSchema, () => deps.ports.accounts())],
       [
         API_ROUTES.backlog,
         getJsonRoute(backlogResponseSchema, (req) => deps.ports.backlog({ repo: readRepoFilter(parseQuery(req.url)) })),

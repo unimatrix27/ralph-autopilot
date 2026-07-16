@@ -10,6 +10,7 @@
  * write ports) — always as additive methods here, never as new reach-ins.
  */
 import type {
+  AccountsResponse,
   AnalyticsResponse,
   AnswerRequestBody,
   BacklogResponse,
@@ -122,6 +123,16 @@ export interface WebControlPlanePorts {
    * active login or touches the reconciler. Daemon-wide, so it takes no repo filter.
    */
   healthUsage(): HealthUsageResponse;
+
+  /**
+   * The account panel for `/api/accounts` (issue #11): every resolved pool account with its
+   * identity (claude OAuth email/name/org, read daemon-side at projection time and omitted on
+   * graceful absence), operator-park state (#10), and live plan usage joined by account id. A pure
+   * read over the routing overlay + a usage-meter snapshot + the daemon-side profile read — it
+   * never flips the active login or touches the reconciler. Daemon-wide, so it takes no repo
+   * filter. Carries no secret material (no keys, tokens, or env-var values).
+   */
+  accounts(): AccountsResponse;
 
   /**
    * The operator Backlog for `/api/backlog` (issue #113): eligible (in the daemon's

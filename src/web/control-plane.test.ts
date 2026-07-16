@@ -17,6 +17,7 @@ import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED, LABEL_REA
 import { LABEL_AFK, LABEL_HITL, LABEL_MODE_TDD } from "../core/labels";
 import { parseRalphAnswer } from "../hitl/answer";
 import {
+  accountsResponseSchema,
   analyticsResponseSchema,
   answerResponseSchema,
   backlogResponseSchema,
@@ -1008,5 +1009,95 @@ describe("createWebPorts — runtime routing (ADR-0037 P4.1, issue #166)", () =>
     const result = ports.applyRouting({ target: "type", type: "impl", routing: { provider: "openai" } });
     expect(result.kind).toBe("bad-request");
     expect(result.kind === "bad-request" && result.error).toMatch(/not tools-capable/i);
+  });
+});
+
+describe("createWebPorts — account panel (issue #11)", () => {
+  let store: Store;
+  beforeEach(() => {
+    store = openStore(MEMORY_DB, { now: () => "2026-07-16T00:00:00.000Z" });
+  });
+  afterEach(() => store.close());
+
+  // A pool with two claude logins (one operator-parked) and a key-based zai account. The
+  // configDir paths carry a SECRET marker so the no-secret assertion is meaningful.
+  function poolConfig(): RalphConfig {
+    return parseConfig({
+      targets: [{ repo: "owner/repo", commands: { build: "true", test: "true" } }],
+      accounts: [
+        { id: "main", provider: "claude", configDir: "/home/op/.claude-main-SECRETDIR" },
+        { id: "second", provider: "claude", configDir: "/home/op/.claude-second-SECRETDIR" },
+        { id: "glm", provider: "zai", authTokenEnv: "ZAI_API_KEY_ENVNAME" },
+      ],
+      disabledAccounts: ["second"],
+    });
+  }
+
+  function portsWithPool(): ReturnType<typeof createWebPorts> {
+    const cfg = poolConfig();
+    const routingStore = new RoutingStore({ config: cfg, targets: resolveTargets(cfg) }); // overlay-only
+    return createWebPorts({
+      startedAt: new Date("2026-07-16T12:00:00.000Z"),
+      now: () => new Date("2026-07-16T12:00:00.000Z"),
+      store,
+      targets: targetMetadata(["owner/repo"]),
+      admitBelowPercent: 85,
+      githubFor: () => new FakeGitHub(),
+      reconcileIntervalSeconds: 30,
+      control: fakeControl(),
+      routing: routingStore,
+      // The live claude meter: `main` active with headroom, `second` parked. Joined by account id.
+      usage: () => ({
+        activeId: "main",
+        ids: ["main", "second"],
+        states: {
+          main: { windows: { five_hour: { utilization: 40, resetsAtMs: Date.parse("2026-07-16T13:00:00.000Z") } }, cooldownUntilMs: null },
+        },
+        disabledIds: ["second"],
+      }),
+      // A fake identity reader: `main` has a readable OAuth profile; `second`'s configDir has NONE
+      // (graceful absence — a live case). Never touches the filesystem.
+      readAccountIdentity: (account) =>
+        account.id === "main"
+          ? { emailAddress: "ada@example.com", displayName: "Ada Lovelace", organizationName: "Analytical Engines" }
+          : undefined,
+    });
+  }
+
+  it("joins pool + park state + usage + identity into a contract-valid panel", () => {
+    const view = portsWithPool().accounts();
+    expect(accountsResponseSchema.safeParse(view).success).toBe(true);
+    expect(view.admitBelowPercent).toBe(85);
+    expect(view.accounts.map((a) => a.id)).toEqual(["main", "second", "glm"]);
+
+    const main = view.accounts.find((a) => a.id === "main")!;
+    expect(main.provider).toBe("claude");
+    expect(main.enabled).toBe(true);
+    expect(main.identity).toEqual({
+      emailAddress: "ada@example.com",
+      displayName: "Ada Lovelace",
+      organizationName: "Analytical Engines",
+    });
+    expect(main.usage.active).toBe(true);
+    expect(main.usage.windows).toEqual([{ type: "five_hour", utilization: 40, resetsAt: "2026-07-16T13:00:00.000Z" }]);
+  });
+
+  it("omits identity for the account whose configDir has no OAuth profile (graceful absence — regression)", () => {
+    const second = portsWithPool().accounts().accounts.find((a) => a.id === "second")!;
+    expect("identity" in second).toBe(false);
+    expect(second.enabled).toBe(false); // operator-parked via disabledAccounts
+    expect(second.usage).toEqual({ active: false, gated: false, cooldownUntil: null, windows: [] }); // never-used null convention
+  });
+
+  it("renders the zai key account as id + provider + env-var NAME, and leaks no secret material", () => {
+    const view = portsWithPool().accounts();
+    const glm = view.accounts.find((a) => a.id === "glm")!;
+    expect(glm).toMatchObject({ id: "glm", provider: "zai", authTokenEnvName: "ZAI_API_KEY_ENVNAME", enabled: true });
+    expect("identity" in glm).toBe(false);
+    // The serialized payload carries NO configDir path / credential value from the fixture pool.
+    const wire = JSON.stringify(view);
+    expect(wire).not.toContain("SECRETDIR");
+    expect(wire).not.toContain(".claude-main");
+    expect(wire).not.toContain("configDir");
   });
 });

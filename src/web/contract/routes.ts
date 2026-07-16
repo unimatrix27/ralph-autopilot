@@ -41,6 +41,13 @@ export const API_ROUTES = {
    */
   healthUsage: `${API_BASE}/health/usage`,
   /**
+   * The account panel (issue #11): every resolved pool account with its identity (claude
+   * OAuth email/name/org, read daemon-side and omitted on graceful absence), operator-park
+   * state (#10), and live plan usage joined by account id. Daemon-wide — a credential is a
+   * box credential, not per-target — so it takes no `?repo=` filter. Carries no secret material.
+   */
+  accounts: `${API_BASE}/accounts`,
+  /**
    * The Backlog: eligible (in pick-order), blocked (with a dependency mini-graph),
    * paused (grouped by attention state), and moding-pass candidates — aggregate
    * across all repos. A `?repo=<owner/name>` query narrows every section.

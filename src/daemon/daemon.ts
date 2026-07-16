@@ -38,7 +38,7 @@ import type { RouteWorld, RoutingSource } from "../providers/resolve";
 import { EscalationCheckpointer } from "../hitl/escalation-checkpoint";
 import type { Logger } from "../log/logger";
 import type { Account, RalphConfig, TargetConfig } from "../config/schema";
-import { groupAccountsByProvider, resolveAccountPool, resolveTargets } from "../config/load";
+import { expandHome, groupAccountsByProvider, resolveAccountPool, resolveTargets } from "../config/load";
 import { RoutingStore } from "../config/routing-store";
 import type { Store } from "../store/store";
 import { Reconciler, type ReconcileBudget } from "./reconciler";
@@ -107,11 +107,6 @@ function ensureTargetClone(repo: string, cloneDir: string, logger: Logger): void
   } catch (err) {
     throw new Error(`failed to clone target repo ${repo} into ${cloneDir}: ${err instanceof Error ? err.message : String(err)}`);
   }
-}
-
-/** Expand a leading `~` to the box home dir so `CLAUDE_CONFIG_DIR` is absolute. */
-function expandHome(p: string): string {
-  return p.startsWith("~") ? join(homedir(), p.slice(1).replace(/^[/\\]/, "")) : p;
 }
 
 /** The pool's claude slice, narrowed to the claude account shape (the OAuth meter's source). */

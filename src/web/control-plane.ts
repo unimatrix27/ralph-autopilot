@@ -27,6 +27,9 @@ import { snapshotToOverview } from "./overview";
 import { analyticsWindowStart, computeAnalytics } from "./analytics";
 import { resolveWindowDays } from "./contract";
 import { buildHealthUsage, type UsageMeterSnapshot } from "./health-usage";
+import { buildAccounts, readAccountIdentity } from "./accounts";
+import type { AccountIdentity } from "./contract";
+import type { Account } from "../config/schema";
 import { snapshotToBacklog } from "./backlog";
 import { toRunDetailResponse, toRunsResponse, runIdOf } from "./runs";
 import { listOpenQuestions, openQuestionForIssue } from "../hitl/queue";
@@ -55,6 +58,15 @@ import { executeRoutingEdit, getEffectiveRouting, type RoutingControlPort } from
  * back to the box-default single login with no streamed state.
  */
 export type UsageSnapshotReader = () => UsageMeterSnapshot;
+
+/**
+ * Reads one account's OAuth identity daemon-side at projection time (issue #11) — the one side
+ * effect behind the pure account-panel transform. Defaults to the real disk read of a claude
+ * account's `configDir` profile ({@link readAccountIdentity}); tests inject a fake so the panel's
+ * identity join is exercised without touching the filesystem. A key-based account, or a graceful
+ * absence (no profile file / missing field), yields `undefined` — never an error, never a guess.
+ */
+export type AccountIdentityReader = (account: Account) => AccountIdentity | undefined;
 
 /** The box-default usage picture when no meter is wired: one login, nothing streamed. */
 const DEFAULT_USAGE_SNAPSHOT: UsageMeterSnapshot = { activeId: "default", ids: ["default"], states: {}, disabledIds: [] };
@@ -106,6 +118,12 @@ export interface StartWebControlPlaneDeps {
    * is started, so the mounted routing routes cannot silently no-op.
    */
   routing: RoutingControlPort;
+  /**
+   * Reads a claude account's OAuth identity daemon-side for the account panel (issue #11). Omitted
+   * on the real daemon → the disk read of each claude account's `configDir` profile; overridden in
+   * tests with a fake so the panel is exercised without touching the filesystem.
+   */
+  readAccountIdentity?: AccountIdentityReader;
   /**
    * The resolved VAPID identity for web push (issue #119), or `null` when not configured. Served to
    * the browser at `/api/webpush/vapid`; resolved once by the daemon from the env-var NAME in config.
@@ -181,6 +199,11 @@ export function createWebPorts(deps: {
    */
   routing: RoutingControlPort;
   /**
+   * Reads a claude account's OAuth identity daemon-side for the account panel (issue #11). Defaults
+   * to the real disk read; tests inject a fake. Never ships a credential — only email/name/org.
+   */
+  readAccountIdentity?: AccountIdentityReader;
+  /**
    * The resolved VAPID identity for the web-push channel (issue #119), or `null` when push is not
    * configured. The vapid port serves its public key; subscribe/unsubscribe persist to the store.
    * The daemon resolves the identity once from the configured env-var NAME and passes it here.
@@ -191,6 +214,7 @@ export function createWebPorts(deps: {
   const vapid = deps.vapid ?? null;
   const meta = readPackageMeta();
   const usage = deps.usage ?? ((): UsageMeterSnapshot => DEFAULT_USAGE_SNAPSHOT);
+  const identityReader: AccountIdentityReader = deps.readAccountIdentity ?? readAccountIdentity;
   const control = deps.control;
   // The repos this control plane serves, in configured order; the inbox narrows to one when asked.
   const allRepos = deps.targets.map((target) => target.targetRepo);
@@ -240,6 +264,28 @@ export function createWebPorts(deps: {
       return buildHealthUsage(snapshot, deps.store.latestAnomalies(), usage(), {
         now: deps.now,
         admitBelowPercent: deps.admitBelowPercent,
+      });
+    },
+    // The account panel (issue #11): join the resolved pool + operator-park state (off the routing
+    // overlay snapshot), the usage-meter windows (by account id), and the daemon-side OAuth identity
+    // read into one panel. `buildAccounts` is pure; the identity read is the one side effect, done
+    // here per claude account and injectable for tests. No secret material crosses the wire.
+    accounts: () => {
+      const snap = deps.routing.snapshot();
+      const identities: Record<string, AccountIdentity> = {};
+      for (const account of snap.accounts) {
+        const identity = identityReader(account);
+        if (identity) {
+          identities[account.id] = identity;
+        }
+      }
+      return buildAccounts({
+        pool: snap.accounts,
+        disabledAccounts: snap.disabledAccounts,
+        usage: usage(),
+        identities,
+        admitBelowPercent: deps.admitBelowPercent,
+        now: deps.now,
       });
     },
     backlog: (query) => {
@@ -422,6 +468,7 @@ export async function startWebControlPlane(
     reconcileIntervalSeconds: config.scheduler.reconcileIntervalSeconds,
     control: deps.control,
     routing: deps.routing,
+    readAccountIdentity: deps.readAccountIdentity,
     vapid: deps.vapid ?? null,
   });
   const server = new WebServer({ config: config.web, logger, ports });

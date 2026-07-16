@@ -10,6 +10,7 @@ import { InboxFocusPage } from "@/routes/inbox-focus";
 import { BacklogPage } from "@/routes/backlog";
 import { AnalyticsPage } from "@/routes/analytics";
 import { RoutingPage } from "@/routes/routing";
+import { AccountsPage } from "@/routes/accounts";
 import { HealthPage } from "@/routes/health";
 import { PageHeader, ComingSoon } from "@/components/page";
 
@@ -51,6 +52,7 @@ const routeTree = rootRoute.addChildren([
   route("/backlog", BacklogPage),
   route("/analytics", AnalyticsPage),
   route("/routing", RoutingPage),
+  route("/accounts", AccountsPage),
   route("/health", HealthPage),
 ]);
 

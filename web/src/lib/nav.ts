@@ -13,6 +13,7 @@ import {
   LayersIcon,
   ListIcon,
   RouteIcon,
+  UsersIcon,
 } from "@/components/icons";
 
 export interface NavItem {
@@ -30,5 +31,6 @@ export const NAV: NavItem[] = [
   { path: "/backlog", label: "Backlog", description: "Eligible, blocked & paused issues", Icon: LayersIcon },
   { path: "/analytics", label: "Analytics", description: "Throughput, time-to-merge & quality trends", Icon: BarChartIcon },
   { path: "/routing", label: "Routing", description: "Per-type provider·model & account pool", Icon: RouteIcon },
+  { path: "/accounts", label: "Accounts", description: "Pool identity, live usage & park state", Icon: UsersIcon },
   { path: "/health", label: "Health", description: "Daemon health & usage", Icon: HeartPulseIcon },
 ];

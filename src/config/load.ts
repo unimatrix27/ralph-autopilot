@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { loadYamlFile, parseYamlValue, type YamlFileMessages } from "./yaml-loader";
 import {
   BACKCOMPAT_OPENAI_ACCOUNT_ID,
@@ -12,6 +13,17 @@ import {
 import { AGENT_TYPES, allPreferenceLists, capabilityOk } from "../providers/select";
 
 export const DEFAULT_CONFIG_PATH = ".ralph/config.yaml";
+
+/**
+ * Expand a leading `~` in a config-declared store path (an account `configDir` / `CLAUDE_CONFIG_DIR`)
+ * to the box home dir so the resolved path is absolute; a path with no leading `~` is returned
+ * unchanged. Shared by the daemon (locating each login's `.credentials.json`) and the `/api/accounts`
+ * read leaf (locating that login's `.claude.json` identity profile) so both resolve the same account
+ * to the same directory.
+ */
+export function expandHome(path: string): string {
+  return path.startsWith("~") ? join(homedir(), path.slice(1).replace(/^[/\\]/, "")) : path;
+}
 
 /** `owner/repo` → `owner-repo`, a filesystem-safe segment for slug-derived paths. */
 function slugToPathSegment(slug: string): string {
