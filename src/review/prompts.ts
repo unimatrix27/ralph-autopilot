@@ -38,6 +38,7 @@ const PHASE1_RUBRIC = [
   "- Conventions: the change follows the target codebase's documented conventions — read its CLAUDE.md / AGENTS.md / ADRs as context for naming, error-handling idioms, layering, and do-not-touch areas (generated code, migrations). A convention violation is a finding.",
   "- Design-authority: flag any diff that deviates from a binding design decision without an escalation.",
   "Severity in phase 1: `P0` = a correctness / security / spec / arch-rule violation that must block the merge. Do NOT raise pure structural / thermo-nuclear quality items here — those belong to phase 2.",
+  "Output discipline: emit ONLY `P0` blockers (plus `escalate` for a finding too risky for a fix agent to apply blind). Do NOT emit nits, minor suggestions, out-of-scope observations, or a strengths / what-went-well summary. If the diff has no P0 blocker, return an empty worklist — a clean pass is the expected, correct result. Never invent, pad, or inflate a lesser observation into a P0 just to have a finding.",
 ].join("\n");
 
 /**
@@ -47,8 +48,9 @@ const PHASE1_RUBRIC = [
  */
 const PHASE2_RUBRIC = [
   "This is an extremely strict maintainability review. Behaviour is already verified correct (phase 1) — every item here MUST be behaviour-preserving, and you must not re-litigate phase-1 correctness.",
-  "Be AMBITIOUS about structural simplification — do not stop at local cleanups. Hunt the 'code-judo' move: a reframing that makes whole branches, helpers, modes, conditionals, or layers disappear, so the change feels inevitable in hindsight. Prefer deleting complexity over rearranging it.",
-  "Flag aggressively (as `P1`):",
+  "Hunt the 'code-judo' move: a reframing that makes whole branches, helpers, modes, conditionals, or layers disappear, so the change feels inevitable in hindsight. Prefer deleting complexity over rearranging it.",
+  "The P1 bar is HIGH — a P1 must be a structural problem serious enough to justify blocking the merge and spending fix attempts on: the code is genuinely hard to maintain or extend as written, and the fix is a clear, high-conviction win. A merely nicer / tidier / more-elegant alternative is NOT a P1. If reasonable engineers would ship the diff as-is, there is no P1. When in doubt, it is not a P1.",
+  "Raise a `P1` ONLY for a high-conviction, merge-blocking instance of:",
   "- Missed simplification: a reframing would delete branches/helpers/conditionals the diff adds.",
   "- Spaghetti growth: ad-hoc conditionals, one-off flags, or special cases bolted into an unrelated flow — push the logic behind its own abstraction, state machine, or the owning module.",
   "- Wrong layer / boundary leak: feature logic leaking into a shared path, or logic that belongs in a different module/layer — name the canonical home.",
@@ -57,7 +59,8 @@ const PHASE2_RUBRIC = [
   "- File-size smell: a file the diff pushes past ~1000 lines is a decomposition signal (a smell, not a hard block — waive with a clear structural reason).",
   "- Type-contract muddiness: needless `any` / `unknown` / casts / optionality papering over a real invariant — prefer an explicit typed model.",
   "- Non-atomic or needlessly sequential orchestration where the cleaner structure is obvious.",
-  "Approval bar: do NOT approve merely because tests pass. Prefer a FEW high-conviction structural findings over a long nit list. If a worthwhile restructuring would change observable behaviour, it is out of scope here — escalate it instead of doing it.",
+  "Output discipline: emit ONLY high-conviction `P1` structural blockers (plus `escalate` for a restructuring too risky to apply blind). Do NOT emit nits, minor suggestions, out-of-scope notes, or a strengths / summary. An empty worklist is a valid, common, and GOOD phase-2 outcome — a reasonably-structured diff has no P1. Never manufacture, pad, or inflate a finding to justify the phase; a review that invents a marginal item to avoid returning empty is a worse review, not a better one.",
+  "If a worthwhile restructuring would change observable behaviour, it is out of scope here — escalate it instead of doing it.",
 ].join("\n");
 
 function phaseGuidance(phase: Phase, mode: Mode): string {
@@ -100,11 +103,12 @@ export function buildReviewPrompt(
     "",
     commentDigest(prComments),
     "",
-    "Produce ONE consolidated, deduplicated, severity-ranked worklist. Tag each item with exactly one disposition:",
-    "- `P0` / `P1`: a blocker that gates the merge (P0 = must-fix correctness/security; P1 = structural).",
-    "- `nit`: a minor suggestion that must NOT gate the merge.",
-    "- `out-of-scope`: a real point that belongs to another issue; does NOT gate.",
-    "- `escalate`: a finding that implies a risky structural change a fix agent should not apply blind.",
+    "Produce ONE consolidated, deduplicated worklist containing ONLY genuine blockers. Tag each item with exactly one disposition:",
+    "- `P0`: a must-fix correctness / security / spec / arch-rule blocker (phase 1).",
+    "- `P1`: a high-conviction, merge-blocking structural problem (phase 2).",
+    "- `escalate`: a blocker that implies a change too risky for a fix agent to apply blind.",
+    "Emit NOTHING else — no nits, no minor suggestions, no out-of-scope notes, no strengths or summary. Per the no-deferral rule, a point either rises to a P0 / P1 / escalate blocker or it is not worth mentioning.",
+    "Do NOT invent, pad, or inflate items. If there is no genuine blocker, return an empty `items` array — a clean pass is the expected, correct result, and returning empty is a good outcome, never a failure to find something.",
     "",
     "Output ONLY this JSON object as the final message, fenced as ```json:",
     '```json',

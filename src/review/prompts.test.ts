@@ -51,6 +51,29 @@ describe("buildReviewPrompt — hardcoded, target-independent rubrics", () => {
   });
 });
 
+describe("buildReviewPrompt — P0/P1-only output discipline (no nits, no padding)", () => {
+  it("phase 1 forbids nits/strengths and treats an empty clean pass as correct", () => {
+    const prompt = buildReviewPrompt(issue, "tdd", 1, 10, []);
+    expect(prompt).toContain("emit ONLY `P0` blockers");
+    expect(prompt).toContain("Never invent, pad, or inflate");
+    expect(prompt.toLowerCase()).toContain("empty worklist");
+  });
+
+  it("phase 2 raises a HIGH P1 bar and blesses an empty result over a manufactured one", () => {
+    const prompt = buildReviewPrompt(issue, "tdd", 2, 10, []);
+    expect(prompt).toContain("The P1 bar is HIGH");
+    expect(prompt).toContain("When in doubt, it is not a P1");
+    expect(prompt).toContain("Never manufacture, pad, or inflate");
+  });
+
+  it("the output contract offers only P0/P1/escalate — nit and out-of-scope are gone", () => {
+    const prompt = buildReviewPrompt(issue, "tdd", 1, 10, []);
+    expect(prompt).toContain("Emit NOTHING else");
+    expect(prompt).not.toContain("`nit`: a minor suggestion");
+    expect(prompt).not.toContain("out-of-scope`: a real point");
+  });
+});
+
 describe("buildFixPrompt — mode-aware gate (AC4)", () => {
   it("tdd keeps the build and tests green", () => {
     const prompt = buildFixPrompt(
