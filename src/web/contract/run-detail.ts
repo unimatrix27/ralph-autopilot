@@ -175,6 +175,12 @@ export const runHeaderSchema = z
     mode: runModeSchema,
     branch: z.string().nullable(),
     prNumber: prNumber.nullable(),
+    /**
+     * The GitHub issue title, captured on the run row at dispatch (issue #13), so the run-detail
+     * header can show *which* issue this run is. `null` for a run predating the column — the
+     * header falls back to the `repo #issue` reference.
+     */
+    title: z.string().nullable(),
     /** ISO-8601 instant the run row was created (the duration anchor). */
     startedAt: z.string(),
     /** ISO-8601 instant the run row last changed (the duration's far end). */
@@ -218,6 +224,12 @@ export const runSummarySchema = z
     mode: runModeSchema,
     branch: z.string().nullable(),
     prNumber: prNumber.nullable(),
+    /**
+     * The GitHub issue title, captured on the run row at dispatch (issue #13), so a run-history
+     * row heads with *which* issue it was — durable even after the issue closes. `null` for a
+     * run predating the column; the UI falls back to the `repo #issue` reference.
+     */
+    title: z.string().nullable(),
     startedAt: z.string(),
     updatedAt: z.string(),
   })

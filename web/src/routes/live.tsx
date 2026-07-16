@@ -5,17 +5,18 @@ import { fetchOverview } from "@/lib/api";
 import { formatDuration, useNow } from "@/lib/time";
 import { ALL_REPOS, useRepoFilter } from "@/components/repo-filter";
 import { fleetLineKey, useLiveLines, useLiveStatus, type FleetLineEntry } from "@/lib/live";
+import { githubIssueUrl, issueHeading } from "@/lib/github";
 import { PageHeader } from "@/components/page";
 import { RouteChip } from "@/components/route-chip";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 /**
- * The **Live / Fleet wall** (issue #109): one card per running agent, each streaming its
- * phase, elapsed, fix-attempt, and the latest tool call / assistant line over SSE. The
- * fleet *structure* comes from the Overview projection (refreshed by the live feed's
- * coalesced invalidation on lifecycle changes); the per-card live line and the elapsed
- * clock update continuously without a refetch.
+ * The **Live / Fleet wall** (issue #109, #13): a single-column list — one full-width row per
+ * running agent, headed by its GitHub issue title — each streaming its phase, elapsed,
+ * fix-attempt, and the latest tool call / assistant line over SSE. The fleet *structure* comes
+ * from the Overview projection (refreshed by the live feed's coalesced invalidation on lifecycle
+ * changes); the per-row live line and the elapsed clock update continuously without a refetch.
  */
 export function LivePage() {
   const { repo } = useRepoFilter();
@@ -66,9 +67,9 @@ export function LivePage() {
       )}
 
       {fleet.length > 0 && (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <div className="space-y-3">
           {fleet.map((agent) => (
-            <FleetCard
+            <FleetRow
               key={fleetLineKey(agent.repo, agent.issue)}
               agent={agent}
               entry={lines[fleetLineKey(agent.repo, agent.issue)]}
@@ -99,40 +100,58 @@ function LiveIndicator({ status }: { status: "connecting" | "open" }) {
 }
 
 /**
- * One running-agent card: phase + elapsed + fix-attempt, with the live tool/assistant line.
- * Expanding it (a click) opens the run's full streaming transcript (issue #111).
+ * One full-width running-agent row (issue #13): headed by the GitHub issue title (fallback to
+ * `repo #issue` when the title is null), with the repo + `#issue` reference linking out to the
+ * issue on GitHub, plus phase + elapsed + fix-attempt + route and the live tool/assistant line.
+ *
+ * The row navigates to the run's streaming transcript (issue #111), but the GitHub reference is
+ * its own external anchor — an `<a>` nested in a router `Link` is invalid HTML. So the transcript
+ * `Link` is a stretched overlay covering the row (below the content), while the GitHub anchor
+ * sits above it (`relative z-10`) and stops propagation, so clicking it opens *only* GitHub while
+ * clicking anywhere else on the row opens the transcript.
  */
-function FleetCard({ agent, entry, now }: { agent: FleetAgent; entry: FleetLineEntry | undefined; now: number }) {
+function FleetRow({ agent, entry, now }: { agent: FleetAgent; entry: FleetLineEntry | undefined; now: number }) {
+  const heading = issueHeading(agent.title, agent.repo, agent.issue);
   return (
-    <Link
-      to="/run"
-      search={{ repo: agent.repo, issue: agent.issue }}
-      className="block transition-shadow hover:ring-2 hover:ring-ring focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      aria-label={`Open transcript for ${agent.repo} #${agent.issue}`}
-    >
-      <Card className="overflow-hidden">
-        <CardHeader className="pb-3">
-          <CardTitle className="flex items-center justify-between gap-2 text-sm font-medium">
-            <span className="font-mono text-xs text-muted-foreground">
+    <Card className="relative overflow-hidden transition-shadow hover:ring-2 hover:ring-ring focus-within:ring-2 focus-within:ring-ring">
+      {/* Stretched overlay → the transcript. Non-interactive row area sits below it, so a click
+          there navigates; the GitHub anchor below is lifted above it to opt out. */}
+      <Link
+        to="/run"
+        search={{ repo: agent.repo, issue: agent.issue }}
+        className="absolute inset-0 z-0 focus:outline-none"
+        aria-label={`Open transcript for ${heading}`}
+      />
+      <CardHeader className="pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 space-y-0.5">
+            <CardTitle className="truncate text-sm font-medium text-foreground">{heading}</CardTitle>
+            <a
+              href={githubIssueUrl(agent.repo, agent.issue)}
+              target="_blank"
+              rel="noreferrer noopener"
+              onClick={(e) => e.stopPropagation()}
+              className="relative z-10 inline-flex font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
+            >
               {agent.repo}
               <span className="text-foreground"> #{agent.issue}</span>
-            </span>
-            <span className="font-mono text-xs tabular-nums text-muted-foreground">
-              {formatDuration(now - Date.parse(agent.phaseStartedAt))}
-            </span>
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="running">{agent.phase}</Badge>
-            {agent.fixAttempt > 0 && <span className="text-xs text-muted-foreground">fix #{agent.fixAttempt}</span>}
-            {/* The live route of the running phase — provider · model · account (#165). */}
-            <RouteChip route={agent.route} />
+            </a>
           </div>
-          <LiveLineRow entry={entry} />
-        </CardContent>
-      </Card>
-    </Link>
+          <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+            {formatDuration(now - Date.parse(agent.phaseStartedAt))}
+          </span>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="running">{agent.phase}</Badge>
+          {agent.fixAttempt > 0 && <span className="text-xs text-muted-foreground">fix #{agent.fixAttempt}</span>}
+          {/* The live route of the running phase — provider · model · account (#165). */}
+          <RouteChip route={agent.route} />
+        </div>
+        <LiveLineRow entry={entry} />
+      </CardContent>
+    </Card>
   );
 }
 

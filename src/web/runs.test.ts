@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { toRunSummary, toRunsResponse, toRunDetailResponse } from "./runs";
-import { runDetailResponseSchema, runsResponseSchema } from "./contract";
+import { runDetailResponseSchema, runSummarySchema, runsResponseSchema } from "./contract";
 import type { Run } from "../store/types";
 import type { RecordedStreamEvent, RecordedTranscriptEvent } from "../store/event-log";
 
@@ -16,6 +16,7 @@ function run(over: Partial<Run> = {}): Run {
     branch: "ralph/111-x",
     worktreePath: "/tmp/wt",
     prNumber: 42,
+    issueTitle: "Sample run title",
     createdAt: "2026-06-22T00:00:00.000Z",
     updatedAt: "2026-06-22T00:30:00.000Z",
     ...over,
@@ -53,6 +54,15 @@ describe("toRunSummary", () => {
   it("derives the runId from the numeric run id", () => {
     expect(toRunSummary(run({ id: 17 })).runId).toBe("17");
   });
+
+  it("carries the issue title, null-safe for a pre-migration run, round-tripping the schema (#13)", () => {
+    for (const title of ["Live view titles", null]) {
+      const summary = toRunSummary(run({ issueTitle: title }));
+      expect(summary.title).toBe(title);
+      // runSummarySchema round-trips the new nullable field across serialize + parse (ADR-0031).
+      expect(runSummarySchema.parse(JSON.parse(JSON.stringify(summary)))).toEqual(summary);
+    }
+  });
 });
 
 describe("toRunDetailResponse", () => {
@@ -73,6 +83,16 @@ describe("toRunDetailResponse", () => {
     expect(out.run.prNumber).toBe(42);
     expect(out.run.spanStartGlobalPosition).toBe(1);
     expect(out.timeline.map((t) => t.type)).toEqual(["RunStarted", "AnomalyDetected", "Merged"]);
+  });
+
+  it("carries the issue title onto the run-detail header, null-safe (#13)", () => {
+    const titled = toRunDetailResponse({ run: run({ issueTitle: "Header title" }), timeline: [], transcript: [], now: NOW });
+    expect(runDetailResponseSchema.safeParse(titled).success).toBe(true);
+    expect(titled.run.title).toBe("Header title");
+
+    const untitled = toRunDetailResponse({ run: run({ issueTitle: null }), timeline: [], transcript: [], now: NOW });
+    expect(runDetailResponseSchema.safeParse(untitled).success).toBe(true);
+    expect(untitled.run.title).toBeNull();
   });
 
   it("surfaces the per-phase route on each RouteResolved timeline entry (ADR-0037 P3.1, #164)", () => {

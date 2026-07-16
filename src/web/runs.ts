@@ -53,6 +53,8 @@ export function toRunSummary(run: Run): RunSummary {
     mode: run.mode,
     branch: run.branch,
     prNumber: run.prNumber,
+    // The issue title captured at dispatch (issue #13); null for a pre-migration run.
+    title: run.issueTitle,
     startedAt: run.createdAt,
     updatedAt: run.updatedAt,
   };
@@ -231,6 +233,8 @@ export function toRunDetailResponse(input: {
       mode: run.mode,
       branch: run.branch,
       prNumber: run.prNumber,
+      // The issue title captured at dispatch (issue #13); null for a pre-migration run.
+      title: run.issueTitle,
       startedAt: run.createdAt,
       updatedAt: input.projection?.updatedAt ?? run.updatedAt,
       spanStartGlobalPosition: spanStart,

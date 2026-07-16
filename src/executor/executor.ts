@@ -264,6 +264,9 @@ export class Executor {
         tier: readTier(issue.labels),
         branch,
         worktreePath,
+        // Plumb the issue title once, at dispatch (issue #13): durable on the run row for the
+        // fleet/run views, without any read-time GitHub call.
+        issueTitle: issue.title,
       });
       const agent = store.addAgent({ runId: run.id, worktreePath, branch });
       // Open the run span (issue #80): a re-pickup appends a new `RunStarted` (abandoning
@@ -361,6 +364,7 @@ export class Executor {
       branch,
       worktreePath,
       prNumber: run.prNumber,
+      issueTitle: issue.title,
     });
     for (const q of store.listOpenQuestions()) {
       if (q.runId === run.id) {
@@ -576,7 +580,7 @@ export class Executor {
 
     const worktreePath = await worktrees.attach(branch, dirName);
     const prNumber = pr.number;
-    store.upsertRun({ issueNumber: issue.number, mode: run.mode, tier: run.tier, branch, worktreePath, prNumber });
+    store.upsertRun({ issueNumber: issue.number, mode: run.mode, tier: run.tier, branch, worktreePath, prNumber, issueTitle: issue.title });
     if (opts.afterRunning) {
       await opts.afterRunning(log);
     }
@@ -715,6 +719,7 @@ export class Executor {
       mode,
       tier: readTier(issue.labels),
       branch: branchName(issueNumber, issue.title),
+      issueTitle: issue.title,
     });
     const anomalyReason = `claim-failed-after-${failures}-attempts`;
     // The terminal status is event-sourced (issue #83): append the `RunStuck` fact so the
@@ -856,7 +861,7 @@ export class Executor {
       return { runId, branch, worktreePath, prNumber: null };
     }
 
-    store.upsertRun({ issueNumber: issue.number, mode, tier: readTier(issue.labels), branch, worktreePath, prNumber });
+    store.upsertRun({ issueNumber: issue.number, mode, tier: readTier(issue.labels), branch, worktreePath, prNumber, issueTitle: issue.title });
     store.appendLog({ runId, issueNumber: issue.number, level: "info", event: "pr-opened", data: { prNumber } });
 
     await this.runReviewLoop({ issue, mode, runId, agentId, prNumber, branch, worktreePath, abortSignal, log });
@@ -969,7 +974,7 @@ export class Executor {
     const prNumber = pr.number;
     // Refresh the re-attached worktree path; keep status awaiting-merge (the merge
     // lease, not the status, marks "currently integrating", so a crash re-picks it).
-    store.upsertRun({ issueNumber: issue.number, mode: run.mode, tier: run.tier, branch, worktreePath, prNumber });
+    store.upsertRun({ issueNumber: issue.number, mode: run.mode, tier: run.tier, branch, worktreePath, prNumber, issueTitle: issue.title });
     const agent = store.addAgent({ runId: run.id, worktreePath, branch });
     store.appendLog({ runId: run.id, issueNumber: issue.number, level: "info", event: "integrate", data: { branch, prNumber } });
     log.info("agent.integrate", { branch, prNumber });

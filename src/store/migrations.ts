@@ -227,6 +227,18 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE runs ADD COLUMN tier INTEGER;
     `,
   },
+  {
+    version: 9,
+    name: "run-issue-title",
+    // Live + Runs views (issue #13): persist the GitHub issue title on the run row at
+    // dispatch, so both the fleet view and run history can head a run with *which* issue
+    // it is — durable for run history without any read-time GitHub call (the read edge
+    // stays SQLite-only, ADR-0029), even after the issue closes. Additive + nullable:
+    // pre-existing rows stay NULL and every consumer degrades gracefully to `repo #issue`.
+    up: `
+      ALTER TABLE runs ADD COLUMN issue_title TEXT;
+    `,
+  },
 ];
 
 /**

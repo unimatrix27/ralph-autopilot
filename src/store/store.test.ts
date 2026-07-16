@@ -132,6 +132,53 @@ describe("migrations", () => {
     ).toBe(0);
     db.close();
   });
+
+  it("adds the nullable issue_title column additively (v9)", () => {
+    const db = new BetterSqlite3(MEMORY_DB);
+    runMigrations(db);
+    const cols = db
+      .prepare<[], { name: string }>("PRAGMA table_info(runs)")
+      .all()
+      .map((r) => r.name);
+    expect(cols).toContain("issue_title");
+    db.close();
+  });
+
+  it("applies the issue_title migration idempotently against a pre-migration DB, reading old rows back with a null title (#13)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ralph-title-migration-"));
+    const path = join(dir, "ralph.sqlite");
+    const db = new BetterSqlite3(path);
+    db.exec(
+      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);",
+    );
+    // Stand up the schema at the version *before* issue_title existed, recording each so
+    // runMigrations sees a DB that only needs the new column.
+    for (const m of MIGRATIONS.filter((mm) => mm.version <= 8)) {
+      db.exec(m.up);
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, 't')").run(m.version, m.name);
+    }
+    // A run row seeded under the pre-migration schema — it has no issue_title column.
+    db.prepare(
+      "INSERT INTO runs (repo, issue_number, mode, tier, branch, worktree_path, pr_number, created_at, updated_at) VALUES ('acme/widgets', 5, 'tdd', NULL, 'ralph/5-x', '/wt/5', NULL, 't', 't')",
+    ).run();
+    db.close();
+
+    // Opening the pre-migration DB succeeds; the additive migration lands and the old row
+    // reads back with a null title (every consumer degrades gracefully).
+    const store = openStore(path);
+    const cols = store.db
+      .prepare<[], { name: string }>("PRAGMA table_info(runs)")
+      .all()
+      .map((r) => r.name);
+    expect(cols).toContain("issue_title");
+    expect(store.getRunByIssue("acme/widgets", 5)?.issueTitle).toBeNull();
+    store.close();
+
+    // Re-opening applies nothing new (idempotent) and still reads the old row cleanly.
+    const reopened = openStore(path);
+    expect(reopened.getRunByIssue("acme/widgets", 5)?.issueTitle).toBeNull();
+    reopened.close();
+  });
 });
 
 describe("Store", () => {
@@ -203,6 +250,23 @@ describe("Store", () => {
       // The merged status is the fold of the `Merged` fact, not a row field.
       await store.recordMerged(REPO, 1, { runId: created.id, prNumber: 99 });
       expect(store.getRun(created.id)?.status).toBe("merged");
+    });
+
+    it("persists the issue title at dispatch, preserving it across a title-less upsert (#13)", () => {
+      const created = store.upsertRun({ repo: REPO, issueNumber: 50, mode: "tdd", issueTitle: "Plumb the title once" });
+      expect(created.issueTitle).toBe("Plumb the title once");
+      expect(store.getRunByIssue(REPO, 50)?.issueTitle).toBe("Plumb the title once");
+
+      // A later upsert (e.g. recording the PR) that does not re-pass the title must NOT
+      // clobber it to null — the title is durable for run history (issue #13, ADR-0029).
+      const updated = store.upsertRun({ repo: REPO, issueNumber: 50, mode: "tdd", prNumber: 7 });
+      expect(updated.issueTitle).toBe("Plumb the title once");
+      expect(updated.prNumber).toBe(7);
+    });
+
+    it("leaves the issue title null when a run is created without one (#13)", () => {
+      const created = store.upsertRun({ repo: REPO, issueNumber: 51, mode: "tdd" });
+      expect(created.issueTitle).toBeNull();
     });
 
     it("derives status from the issue stream's facts (append → fold → derived status)", async () => {

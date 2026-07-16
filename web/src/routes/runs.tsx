@@ -4,6 +4,7 @@ import type { RunStatusWire, RunSummary } from "@contract";
 import { fetchRuns } from "@/lib/api";
 import { ALL_REPOS, useRepoFilter } from "@/components/repo-filter";
 import { formatWaited, useNow } from "@/lib/time";
+import { githubIssueUrl, issueHeading } from "@/lib/github";
 import { PageHeader } from "@/components/page";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
@@ -75,21 +76,43 @@ export function RunsPage() {
   );
 }
 
+/**
+ * One run-history row (issue #13): the GitHub issue title is the row's primary text (fallback
+ * to `repo #issue` when the title is null — durable even for a finished run whose issue has
+ * since closed), with the repo + `#issue` reference linking out to the issue on GitHub.
+ *
+ * The row navigates to the transcript, but the GitHub reference is its own external anchor — an
+ * `<a>` nested in a router `Link` is invalid HTML. So the transcript `Link` is a stretched
+ * overlay covering the row and the GitHub anchor sits above it (`relative z-10`) with propagation
+ * stopped, so clicking it opens *only* GitHub while a click anywhere else opens the transcript.
+ */
 function RunRow({ run, nowMs }: { run: RunSummary; nowMs: number }) {
   const meta = STATUS_META[run.status];
+  const heading = issueHeading(run.title, run.repo, run.issue);
   return (
-    <Link
-      to="/run"
-      search={{ repo: run.repo, issue: run.issue }}
-      className="flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-muted/40"
-    >
+    <div className="relative flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-muted/40">
+      <Link
+        to="/run"
+        search={{ repo: run.repo, issue: run.issue }}
+        className="absolute inset-0 z-0 focus:outline-none"
+        aria-label={`Open transcript for ${heading}`}
+      />
       <Badge variant={meta.variant} className="shrink-0">
         {meta.label}
       </Badge>
-      <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
-        {run.repo}
-        <span className="text-foreground"> #{run.issue}</span>
-      </span>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-foreground">{heading}</div>
+        <a
+          href={githubIssueUrl(run.repo, run.issue)}
+          target="_blank"
+          rel="noreferrer noopener"
+          onClick={(e) => e.stopPropagation()}
+          className="relative z-10 inline-flex font-mono text-xs text-muted-foreground hover:text-foreground hover:underline"
+        >
+          {run.repo}
+          <span className="text-foreground"> #{run.issue}</span>
+        </a>
+      </div>
       <Badge variant="outline" className="hidden shrink-0 sm:inline-flex">
         {run.mode}
       </Badge>
@@ -97,6 +120,6 @@ function RunRow({ run, nowMs }: { run: RunSummary; nowMs: number }) {
         <span className="hidden shrink-0 font-mono text-xs text-muted-foreground sm:inline">PR #{run.prNumber}</span>
       )}
       <span className="shrink-0 tabular-nums text-xs text-muted-foreground">{formatWaited(run.updatedAt, nowMs)} ago</span>
-    </Link>
+    </div>
   );
 }

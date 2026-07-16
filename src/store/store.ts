@@ -40,6 +40,8 @@ interface RunRow {
   branch: string | null;
   worktree_path: string | null;
   pr_number: number | null;
+  /** The GitHub issue title, captured at dispatch (issue #13); null for pre-migration rows. */
+  issue_title: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -147,6 +149,7 @@ export class Store {
       branch: row.branch,
       worktreePath: row.worktree_path,
       prNumber: row.pr_number,
+      issueTitle: row.issue_title ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -162,14 +165,18 @@ export class Store {
     const ts = this.now();
     this.db
       .prepare(
-        `INSERT INTO runs (repo, issue_number, mode, tier, branch, worktree_path, pr_number, created_at, updated_at)
-         VALUES (@repo, @issue_number, @mode, @tier, @branch, @worktree_path, @pr_number, @ts, @ts)
+        `INSERT INTO runs (repo, issue_number, mode, tier, branch, worktree_path, pr_number, issue_title, created_at, updated_at)
+         VALUES (@repo, @issue_number, @mode, @tier, @branch, @worktree_path, @pr_number, @issue_title, @ts, @ts)
          ON CONFLICT(repo, issue_number) DO UPDATE SET
            mode = excluded.mode,
            tier = excluded.tier,
            branch = excluded.branch,
            worktree_path = excluded.worktree_path,
            pr_number = excluded.pr_number,
+           -- The title is plumbed once at dispatch and is durable for run history (issue #13):
+           -- a later upsert that does not re-pass it (e.g. recording the PR) must NOT clobber
+           -- it to null, so keep the existing value when the incoming one is absent.
+           issue_title = COALESCE(excluded.issue_title, runs.issue_title),
            updated_at = excluded.updated_at`,
       )
       .run({
@@ -180,6 +187,7 @@ export class Store {
         branch: input.branch ?? null,
         worktree_path: input.worktreePath ?? null,
         pr_number: input.prNumber ?? null,
+        issue_title: input.issueTitle ?? null,
         ts,
       });
     const run = this.getRunByIssue(input.repo, input.issueNumber);

@@ -19,6 +19,7 @@ import {
   type ToolStatus,
 } from "@contract";
 import { cn } from "@/lib/utils";
+import { githubIssueUrl, issueHeading } from "@/lib/github";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { RouteChip } from "@/components/route-chip";
@@ -364,13 +365,22 @@ export function RunHeaderCard({ header, nowMs }: { header: RunHeaderView; nowMs:
   return (
     <Card>
       <CardContent className="space-y-3 py-4">
+        {/* The GitHub issue title heads the run (issue #13); null-safe fallback to repo #issue. */}
+        <h2 className="text-base font-semibold leading-tight text-foreground">
+          {issueHeading(header.title, header.repo, header.issue)}
+        </h2>
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={toneVariant(header.statusTone)}>{header.statusLabel}</Badge>
           <Badge variant="outline">{header.mode}</Badge>
-          <span className="font-mono text-sm text-muted-foreground">
+          <a
+            href={githubIssueUrl(header.repo, header.issue)}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="font-mono text-sm text-muted-foreground hover:text-foreground hover:underline"
+          >
             {header.repo}
             <span className="text-foreground"> #{header.issue}</span>
-          </span>
+          </a>
           {header.prNumber !== null && (
             <Badge variant="outline" className="font-mono">
               PR #{header.prNumber}

@@ -198,6 +198,11 @@ export interface TimelineNode {
 export interface RunHeaderView {
   repo: string;
   issue: number;
+  /**
+   * The GitHub issue title, captured at dispatch (issue #13), or `null` for a run predating
+   * the column — the header falls back to the `repo #issue` reference.
+   */
+  title: string | null;
   runId: string;
   status: RunStatusWire;
   statusLabel: string;
@@ -1082,6 +1087,7 @@ function buildHeader(detail: RunDetailResponse, derived: DerivedTimeline): RunHe
   return {
     repo: run.repo,
     issue: run.issue,
+    title: run.title,
     runId: run.runId,
     status: run.status,
     statusLabel: STATUS_LABELS[run.status],

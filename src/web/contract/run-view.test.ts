@@ -37,6 +37,7 @@ function detail(over: Partial<RunDetailResponse> = {}): RunDetailResponse {
     run: {
       repo: "owner/repo",
       issue: 111,
+      title: "Sample run title",
       runId: "5",
       status: "merged",
       mode: "tdd",
