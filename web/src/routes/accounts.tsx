@@ -5,6 +5,7 @@ import { fetchAccounts, postRoutingEdit } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { relativeTo, useNow } from "@/lib/time";
 import { PageHeader } from "@/components/page";
+import { UsageWindows } from "@/components/usage-windows";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -161,7 +162,7 @@ function AccountRow({
           </Button>
         </div>
       </div>
-      <UsageWindows account={account} threshold={threshold} now={now} />
+      <UsageWindows windows={usage.windows} threshold={threshold} now={now} />
     </li>
   );
 }
@@ -194,37 +195,6 @@ function AccountIdentity({ account }: { account: PoolAccount }) {
           auth token env <span className="font-mono">{account.authTokenEnvName}</span>
         </div>
       )}
-    </div>
-  );
-}
-
-/** The per-window utilization bars + reset ETAs — the null convention (no bars) when never used. */
-function UsageWindows({ account, threshold, now }: { account: PoolAccount; threshold: number; now: number }) {
-  const { windows } = account.usage;
-  if (windows.length === 0) {
-    return <p className="mt-2 text-xs text-muted-foreground">No plan signal yet — utilization unknown.</p>;
-  }
-  return (
-    <div className="mt-2 space-y-1">
-      {windows.map((w) => {
-        const pct = w.utilization;
-        const over = pct !== null && pct >= threshold;
-        return (
-          <div key={w.type} className="flex items-center gap-3 text-xs">
-            <span className="w-20 shrink-0 font-mono text-muted-foreground">{w.type}</span>
-            <div className="h-2 flex-1 overflow-hidden rounded-full bg-muted">
-              <div
-                className={over ? "h-full bg-status-danger" : "h-full bg-status-running"}
-                style={{ width: `${Math.min(100, Math.max(0, pct ?? 0))}%` }}
-              />
-            </div>
-            <span className="w-10 shrink-0 text-right tabular-nums">{pct === null ? "—" : `${pct}%`}</span>
-            <span className="w-24 shrink-0 text-right text-muted-foreground" title={w.resetsAt ?? undefined}>
-              {w.resetsAt ? `resets ${relativeTo(w.resetsAt, now)}` : ""}
-            </span>
-          </div>
-        );
-      })}
     </div>
   );
 }
