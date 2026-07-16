@@ -11,7 +11,7 @@
 # The base ref is PINNED (ADR-0038 lifecycle): the FROM line is part of the L2 content key, so
 # bumping this version is what re-keys + rebuilds this image onto a new base (a floating :latest
 # would silently keep the old base forever — the key never moves when the tag's contents change).
-FROM ralph/agent-base:0.0.4
+FROM ralph/agent-base:0.0.5
 
 # Warm the `ralph` user's npm cache from the lockfile. The base's own `npm ci` ran as root, so
 # its cache lives in /root — not in ~ralph; this primes ~/.npm/_cacache so a run-time `npm ci`
