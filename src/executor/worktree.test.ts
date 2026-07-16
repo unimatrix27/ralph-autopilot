@@ -443,10 +443,11 @@ describe("GitWorktreeManager verifyBranchRebasedOntoBase (#273)", () => {
     advanceBase("shared.txt", "base version\n");
     // The daemon detects + aborts; the container resolves + force-pushes the rebased branch.
     const rebase = await mgr.rebaseOntoBase(path, "ralph/273-ok", "master");
-    expect(rebase.kind).toBe("conflict");
+    if (rebase.kind !== "conflict") throw new Error("expected a conflict");
     containerResolveAndPush("ralph/273-ok", "shared.txt", "base version\nbranch version\n");
 
-    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/273-ok", "master")).toBe(true);
+    // Verify against the base the fix was DISPATCHED against (carried on the conflict result, #20).
+    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/273-ok", "master", rebase.baseSha)).toBe(true);
   });
 
   it("returns false (fail loud) when the resolution did NOT land — origin still conflicts with base", async () => {
@@ -458,10 +459,12 @@ describe("GitWorktreeManager verifyBranchRebasedOntoBase (#273)", () => {
     git(path, "push", "-u", "origin", "ralph/273-stale");
 
     advanceBase("shared.txt", "base version\n");
-    await mgr.rebaseOntoBase(path, "ralph/273-stale", "master");
+    const rebase = await mgr.rebaseOntoBase(path, "ralph/273-stale", "master");
+    if (rebase.kind !== "conflict") throw new Error("expected a conflict");
     // The container reported `fixed` but never actually force-pushed (a silent no-op) — origin's
-    // branch still forks off the OLD base, so it still conflicts. The daemon must NOT assume it landed.
-    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/273-stale", "master")).toBe(false);
+    // branch still forks off the OLD base, so it does not contain the DISPATCH base. Even verifying
+    // against that dispatch base (not a moved one) must fail loud — this is the real #273 failure.
+    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/273-stale", "master", rebase.baseSha)).toBe(false);
   });
 
   it("returns false when a wiped (base-equivalent) branch landed — the #241 no-net-diff invariant rides along", async () => {
@@ -473,6 +476,9 @@ describe("GitWorktreeManager verifyBranchRebasedOntoBase (#273)", () => {
     git(path, "push", "-u", "origin", "ralph/273-wipe");
 
     advanceBase("other.txt", "base change\n");
+    // The dispatch base the (bad) resolution claimed to integrate is the advanced master.
+    git(clone, "fetch", "origin", "master");
+    const dispatchBaseSha = git(clone, "rev-parse", "origin/master").trim();
     // A bad resolution force-pushed a base-equivalent branch (the work was wiped). It contains
     // base as an ancestor (so it "merges cleanly") but carries NO net work — must still fail loud.
     const container = join(mkdtempSync(join(tmpdir(), "ralph-wipe-")), "c");
@@ -481,7 +487,55 @@ describe("GitWorktreeManager verifyBranchRebasedOntoBase (#273)", () => {
     git(container, "branch", "-f", "ralph/273-wipe", "master");
     git(container, "push", "--force", "origin", "ralph/273-wipe");
 
-    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/273-wipe", "master")).toBe(false);
+    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/273-wipe", "master", dispatchBaseSha)).toBe(false);
+  });
+
+  it("returns true when base advanced AGAIN after the resolution landed on the dispatch base (#20)", async () => {
+    const mgr = new GitWorktreeManager(clone, wtRoot);
+    const path = await mgr.create("ralph/20-race", "20-race");
+    writeFileSync(join(path, "shared.txt"), "branch version\n");
+    git(path, "add", "shared.txt");
+    git(path, "commit", "-m", "branch edit");
+    git(path, "push", "-u", "origin", "ralph/20-race");
+
+    advanceBase("shared.txt", "base version\n");
+    const rebase = await mgr.rebaseOntoBase(path, "ralph/20-race", "master");
+    if (rebase.kind !== "conflict") throw new Error("expected a conflict");
+    // The container rebased onto the base it was handed (rebase.baseSha) and force-pushed cleanly.
+    containerResolveAndPush("ralph/20-race", "shared.txt", "base version\nbranch version\n");
+
+    // A SECOND sibling merges into base on a disjoint file, AFTER the resolution landed — origin's
+    // current base is now one commit ahead of what the fix integrated.
+    advanceBase("disjoint.txt", "another base change\n");
+
+    // Verifying against the DISPATCH base still passes: the resolution did exactly what it was asked.
+    // (Verifying against origin's current base — the #20 bug — would falsely fail "push landed nothing".)
+    expect(await mgr.verifyBranchRebasedOntoBase(path, "ralph/20-race", "master", rebase.baseSha)).toBe(true);
+  });
+
+  it("adoptOriginBranch resets the worktree to the runner-pushed resolution so a re-rebase can proceed (#20)", async () => {
+    const mgr = new GitWorktreeManager(clone, wtRoot);
+    const path = await mgr.create("ralph/20-adopt", "20-adopt");
+    writeFileSync(join(path, "shared.txt"), "branch version\n");
+    git(path, "add", "shared.txt");
+    git(path, "commit", "-m", "branch edit");
+    git(path, "push", "-u", "origin", "ralph/20-adopt");
+
+    advanceBase("shared.txt", "base version\n");
+    const rebase = await mgr.rebaseOntoBase(path, "ralph/20-adopt", "master");
+    expect(rebase.kind).toBe("conflict");
+    // The container force-pushes rewritten history; the daemon worktree's local ref still holds the
+    // pre-resolution history, which now DIVERGES from origin (a plain sync would refuse to clobber it).
+    containerResolveAndPush("ralph/20-adopt", "shared.txt", "base version\nbranch version\n");
+
+    await mgr.adoptOriginBranch(path, "ralph/20-adopt");
+
+    // The worktree HEAD now equals origin/<branch> — the resolved history is adopted.
+    expect(git(path, "rev-parse", "HEAD").trim()).toBe(git(path, "rev-parse", "origin/ralph/20-adopt").trim());
+    // A subsequent rebaseOntoBase no longer refuses on divergence: base did not advance, so it is a
+    // clean (unmoved) rebase — the loop can proceed to merge.
+    const again = await mgr.rebaseOntoBase(path, "ralph/20-adopt", "master");
+    expect(again).toEqual({ kind: "clean", moved: false });
   });
 });
 

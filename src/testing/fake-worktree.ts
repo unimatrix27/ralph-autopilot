@@ -16,7 +16,15 @@ export class FakeWorktreeManager implements WorktreeManager {
   /** Audit trail of rebase calls, for assertions. */
   readonly rebased: Array<{ worktreePath: string; branch: string; baseBranch: string }> = [];
   /** Audit trail of {@link verifyBranchRebasedOntoBase} calls, for assertions. */
-  readonly rebaseVerifyCalls: Array<{ worktreePath: string; branch: string; baseBranch: string }> = [];
+  readonly rebaseVerifyCalls: Array<{
+    worktreePath: string;
+    branch: string;
+    baseBranch: string;
+    /** The dispatch-time base SHA the resolution is verified against (#20). */
+    dispatchBaseSha: string;
+  }> = [];
+  /** Audit trail of {@link adoptOriginBranch} calls, for assertions. */
+  readonly adopted: Array<{ worktreePath: string; branch: string }> = [];
   /** Audit trail of {@link branchDiffHash} calls, for assertions. */
   readonly branchDiffHashCalls: Array<{ worktreePath: string; baseBranch: string }> = [];
   /** Local `ralph/*` branches the clone would report; pruned against the keep-set. */
@@ -91,9 +99,14 @@ export class FakeWorktreeManager implements WorktreeManager {
     worktreePath: string,
     branch: string,
     baseBranch: string,
+    dispatchBaseSha: string,
   ): Promise<boolean> {
-    this.rebaseVerifyCalls.push({ worktreePath, branch, baseBranch });
+    this.rebaseVerifyCalls.push({ worktreePath, branch, baseBranch, dispatchBaseSha });
     return this.rebaseVerifyResults.length > 0 ? this.rebaseVerifyResults.shift()! : true;
+  }
+
+  async adoptOriginBranch(worktreePath: string, branch: string): Promise<void> {
+    this.adopted.push({ worktreePath, branch });
   }
 
   async branchDiffHash(worktreePath: string, baseBranch: string): Promise<string | null> {
