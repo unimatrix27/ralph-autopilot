@@ -80,6 +80,15 @@ import { sanitizeForFence } from "../core/fenced-payload";
 const CI_PHASE: Phase = 0;
 
 /**
+ * Bound on rebase-conflict resolution rounds (issue #20). A landed resolution can find base has
+ * advanced again inside its fix window (a sibling PR merging on a hot repo); the sync loop re-rebases
+ * — usually a clean self-heal, a fresh conflict is a new round. This caps the rounds so a
+ * pathologically hot base still terminates in a heal-card that names the RACE (not a phantom push
+ * failure). Chosen to match the review fix-attempt budget's spirit (a few tries, then a human).
+ */
+const MAX_REBASE_ROUNDS = 3;
+
+/**
  * Merge knobs the loop needs (a structural copy of `config.merge`, ADR-0014) so
  * the review module does not depend on the config schema.
  */
@@ -895,26 +904,52 @@ export class ReviewLoop {
   ): Promise<SyncResult> {
     const log = ctx.logger;
     this.setPhase(ctx, MERGE);
-    const rebase = await this.deps.worktrees.rebaseOntoBase(
-      ctx.worktreePath,
-      ctx.branch,
-      this.deps.baseBranch,
-    );
-    log.info("review.rebase", { kind: rebase.kind, ...(rebase.kind === "clean" ? { moved: rebase.moved } : { files: rebase.files.length }) });
 
-    let branchMoved: boolean;
-    if (rebase.kind === "conflict") {
+    // Bounded resolution rounds (issue #20). A rebase conflict is resolved out-of-tree, but base can
+    // advance again inside that fix window (a sibling PR merging on a hot repo). A landed resolution
+    // that finds base moved loops back through the normal rebase — usually a clean, self-healed
+    // re-rebase; a genuinely new conflict is a fresh round, dispatched against its own (newer) base.
+    // Bound the rounds so a pathologically hot base still terminates in an honest heal-card.
+    let branchMoved = false;
+    for (let round = 0; ; ) {
+      const rebase = await this.deps.worktrees.rebaseOntoBase(
+        ctx.worktreePath,
+        ctx.branch,
+        this.deps.baseBranch,
+      );
+      log.info("review.rebase", { kind: rebase.kind, ...(rebase.kind === "clean" ? { moved: rebase.moved } : { files: rebase.files.length }) });
+
+      if (rebase.kind === "clean") {
+        // No (further) conflict — the branch is current with base. It moved if THIS rebase moved it
+        // or an earlier round's resolution did (a landed resolution necessarily integrated base).
+        branchMoved = branchMoved || rebase.moved;
+        break;
+      }
+
+      // A rebase conflict. If we already resolved MAX_REBASE_ROUNDS conflicts and base STILL advanced
+      // into a fresh one, the base is too hot to self-heal — max out with a heal-card naming the RACE
+      // (base kept advancing), not a phantom push failure (#20). `attempts` reflects the rounds spent.
+      if (round >= MAX_REBASE_ROUNDS) {
+        log.warn("review.rebase-base-race", { rounds: round });
+        return {
+          kind: "terminal",
+          outcome: await this.reviewMaxed(ctx, CI_PHASE, baseRaceWorklist(round), round),
+        };
+      }
+      round++;
+
       // resolveRebaseConflicts owns the whole conflict job, including confirming the out-of-tree
-      // resolution actually landed on origin (#273): it returns `clean` ONLY when the resolution is
-      // verified landed, else a maxed/escalated terminal that settle maps here. syncWithBase (the
-      // generic pre-review/pre-merge sync) therefore stays ignorant of the container model's
-      // out-of-band confirmation. A confirmed-landed resolution necessarily moved the branch (base
-      // is now integrated), so the branch is stale → re-await CI below.
-      const resolved = await this.settle(ctx, CI_PHASE, await this.resolveRebaseConflicts(ctx, rebase.files));
+      // resolution actually landed on the base it was DISPATCHED against (#273/#20): it returns
+      // `clean` ONLY when the resolution is verified landed (and adopts it into this worktree), else a
+      // maxed/escalated terminal that settle maps here. A confirmed-landed resolution necessarily
+      // moved the branch; loop back to re-rebase in case base advanced again inside the fix window.
+      const resolved = await this.settle(
+        ctx,
+        CI_PHASE,
+        await this.resolveRebaseConflicts(ctx, rebase.files, rebase.baseSha, round),
+      );
       if (resolved) return { kind: "terminal", outcome: resolved };
       branchMoved = true;
-    } else {
-      branchMoved = rebase.moved;
     }
 
     // If the branch moved, the prior CI result is stale — re-await CI green. Skip
@@ -933,26 +968,32 @@ export class ReviewLoop {
    * fresh clone of the PR branch: it STARTS the rebase onto base, resolves the conflicts (`git add`
    * + `git rebase --continue`), and reports `fixed` WITHOUT pushing — the runner force-pushes the
    * rewritten history (force-push is blocked in agent sessions, DESIGN §8). This method then
-   * verifies origin/<branch> actually moved past the merge-base ({@link
-   * WorktreeManager.verifyBranchRebasedOntoBase}) and returns `clean` ONLY when the resolution is
-   * confirmed landed; a resolution that reported success but did not land maxes out with a healable
-   * {@link rebaseNotLandedWorklist} heal-card (PR preserved). Both failure heal-cards — the
-   * container-reported-failed one and this not-landed one — are co-located here. On a conflict
-   * implying a risky structural change, the agent escalates rather than resolving blind (never
-   * resolve blind, #41).
+   * verifies origin/<branch> actually integrated the base it was DISPATCHED against — `dispatchBaseSha`,
+   * NOT origin's current base, so a sibling PR merging inside the fix window does not falsely fail a
+   * perfectly-landed resolution (#20) — via {@link WorktreeManager.verifyBranchRebasedOntoBase}, and
+   * returns `clean` ONLY when the resolution is confirmed landed (adopting it into the worktree so the
+   * caller can re-rebase against a base that advanced again); a resolution that reported success but
+   * did not land maxes out with a healable {@link rebaseNotLandedWorklist} heal-card (PR preserved).
+   * Both failure heal-cards — the container-reported-failed one and this not-landed one — are
+   * co-located here. `round` is this resolution's round in the caller's bounded loop, reported as the
+   * heal-card `attempts` so it reflects reality (#20). On a conflict implying a risky structural
+   * change, the agent escalates rather than resolving blind (never resolve blind, #41).
    */
   private async resolveRebaseConflicts(
     ctx: ReviewLoopContext,
     files: string[],
+    dispatchBaseSha: string,
+    round: number,
   ): Promise<PhaseOutcome> {
     const log = ctx.logger;
     this.setPhase(ctx, MERGE_CONFLICT);
     const worklist = conflictWorklist(files);
-    log.info("review.rebase-conflict", { files: files.length });
-    // Single-shot (not a review→fix loop): the container fix agent starts + resolves the rebase and
-    // the runner force-pushes the result; syncWithBase verifies it landed before trusting
-    // branchMoved. This path calls runFix DIRECTLY, BYPASSING boundedFixLoop — the only place that
-    // catches a container terminal and degrades it gracefully — so it must replicate that
+    log.info("review.rebase-conflict", { files: files.length, round });
+    // One resolution round (not a review→fix loop): the container fix agent starts + resolves the
+    // rebase and the runner force-pushes the result; this method verifies it landed against its
+    // dispatch base before returning `clean` (the caller's bounded loop drives further rounds if base
+    // advanced again, #20). This path calls runFix DIRECTLY, BYPASSING boundedFixLoop — the only place
+    // that catches a container terminal and degrades it gracefully — so it must replicate that
     // degradation here (#273). A container non-success on the rebase-conflict fix — the #241
     // no-net-diff guard throw, a `git push --force-with-lease` rejected by a concurrent push during
     // the fix window (the very parallel-edit self-heal this path exists for), a transient
@@ -979,20 +1020,28 @@ export class ReviewLoop {
         // The container fix agent redid the rebase in its own clone and the runner force-pushed the
         // resolved history (the agent cannot — git-guardrails, DESIGN §8). The daemon-side rebase was
         // aborted, so the daemon worktree's branch ref is NOT the source of that push — a bare `fixed`
-        // is not enough. Verify origin/<branch> actually moved past the merge-base; a resolution that
-        // reported success but did not land (a silent no-op push that once "succeeded" then merged a
-        // still-conflicting PR, #273) maxes out healably rather than proceeding to a merge that cannot
-        // land. `attempts` is 1 (single-shot); the not-landed maxout flows through settle→reviewMaxed
+        // is not enough. Verify origin/<branch> actually integrated the base it was DISPATCHED against
+        // (`dispatchBaseSha`, not origin's current base — a sibling PR merging inside the fix window
+        // would otherwise fail a perfectly-landed resolution, #20). A resolution that reported success
+        // but did not land (a silent no-op push that once "succeeded" then merged a still-conflicting
+        // PR, #273) maxes out healably rather than proceeding to a merge that cannot land. `attempts`
+        // is this resolution's `round`; the not-landed maxout flows through settle→reviewMaxed
         // uniformly with the container-fault one below.
         const landed = await this.deps.worktrees.verifyBranchRebasedOntoBase(
           ctx.worktreePath,
           ctx.branch,
           this.deps.baseBranch,
+          dispatchBaseSha,
         );
         if (!landed) {
-          log.warn("review.rebase-not-landed", { branch: ctx.branch });
-          return { kind: "maxed", worklist: rebaseNotLandedWorklist(ctx.branch), attempts: 1 };
+          log.warn("review.rebase-not-landed", { branch: ctx.branch, round });
+          return { kind: "maxed", worklist: rebaseNotLandedWorklist(ctx.branch), attempts: round };
         }
+        // Adopt the runner-pushed resolution into the daemon worktree (its local ref still holds the
+        // diverged pre-resolution history) so the caller can re-rebase against a base that advanced
+        // again inside the fix window (#20). Safe now: verification just confirmed origin is the good
+        // resolved state.
+        await this.deps.worktrees.adoptOriginBranch(ctx.worktreePath, ctx.branch);
         return { kind: "clean" };
       } catch (err) {
         // Degrade a container terminal exactly as boundedFixLoop does — the shared helper owns the
@@ -1000,11 +1049,11 @@ export class ReviewLoop {
         // (#220/#273). A `failed` frame surfaces as AgentOutputParseError carrying the runner's real
         // detail (the #241 no-net-diff guard, a rejected force-push, a git/network fault, or genuinely
         // unparseable output): max out with an HONEST card carrying that detail, never the misleading
-        // "fix your JSON" one — the primary cause here is a push failure. `attempts` is 1 (single-shot,
-        // not a review→fix loop) and there is no logMaxed (the resolve's caller owns that logging).
+        // "fix your JSON" one — the primary cause here is a push failure. `attempts` is this
+        // resolution's `round` (#20) and there is no logMaxed (the resolve's caller owns that logging).
         const degraded = this.degradeContainerFault(ctx, err, infraState, {
           phase: CI_PHASE,
-          terminalAttempts: () => 1,
+          terminalAttempts: () => round,
           onParseFailure: (parseErr) => {
             log.warn("review.rebase-fix-failed", { detail: parseErr.lastError });
             return rebaseFixFailedWorklist(parseErr.lastError);
@@ -1275,6 +1324,33 @@ function rebaseNotLandedWorklist(branch: string): Worklist {
           `fix either did not complete the rebase or its force-push landed nothing. The reviewed ` +
           `work is intact on the branch. Inspect the conflict (a human resolution may be needed), ` +
           `then re-enable the run to retry the resolve+verify.`,
+        source: "review",
+      },
+    ],
+  };
+}
+
+/**
+ * The heal-card worklist for a rebase-conflict self-heal that could not converge because base kept
+ * advancing under it (#20): each time the container landed a resolution, another sibling PR had
+ * already merged into base and introduced a fresh conflict, `rounds` times over. This is a hot-base
+ * RACE, not a failed or no-op push — the wording says so explicitly, so the operator does not chase a
+ * phantom push failure (the exact misdiagnosis #20 fixes). The reviewed work is intact on the branch;
+ * resume-from-WIP retries the resolve once the base quiesces.
+ */
+function baseRaceWorklist(rounds: number): Worklist {
+  return {
+    items: [
+      {
+        severity: "P0",
+        title: `The base branch advanced ${rounds} times during rebase-conflict resolution`,
+        detail:
+          `Each time the container fix agent landed a resolution, another sibling PR had already ` +
+          `merged into base and introduced a fresh conflict, so the self-heal could not converge in ` +
+          `${rounds} rounds. This is a hot-base race, NOT a failed or no-op push — every resolution ` +
+          `landed exactly as dispatched. The reviewed work is intact on the branch. Wait for the base ` +
+          `to quiesce (or reduce merge concurrency), then re-enable the run to retry the resolve; a ` +
+          `human resolution may help only if a genuinely hard conflict persists.`,
         source: "review",
       },
     ],

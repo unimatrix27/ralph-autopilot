@@ -927,7 +927,7 @@ describe("ReviewLoop", () => {
 
   it("a rebase conflict is handed to a fix agent, then the PR merges", async () => {
     const ctx = setup();
-    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"] });
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
     const { loop, fixAgent } = wire({ review: [clean], fix: [{ kind: "fixed" }] });
 
     const outcome = await loop.run(ctx);
@@ -939,17 +939,20 @@ describe("ReviewLoop", () => {
     );
     expect(conflictFix).toBeDefined();
     // #273: the harness does NOT force-push the rebase from the daemon worktree anymore — the
-    // container runner owns that push end-to-end. The daemon now VERIFIES the resolution landed.
+    // container runner owns that push end-to-end. The daemon now VERIFIES the resolution landed
+    // against the DISPATCH-time base it was handed (#20), not origin's (possibly-advanced) current base.
     expect(worktrees.rebaseVerifyCalls).toEqual([
-      { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE },
+      { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE, dispatchBaseSha: "base-1" },
     ]);
     expect(github.merges).toHaveLength(1);
   });
 
-  it("a rebase-conflict resolution that did NOT land fails loud (review-maxed), never merging (#273)", async () => {
+  it("a rebase-conflict resolution that did NOT land fails loud (review-maxed) with the honest not-landed card, never merging (#273/#20)", async () => {
     const ctx = setup();
-    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"] });
-    // The container reported `fixed` but its force-push landed nothing — origin still conflicts.
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
+    // The container reported `fixed` but origin/<branch> still does not contain the DISPATCH base it
+    // was handed — a silent no-op push, a wipe, or a branch still forked off an older base. This is a
+    // genuine #273 not-landed failure, distinct from a benign base-advanced race (#20).
     worktrees.scriptRebaseVerify(false);
     const { loop } = wire({ review: [clean], fix: [{ kind: "fixed" }] });
 
@@ -959,12 +962,20 @@ describe("ReviewLoop", () => {
     expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
     expect(github.merges).toHaveLength(0);
     expect(worktrees.rebaseVerifyCalls).toHaveLength(1);
+    // Verified against the base it was DISPATCHED against, not origin's current base.
+    expect(worktrees.rebaseVerifyCalls[0]!.dispatchBaseSha).toBe("base-1");
     expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    // The existing not-landed heal-card, exactly as today — it names the not-landed failure, NOT a
+    // base-advance race.
+    const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
+    expect(body).toContain("did not land on origin");
+    expect(body).toContain("force-push landed nothing");
+    expect(body).not.toContain("base branch advanced");
   });
 
   it("a rebase conflict implying a risky structural change escalates (never resolved blind)", async () => {
     const ctx = setup();
-    worktrees.scriptRebase({ kind: "conflict", files: ["src/core/ledger.ts"] });
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/core/ledger.ts"], baseSha: "base-1" });
     const { loop } = wire({
       review: [clean],
       fix: [{ kind: "escalate", question: escalation }],
@@ -981,7 +992,7 @@ describe("ReviewLoop", () => {
 
   it("a rebase-conflict fix reported `failed` maxes out gracefully, never orphaning the PR (#273)", async () => {
     const ctx = setup();
-    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"] });
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
     // The runner-owned push refused (#241 no-net-diff guard) or a concurrent push rejected the
     // force-with-lease → the container reports `failed` → AgentOutputParseError. This path calls
     // runFix directly (bypassing boundedFixLoop), so before #273 this throw escaped uncaught to
@@ -1018,7 +1029,7 @@ describe("ReviewLoop", () => {
 
   it("a rebase-conflict fix hitting a transient container no-result retries and self-heals (#273/#220)", async () => {
     const ctx = setup();
-    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"] });
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
     const reviewAgent: ReviewAgentRunner = { review: async (_c: ReviewContext) => clean };
     let fixCalls = 0;
     const fixAgent: FixAgentRunner = {
@@ -1041,7 +1052,7 @@ describe("ReviewLoop", () => {
 
   it("a rebase-conflict fix whose container never returns (persistent infra) maxes out via the infra card (#273/#220)", async () => {
     const ctx = setup();
-    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"] });
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
     const reviewAgent: ReviewAgentRunner = { review: async (_c: ReviewContext) => clean };
     let fixCalls = 0;
     const fixAgent: FixAgentRunner = {
@@ -1063,6 +1074,92 @@ describe("ReviewLoop", () => {
     expect(body).toContain("container infrastructure fault");
     expect(body).toContain("docker exited (code=125");
     expect(body).not.toContain("parseable JSON");
+  });
+
+  // ---- Phase-0 rebase verification races a moving base (#20) --------------
+
+  it("a resolution that lands on its dispatch base, then base advances with no new conflict, merges with no human (#20)", async () => {
+    const ctx = setup();
+    // A sibling PR merged into base mid-review → a rebase conflict. The container resolves it and it
+    // lands on the base it was DISPATCHED against (base-1). A second sibling then merges into base
+    // inside the fix window, but on a disjoint file: the re-rebase round picks it up cleanly. The run
+    // self-heals to a merge — no phantom "push landed nothing" heal-card (the exact #20 regression).
+    worktrees.scriptRebase(
+      { kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" },
+      { kind: "clean", moved: true }, // re-rebase onto the advanced base — clean (disjoint files)
+    );
+    worktrees.scriptRebaseVerify(true); // the resolution landed on its dispatch base
+    github.setCiGreen(ctx.prNumber);
+    const { loop, fixAgent } = wire({ review: [clean], fix: [{ kind: "fixed" }] });
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "merged" });
+    // Exactly ONE conflict fix dispatch — the base advance did not need another (it was a clean re-rebase).
+    expect(fixAgent.calls.filter((c) => c.rebaseConflict)).toHaveLength(1);
+    // The daemon verified against the DISPATCH base it handed the fix, not origin's advanced base.
+    expect(worktrees.rebaseVerifyCalls).toHaveLength(1);
+    expect(worktrees.rebaseVerifyCalls[0]!.dispatchBaseSha).toBe("base-1");
+    // The landed resolution was adopted so the re-rebase round could run.
+    expect(worktrees.adopted).toEqual([{ worktreePath: ctx.worktreePath, branch: BRANCH }]);
+    // No heal-card: the race self-healed.
+    expect(store.listOpenQuestions()).toHaveLength(0);
+    expect(github.merges).toHaveLength(1);
+  });
+
+  it("a landed resolution whose base then advances into a NEW conflict triggers a second, bounded fix dispatch (#20)", async () => {
+    const ctx = setup();
+    // First conflict resolves + lands on base-1. Base then advances into a genuinely NEW conflict
+    // (a fresh round, dispatched against base-2), which also lands; the final re-rebase is clean.
+    worktrees.scriptRebase(
+      { kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" },
+      { kind: "conflict", files: ["src/other.ts"], baseSha: "base-2" },
+      { kind: "clean", moved: true },
+    );
+    worktrees.scriptRebaseVerify(true, true);
+    github.setCiGreen(ctx.prNumber);
+    const { loop, fixAgent } = wire({ review: [clean], fix: [{ kind: "fixed" }, { kind: "fixed" }] });
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "merged" });
+    // TWO conflict fix dispatches — the second is the fresh conflict the advanced base introduced.
+    expect(fixAgent.calls.filter((c) => c.rebaseConflict)).toHaveLength(2);
+    // Each round verified against the base IT was dispatched against — never a single moving base.
+    expect(worktrees.rebaseVerifyCalls.map((v) => v.dispatchBaseSha)).toEqual(["base-1", "base-2"]);
+    expect(store.listOpenQuestions()).toHaveLength(0);
+    expect(github.merges).toHaveLength(1);
+  });
+
+  it("a base too hot to converge maxes out with a heal-card that names the RACE, not a phantom push failure (#20)", async () => {
+    const ctx = setup();
+    // Every landed resolution finds base advanced into yet another conflict — a pathologically hot
+    // base. After the bounded rounds, max out with a heal-card that names the race honestly.
+    worktrees.scriptRebase(
+      { kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" },
+      { kind: "conflict", files: ["src/app.ts"], baseSha: "base-2" },
+      { kind: "conflict", files: ["src/app.ts"], baseSha: "base-3" },
+      { kind: "conflict", files: ["src/app.ts"], baseSha: "base-4" },
+    );
+    worktrees.scriptRebaseVerify(true, true, true); // every dispatched resolution genuinely lands
+    const { loop, fixAgent } = wire({
+      review: [clean],
+      fix: [{ kind: "fixed" }, { kind: "fixed" }, { kind: "fixed" }],
+    });
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    // Exactly the bounded number of fix dispatches (3), then the bound halts a 4th.
+    expect(fixAgent.calls.filter((c) => c.rebaseConflict)).toHaveLength(3);
+    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    // The heal-card names the base-advance RACE and explicitly NOT a failed / no-op push.
+    const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
+    expect(body).toContain("base branch advanced");
+    expect(body).toMatch(/hot-base race/);
+    expect(body).not.toContain("force-push landed nothing");
+    expect(body).not.toContain("did not land on origin");
   });
 
   // ---- Build / integration split ----------------------------------------

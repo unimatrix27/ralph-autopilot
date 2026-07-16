@@ -43,10 +43,16 @@ export function detectDefaultBranch(cloneDir: string): string {
  * - `conflict` — the rebase stopped on conflicts in `files`; the rebase is then
  *                aborted (the resolution is owned out-of-tree by the container
  *                fix agent + runner push, #273), reporting the conflicted paths.
+ *                `baseSha` is `origin/<base>` at conflict-detection time — the base the
+ *                container fix agent will rebase onto (its own fetch happens strictly
+ *                *after* dispatch, so its base is this SHA or newer). Post-fix
+ *                verification checks the branch integrated THIS base, not origin's
+ *                current base, so a sibling PR merging inside the fix window does not
+ *                falsely fail a perfectly-landed resolution (#20).
  */
 export type RebaseResult =
   | { kind: "clean"; moved: boolean }
-  | { kind: "conflict"; files: string[] };
+  | { kind: "conflict"; files: string[]; baseSha: string };
 
 /** The worktree operations the executor depends on. */
 export interface WorktreeManager {
@@ -80,15 +86,36 @@ export interface WorktreeManager {
   /**
    * Verify a rebase-conflict resolution actually **landed on origin** (issue #273). After the
    * container fix agent redoes the rebase in its clone and the runner force-pushes the result,
-   * fetch and confirm `origin/<branch>` is now a clean descendant of `origin/<base>` — it
-   * contains base as an ancestor (the rebase fully integrated base, so no conflict can remain)
-   * AND still carries its net work (not wiped to a base-equivalent state, #241). The daemon must
-   * NOT assume the resolution landed: under the container model the daemon-side rebase was
-   * aborted and the resolution happened out-of-tree, so a silent no-op push would otherwise
-   * proceed to a merge that cannot land (the #273 failure mode). Returns `true` only when origin
-   * genuinely moved past the merge-base.
+   * fetch and confirm `origin/<branch>` now contains `dispatchBaseSha` as an ancestor (the rebase
+   * fully integrated the base the fix was HANDED, so no conflict can remain against it) AND still
+   * carries its net work (not wiped to a base-equivalent state, #241). `dispatchBaseSha` is the
+   * base SHA the conflict was detected against ({@link RebaseResult} `conflict.baseSha`), NOT
+   * origin's current base: verifying against a moving current base races a sibling PR that merges
+   * into base inside the fix window and would misfire a "push landed nothing" heal-card on a
+   * resolution that landed perfectly (#20). The dispatch base is monotonic — a container that
+   * fetched an even newer base still contains it — so a correct resolution always passes while the
+   * real #273 failures (silent no-op push, still-forked-off-old-base, base-equivalent wipe) still
+   * fail loud. The daemon must NOT assume the resolution landed: the daemon-side rebase was aborted
+   * and the resolution happened out-of-tree. Returns `true` only when origin genuinely integrated
+   * the dispatch base and kept the work.
    */
-  verifyBranchRebasedOntoBase(worktreePath: string, branch: string, baseBranch: string): Promise<boolean>;
+  verifyBranchRebasedOntoBase(
+    worktreePath: string,
+    branch: string,
+    baseBranch: string,
+    dispatchBaseSha: string,
+  ): Promise<boolean>;
+  /**
+   * Hard-reset the worktree's local `branch` ref to `origin/<branch>` — adopt the runner-pushed
+   * state as authoritative (issue #20). After a rebase-conflict resolution the container force-pushes
+   * rewritten history to `origin/<branch>`, leaving the daemon worktree's local ref on the
+   * pre-resolution history, which *diverges* from origin (neither is an ancestor of the other). A
+   * plain fast-forward sync ({@link rebaseOntoBase}'s internal sync) refuses that divergence loudly to
+   * avoid clobbering origin. This is called only AFTER {@link verifyBranchRebasedOntoBase} confirms
+   * origin/<branch> is the good resolved state, so adopting it is safe — and lets the caller re-rebase
+   * the branch against a base that advanced again inside the fix window (#20) instead of stalling.
+   */
+  adoptOriginBranch(worktreePath: string, branch: string): Promise<void>;
   /**
    * Hash the branch's *net diff vs base* — `git diff origin/<baseBranch>...HEAD`
    * (three-dot: the merge-base of base and HEAD against HEAD, i.e. exactly what the
@@ -334,6 +361,10 @@ export class GitWorktreeManager implements WorktreeManager {
     // Rebase the branch's true state, not the possibly-stale local ref (#255).
     await this.syncBranchToOrigin(worktreePath, branch);
     await inWorktree(["fetch", "origin", baseBranch]);
+    // Snapshot the base the rebase is being attempted against — on a conflict this is the base the
+    // container fix agent will rebase onto, and the fixed anchor its resolution is verified against
+    // (#20). Captured after the fetch, before the rebase, so it is exactly what the daemon saw.
+    const baseSha = (await inWorktree(["rev-parse", `origin/${baseBranch}`])).stdout.trim();
     const before = (await inWorktree(["rev-parse", "HEAD"])).stdout.trim();
     try {
       await inWorktree(["rebase", `origin/${baseBranch}`]);
@@ -351,7 +382,7 @@ export class GitWorktreeManager implements WorktreeManager {
         .map((l) => l.trim())
         .filter((l) => l.length > 0);
       await inWorktree(["rebase", "--abort"]).catch(() => {});
-      return { kind: "conflict", files };
+      return { kind: "conflict", files, baseSha };
     }
     const after = (await inWorktree(["rev-parse", "HEAD"])).stdout.trim();
     const moved = before !== after;
@@ -403,26 +434,32 @@ export class GitWorktreeManager implements WorktreeManager {
     worktreePath: string,
     branch: string,
     baseBranch: string,
+    dispatchBaseSha: string,
   ): Promise<boolean> {
     const inWorktree = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
       execFileAsync("git", ["-C", resolve(worktreePath), ...args]);
     try {
-      // Read origin's CURRENT state for both refs — the resolution landed on origin (the
-      // container force-pushed it), so the verdict comes from the remote-tracking refs, not
-      // this (stale, pre-rebase) worktree's local ref. A fetch failure → conservative false
-      // (the caller fails loud rather than assuming the resolution landed).
+      // Read origin's CURRENT state for the branch — the resolution landed on origin (the
+      // container force-pushed it), so the verdict comes from the remote-tracking ref, not this
+      // (stale, pre-rebase) worktree's local ref. Fetch base too so `dispatchBaseSha` is present in
+      // the object store even after a GC. A fetch failure → conservative false (the caller fails
+      // loud rather than assuming the resolution landed).
       await inWorktree(["fetch", "origin", baseBranch, branch]);
       const remoteBranch = (await inWorktree(["rev-parse", `origin/${branch}`])).stdout.trim();
-      const remoteBase = (await inWorktree(["rev-parse", `origin/${baseBranch}`])).stdout.trim();
-      if (!remoteBranch || !remoteBase) return false;
+      if (!remoteBranch || !dispatchBaseSha) return false;
 
-      // (1) The branch must now contain base as an ancestor — i.e. the rebase fully integrated
-      // base, so the PR can no longer conflict. If base is NOT an ancestor, the resolution did
-      // not land (origin/<branch> still forks off the old base) → still conflicts → fail loud.
+      // (1) The branch must contain the DISPATCH base as an ancestor — the base the fix was HANDED
+      // and rebased onto, NOT origin's (possibly-advanced) current base. Checking current base races
+      // a sibling PR that merged into base inside the fix window (#20): a resolution that landed
+      // perfectly on its dispatch base would fail the check and misfire a "push landed nothing"
+      // heal-card. The dispatch base is monotonic — a container that fetched an even newer base still
+      // contains it — so a correct resolution always passes; the real #273 not-landed failures
+      // (silent no-op push, still-forked-off-old-base) still fail, as origin/<branch> would not
+      // contain the dispatch base.
       const baseIsAncestor = await inWorktree([
         "merge-base",
         "--is-ancestor",
-        remoteBase,
+        dispatchBaseSha,
         remoteBranch,
       ]).then(
         () => true,
@@ -430,17 +467,29 @@ export class GitWorktreeManager implements WorktreeManager {
       );
       if (!baseIsAncestor) return false;
 
-      // (2) #241 ride-along: the branch must still carry its net work (a non-empty diff vs base).
-      // A base-equivalent branch would pass (1) yet be a silent wipe of the reviewed work, so the
-      // same no-net-diff invariant ({@link hasNetDiffVsBase}) is enforced here too, defensively, on
-      // the remote refs. Both are already-resolved SHAs, so the three-dot diff cannot fail here —
-      // a fetch/rev-parse failure was handled above; anything else falls through to the catch.
-      return await this.hasNetDiffVsBase(inWorktree, remoteBase, remoteBranch);
+      // (2) #241 ride-along: the branch must still carry net work over the dispatch base (a non-empty
+      // three-dot diff). A base-equivalent wipe would pass (1) yet silently discard the reviewed work,
+      // so the same no-net-diff invariant ({@link hasNetDiffVsBase}) is enforced here too, on the
+      // dispatch base. Both are already-resolved SHAs, so the diff cannot fail for a missing ref — a
+      // fetch/rev-parse failure was handled above; anything else falls through to the catch.
+      return await this.hasNetDiffVsBase(inWorktree, dispatchBaseSha, remoteBranch);
     } catch {
       // Any git failure (fetch refused, ref gone) → conservative false; the caller surfaces it
       // rather than proceeding to a merge that cannot land (#273).
       return false;
     }
+  }
+
+  async adoptOriginBranch(worktreePath: string, branch: string): Promise<void> {
+    const inWorktree = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
+      execFileAsync("git", ["-C", resolve(worktreePath), ...args]);
+    // Fetch the runner-pushed resolution, then hard-reset the worktree's local branch to it. The
+    // local ref held the pre-resolution history (which diverges from the rewritten origin), so this
+    // adopts origin as authoritative — safe because verification already confirmed origin/<branch> is
+    // the good resolved state (#20). The subsequent rebaseOntoBase then sees head == origin/<branch>
+    // and its fast-forward-only sync is a no-op, so a base that advanced again can be re-rebased.
+    await inWorktree(["fetch", "origin", branch]);
+    await inWorktree(["reset", "--hard", `origin/${branch}`]);
   }
 
   /**
