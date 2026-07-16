@@ -73,13 +73,20 @@ export interface TypeRoutingRow {
   providerOptions: ProviderOption[];
 }
 
-/** One account-pool group: a provider KIND, its capability/config state, and its account ids. */
+/** One pool account as the editor renders it: the id chip plus its operator-park toggle state. */
+export interface AccountPoolEntry {
+  id: string;
+  /** `false` = operator-parked (invisible to dispatch until re-enabled, issue #10). */
+  enabled: boolean;
+}
+
+/** One account-pool group: a provider KIND, its capability/config state, and its accounts. */
 export interface AccountPoolGroup {
   provider: RoutingProviderWire;
   configured: boolean;
   toolsCapable: boolean;
-  /** The configured account ids for this provider (possibly empty — a provider with no accounts). */
-  accountIds: string[];
+  /** The configured accounts for this provider (possibly empty), each with its enabled state. */
+  accounts: AccountPoolEntry[];
 }
 
 /** The whole render-model the editor consumes (ADR-0037 P4.2). */
@@ -157,7 +164,9 @@ export function buildRoutingEditorModel(res: EffectiveRoutingResponse): RoutingE
     provider,
     configured: byProvider.get(provider)?.configured ?? false,
     toolsCapable: byProvider.get(provider)?.toolsCapable ?? false,
-    accountIds: res.accounts.filter((a) => a.provider === provider).map((a) => a.id),
+    accounts: res.accounts
+      .filter((a) => a.provider === provider)
+      .map((a) => ({ id: a.id, enabled: a.enabled })),
   }));
   return {
     generatedAt: res.generatedAt,
@@ -208,6 +217,17 @@ export function buildSetRoutingEdit(
 /** Build the `POST /api/routing/edit` body that **clears** a type's override (falls back to default). */
 export function buildClearRoutingEdit(type: RoutingAgentTypeWire): RoutingEditRequestBody {
   return { target: "type", type, routing: null };
+}
+
+/**
+ * Build the `POST /api/routing/edit` body that **parks / un-parks** one pool account by resolved
+ * pool id (issue #10, the account arm). Reversible with next-dispatch effect only — in-flight
+ * runs finish on the route they were dispatched with (ADR-0038) — so no confirm escalation; the
+ * origin guard applies by construction (ADR-0032). The server rejects a toggle that would leave
+ * a provider any preference list selects with zero enabled accounts.
+ */
+export function buildAccountToggleEdit(id: string, enabled: boolean): RoutingEditRequestBody {
+  return { target: "account", id, enabled };
 }
 
 /** A per-phase draft for a phaseable type (`review`/`fix`): a required base list + optional overrides. */

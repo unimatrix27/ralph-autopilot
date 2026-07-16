@@ -97,7 +97,7 @@ const ports: WebControlPlanePorts = {
       admitBelowPercent: 85,
       activeId: "default",
       paused: false,
-      logins: [{ id: "default", active: true, gated: false, windows: [], cooldownUntil: null }],
+      logins: [{ id: "default", active: true, gated: false, disabled: false, windows: [], cooldownUntil: null }],
     },
   }),
   // Likewise echoes the repo filter; minimal contract-valid backlog payload.

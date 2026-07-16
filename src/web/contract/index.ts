@@ -239,6 +239,7 @@ export type {
 } from "./routing";
 export {
   buildRoutingEditorModel,
+  buildAccountToggleEdit,
   buildClearRoutingEdit,
   buildSetRoutingEdit,
   buildPhasedRoutingEdit,
@@ -252,6 +253,7 @@ export type {
   ProviderOption,
   TypeRoutingRow,
   PhasedDraft,
+  AccountPoolEntry,
   AccountPoolGroup,
   RoutingEditorModel,
 } from "./routing-editor";

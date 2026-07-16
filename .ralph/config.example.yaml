@@ -112,16 +112,29 @@ usageLimit:
 #
 # CAVEAT (today): for CLAUDE, listing N logins here gives full ADR-0028 rotation/failover.
 # For z.ai/openai, per-account rotation + headroom failover land in a later ADR-0037 slice —
-# until then route resolution binds only the FIRST pool account per provider, so a second
-# z.ai/Codex account is defined-but-unused (when the head account is rate-limited the daemon
-# pauses that provider's work rather than rotating to the spare). Single-account configs are
-# exact parity.
+# until then route resolution binds only the FIRST ENABLED pool account per provider, so a
+# second z.ai/Codex account is defined-but-unused (when the head account is rate-limited the
+# daemon pauses that provider's work rather than rotating to the spare). Single-account
+# configs are exact parity.
 # accounts:
 #   - { id: claude-a, provider: claude, configDir: ~/.claude }
 #   - { id: claude-b, provider: claude, configDir: ~/.claude-b }
 #   - { id: zai-1,    provider: zai,    authTokenEnv: ZAI_API_KEY }
 #   - { id: zai-2,    provider: zai,    authTokenEnv: ZAI_API_KEY_2 }
 #   - { id: codex-1,  provider: openai, codexHome: ~/.codex-ralph }
+
+# Operator-DISABLED pool accounts (issue #10), keyed by RESOLVED POOL ID — explicit
+# `accounts:` ids and back-compat-slice ids (`usageLimit.subscriptions` ids, the synthetic
+# `openai`/`zai` single-block ids) alike. A disabled account stays in the pool but is
+# invisible to dispatch-time selection: route resolution walks past it exactly like the
+# all-gated case, its rate-limit state never counts toward the "every login gated → paused"
+# hold, and (for zai) its key env var need not be set — the "take a key offline" use case.
+# Normally you never edit this by hand: the web control plane's per-account toggle writes it
+# through here (so it survives restart + self-update). Fail-loud rules: an id naming nothing
+# in the pool rejects the config, as does disabling the LAST enabled account of any provider
+# a routing preference list selects (claude included — the daemon never silently falls back
+# to the box-default login).
+# disabledAccounts: [claude-b, zai-2]
 
 # Daemon-wide DEFAULTS. Any target may override any of these in its `agent`/`merge`/
 # `review`/`priorityLabels` block; an unset target key inherits the value here.

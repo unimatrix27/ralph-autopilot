@@ -1,6 +1,7 @@
 import * as React from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
+  buildAccountToggleEdit,
   buildClearRoutingEdit,
   buildPhasedRoutingEdit,
   buildRoutingEditorModel,
@@ -275,7 +276,7 @@ function EditorFooter({
         )}
       </div>
 
-      {posted && (
+      {posted && posted.target === "type" && (
         <p className="mt-2 text-xs text-status-success">
           {posted.cleared ? "Reset to the global default" : "Saved"} — applies on the next dispatch (~
           {posted.appliesNextDispatchSeconds}s).
@@ -603,15 +604,24 @@ function ProviderSelect({
   );
 }
 
-/** The read-only account pool (ADR-0037): the configured credentials behind each provider. */
+/**
+ * The account pool (ADR-0037) with the per-account enable/disable toggle (issue #10). Disabling
+ * parks the account: dispatch-time selection never picks it (route resolution walks on to the
+ * next preference entry, exactly like the all-gated case) until it is re-enabled — with
+ * next-dispatch effect only, so the action is reversible and needs no confirm step. The server
+ * rejects a toggle that would leave a provider any preference list selects with zero enabled
+ * accounts; that rejection surfaces inline.
+ */
 function AccountPoolCard({ pool }: { pool: AccountPoolGroup[] }) {
+  const { submit, posted, error, pending } = useRoutingEditMutation();
   return (
     <Card>
       <CardHeader>
         <CardTitle>Account pool</CardTitle>
         <CardDescription>
           The configured credentials per provider (model-free; account choice within a provider is automatic).
-          Read-only here — runtime pool edits are a later slice.
+          Disable an account to park it — invisible to dispatch from the next dispatch on; in-flight runs finish
+          on the route they started with.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -627,21 +637,52 @@ function AccountPoolCard({ pool }: { pool: AccountPoolGroup[] }) {
                   {group.toolsCapable ? "tools-capable" : "no in-session tools"}
                 </Badge>
                 <span className="text-xs text-muted-foreground">
-                  {group.accountIds.length} account{group.accountIds.length === 1 ? "" : "s"}
+                  {group.accounts.length} account{group.accounts.length === 1 ? "" : "s"}
                 </span>
               </div>
-              {group.accountIds.length > 0 && (
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {group.accountIds.map((id) => (
-                    <span key={id} className="rounded border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
-                      {id}
-                    </span>
+              {group.accounts.length > 0 && (
+                <ul className="mt-2 space-y-1.5">
+                  {group.accounts.map((account) => (
+                    <li key={account.id} className="flex flex-wrap items-center gap-2">
+                      <span
+                        className={cn(
+                          "rounded border px-1.5 py-0.5 font-mono text-[11px]",
+                          account.enabled ? "text-muted-foreground" : "text-muted-foreground/60 line-through",
+                        )}
+                      >
+                        {account.id}
+                      </span>
+                      {account.enabled ? (
+                        <Badge variant="success">enabled</Badge>
+                      ) : (
+                        <Badge variant="outline">disabled</Badge>
+                      )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        aria-label={`${account.enabled ? "Disable" : "Enable"} account ${account.id}`}
+                        disabled={pending}
+                        onClick={() => submit(buildAccountToggleEdit(account.id, !account.enabled))}
+                      >
+                        {account.enabled ? "Disable" : "Enable"}
+                      </Button>
+                    </li>
                   ))}
-                </div>
+                </ul>
               )}
             </li>
           ))}
         </ul>
+
+        {posted && posted.target === "account" && (
+          <p className="mt-3 text-xs text-status-success">
+            Account <span className="font-mono">{posted.id}</span>{" "}
+            {posted.enabled ? "enabled" : "disabled"} — applies on the next dispatch (~
+            {posted.appliesNextDispatchSeconds}s); in-flight runs are untouched.
+          </p>
+        )}
+        {error && <p className="mt-3 text-xs text-status-danger">{error}</p>}
       </CardContent>
     </Card>
   );

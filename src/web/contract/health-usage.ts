@@ -101,6 +101,12 @@ export const usageLoginSchema = z
     active: z.boolean(),
     /** Would the proactive gate refuse NEW work on this login right now? */
     gated: z.boolean(),
+    /**
+     * Operator-disabled (issue #10): the login is parked — invisible to dispatch-time
+     * selection until re-enabled, and excluded from the `paused` computation (disabled is
+     * operator intent, not a gate state).
+     */
+    disabled: z.boolean(),
     /** Per-window utilization, type-ordered. */
     windows: z.array(usageWindowSchema),
     /** ISO-8601 instant an active cooldown lifts, or null when none is active. */
@@ -111,8 +117,10 @@ export type UsageLogin = z.infer<typeof usageLoginSchema>;
 
 /**
  * The daemon-wide usage picture (ADR-0028). `paused` is the whole-daemon hold: every
- * login is gated, so admission defers new work until a window resets — exactly the
- * ADR-0023 pause, now reached only when all budgets are spent.
+ * **enabled** login is gated, so admission defers new work until a window resets —
+ * exactly the ADR-0023 pause, now reached only when all budgets are spent. An
+ * operator-disabled login counts toward neither side (issue #10): a pool whose only
+ * enabled logins have headroom never reads paused because a disabled sibling is gated.
  */
 export const usageSummarySchema = z
   .object({

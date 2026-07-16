@@ -267,3 +267,109 @@ describe("RoutingStore — snapshot for the read", () => {
     expect(route).toEqual({ provider: "claude", model: "sonnet", account: CLAUDE });
   });
 });
+
+describe("RoutingStore — account enable/disable arm (issue #10)", () => {
+  it("a disable edit lands in the overlay (live isAccountDisabled + snapshot), a re-enable clears it", () => {
+    const store = buildStore({ accounts: [
+      { id: "c1", provider: "claude", configDir: "/c1" },
+      { id: "c2", provider: "claude", configDir: "/c2" },
+    ] });
+    expect(store.isAccountDisabled("c2")).toBe(false);
+
+    expect(store.applyEdit({ target: "account", id: "c2", enabled: false })).toEqual({ ok: true, cleared: false });
+    expect(store.isAccountDisabled("c2")).toBe(true);
+    expect(store.snapshot().disabledAccounts).toEqual(["c2"]);
+
+    expect(store.applyEdit({ target: "account", id: "c2", enabled: true })).toEqual({ ok: true, cleared: false });
+    expect(store.isAccountDisabled("c2")).toBe(false);
+    expect(store.snapshot().disabledAccounts).toEqual([]);
+  });
+
+  it("rejects an unknown pool id with a clear error (typo / box-default login), overlay untouched", () => {
+    const store = buildStore({ accounts: [{ id: "c1", provider: "claude", configDir: "/c1" }] });
+    const outcome = store.applyEdit({ target: "account", id: "nope", enabled: false });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false && outcome.error).toMatch(/unknown account id 'nope'/);
+    expect(store.snapshot().disabledAccounts).toEqual([]);
+  });
+
+  it("rejects disabling the LAST enabled account of a provider any preference list selects (claude default)", () => {
+    // Default routing: every type resolves to claude, whose pool has exactly one account.
+    const store = buildStore({ accounts: [{ id: "c1", provider: "claude", configDir: "/c1" }] });
+    const outcome = store.applyEdit({ target: "account", id: "c1", enabled: false });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false && outcome.error).toMatch(/every claude account in the pool is disabled/);
+    expect(store.isAccountDisabled("c1")).toBe(false);
+  });
+
+  it("rejects disabling the last enabled zai account while a type routes to zai; allows it once the sibling covers", () => {
+    process.env.ZAI_KEY = "secret";
+    const store = buildStore({
+      agent: { types: { review: { provider: "zai" } } },
+      providers: { zai: {} },
+      accounts: [
+        { id: "z1", provider: "zai", authTokenEnv: "ZAI_KEY" },
+        { id: "z2", provider: "zai", authTokenEnv: "ZAI_KEY" },
+      ],
+    });
+    // Parking one of two is fine — the sibling still serves the review route.
+    expect(store.applyEdit({ target: "account", id: "z1", enabled: false }).ok).toBe(true);
+    // Parking the second would leave review with zero enabled zai accounts → rejected at the edge.
+    const outcome = store.applyEdit({ target: "account", id: "z2", enabled: false });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false && outcome.error).toMatch(/every zai account in the pool is disabled/);
+    expect(store.isAccountDisabled("z2")).toBe(false);
+  });
+
+  it("a disable edit is idempotent (already-parked stays parked, list not duplicated)", () => {
+    const store = buildStore({ accounts: [
+      { id: "c1", provider: "claude", configDir: "/c1" },
+      { id: "c2", provider: "claude", configDir: "/c2" },
+    ] });
+    expect(store.applyEdit({ target: "account", id: "c2", enabled: false }).ok).toBe(true);
+    expect(store.applyEdit({ target: "account", id: "c2", enabled: false }).ok).toBe(true);
+    expect(store.snapshot().disabledAccounts).toEqual(["c2"]);
+  });
+
+  it("persists the disabled set to config.yaml (comments preserved); a re-enable removes the key entirely", () => {
+    const path = writeConfigFile(
+      "# my operator config\ntargets:\n  - { repo: owner/app, commands: { build: b, test: t } }\naccounts: # the pool\n  - { id: c1, provider: claude, configDir: /c1 }\n  - { id: c2, provider: claude, configDir: /c2 }\n",
+    );
+    const config = loadConfig(path);
+    const store = new RoutingStore({ config, targets: resolveTargets(config), configPath: path });
+
+    expect(store.applyEdit({ target: "account", id: "c2", enabled: false }).ok).toBe(true);
+    // Round-trip: a daemon restart reloads the parked state from the file.
+    expect(loadConfig(path).disabledAccounts).toEqual(["c2"]);
+    const written = readFileSync(path, "utf8");
+    expect(written).toContain("# my operator config");
+    expect(written).toContain("# the pool");
+
+    expect(store.applyEdit({ target: "account", id: "c2", enabled: true }).ok).toBe(true);
+    expect(loadConfig(path).disabledAccounts).toEqual([]);
+    // The cleared list leaves no residue key — the file returns to its pre-#10 shape.
+    expect(readFileSync(path, "utf8")).not.toContain("disabledAccounts");
+  });
+
+  it("rejects the account edit and leaves the overlay unchanged when write-through fails", () => {
+    const store = buildStore(
+      { accounts: [
+        { id: "c1", provider: "claude", configDir: "/c1" },
+        { id: "c2", provider: "claude", configDir: "/c2" },
+      ] },
+      {
+        configPath: "/no/such/dir/config.yaml",
+        readFile: () => {
+          throw new Error("ENOENT: no such file");
+        },
+        writeFile: () => {
+          throw new Error("should not be reached");
+        },
+      },
+    );
+    const outcome = store.applyEdit({ target: "account", id: "c2", enabled: false });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok === false && outcome.error).toMatch(/failed to persist/i);
+    expect(store.isAccountDisabled("c2")).toBe(false);
+  });
+});

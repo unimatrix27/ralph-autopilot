@@ -124,11 +124,14 @@ export function isPhasedRoutingValue(
 
 /**
  * The `/api/routing/edit` request body — a discriminated union on `target` so account /
- * provider edits are additive arms later (#170 / a follow-up), never a reshape of this one.
- * The v1 arm edits a **type's preference list**: `routing` carries the new value, or `null`
- * to **clear** the override (the type falls back to the global default provider). `repo` is
- * accepted for forward-compatible per-repo deviation (#170) but ignored in v1 — the edit is
- * global.
+ * provider edits are additive arms (#170 / issue #10), never a reshape of an existing one.
+ * The `type` arm edits a **type's preference list**: `routing` carries the new value, or `null`
+ * to **clear** the override (the type falls back to the global default provider). The
+ * `account` arm (issue #10) parks / un-parks one **resolved-pool account** by pool id —
+ * explicit `accounts:` entries and back-compat-slice accounts alike: `enabled: false` makes it
+ * invisible to dispatch-time selection from the next dispatch on (in-flight runs untouched,
+ * ADR-0038); `enabled: true` returns it to rotation. `repo` is accepted for forward-compatible
+ * per-repo deviation (#170) but ignored in v1 — the edit is global.
  */
 export const routingEditRequestBodySchema = z
   .discriminatedUnion("target", [
@@ -148,12 +151,28 @@ export const routingEditRequestBodySchema = z
         routing: routingValueOrPhasedSchema.nullable(),
       })
       .strict(),
+    z
+      .object({
+        target: z.literal("account"),
+        /** Forward-compat per-repo key (#170); ignored in v1 — the edit applies globally. */
+        repo: repoSlug.optional(),
+        /** The resolved pool id of the account to park / un-park (issue #10). */
+        id: z.string().min(1),
+        /** `false` → park (invisible to the next dispatch on); `true` → back into rotation. */
+        enabled: z.boolean(),
+      })
+      .strict(),
   ])
   .superRefine((body, ctx) => {
     // Per-phase routing (base/phase1/phase2) is only meaningful for review/fix — impl/autoMode are
     // single-phase. Reject the object form for them at the contract edge, mirroring the config
     // schema's `.strict()` rejection so the API and the file agree (ADR-0037 #169).
-    if (body.routing !== null && isPhasedRoutingValue(body.routing) && !typeIsPhaseable(body.type)) {
+    if (
+      body.target === "type" &&
+      body.routing !== null &&
+      isPhasedRoutingValue(body.routing) &&
+      !typeIsPhaseable(body.type)
+    ) {
       ctx.addIssue({
         code: "custom",
         path: ["routing"],
@@ -164,27 +183,44 @@ export const routingEditRequestBodySchema = z
 export type RoutingEditRequestBody = z.infer<typeof routingEditRequestBodySchema>;
 
 /**
- * The `/api/routing/edit` response: which type was edited, whether it was cleared, and the
- * honest "the new route takes effect next dispatch (~Ns)" figure — the UI states this so the
- * operator knows an in-flight container is unaffected and the effect is the next agent start.
+ * The `/api/routing/edit` response — discriminated on `target` like the request (additive-only,
+ * ADR-0026): which type/account was edited and the honest "takes effect next dispatch (~Ns)"
+ * figure — the UI states this so the operator knows an in-flight container is unaffected and
+ * the effect is the next agent start.
  */
-export const routingEditResponseSchema = z
-  .object({
-    /** ISO-8601 instant the edit was written to the overlay + config.yaml. */
-    generatedAt: z.string(),
-    /** The edit target (always `"type"` in v1). */
-    target: z.literal("type"),
-    /** The agent type whose routing was changed. */
-    type: routingAgentTypeSchema,
-    /** `true` when the override was cleared (the type now uses the global default). */
-    cleared: z.boolean(),
-    /**
-     * The reconcile interval — the honest "the new route takes effect on the next dispatch
-     * (~Ns)" figure. An in-flight container finishes on the route it started with (ADR-0038).
-     */
-    appliesNextDispatchSeconds: z.number().int().positive(),
-  })
-  .strict();
+export const routingEditResponseSchema = z.discriminatedUnion("target", [
+  z
+    .object({
+      /** ISO-8601 instant the edit was written to the overlay + config.yaml. */
+      generatedAt: z.string(),
+      /** The edit target. */
+      target: z.literal("type"),
+      /** The agent type whose routing was changed. */
+      type: routingAgentTypeSchema,
+      /** `true` when the override was cleared (the type now uses the global default). */
+      cleared: z.boolean(),
+      /**
+       * The reconcile interval — the honest "the new route takes effect on the next dispatch
+       * (~Ns)" figure. An in-flight container finishes on the route it started with (ADR-0038).
+       */
+      appliesNextDispatchSeconds: z.number().int().positive(),
+    })
+    .strict(),
+  z
+    .object({
+      /** ISO-8601 instant the edit was written to the overlay + config.yaml. */
+      generatedAt: z.string(),
+      /** The edit target. */
+      target: z.literal("account"),
+      /** The resolved pool id whose enablement changed (issue #10). */
+      id: z.string(),
+      /** The account's new state: `false` = parked, `true` = back in rotation. */
+      enabled: z.boolean(),
+      /** The reconcile interval — the honest "takes effect next dispatch (~Ns)" figure. */
+      appliesNextDispatchSeconds: z.number().int().positive(),
+    })
+    .strict(),
+]);
 export type RoutingEditResponse = z.infer<typeof routingEditResponseSchema>;
 
 /**
@@ -239,11 +275,17 @@ export const effectiveRoutingProviderSchema = z
   .strict();
 export type EffectiveRoutingProvider = z.infer<typeof effectiveRoutingProviderSchema>;
 
-/** One account-pool entry, model-free (ADR-0037). Read-only in this slice (#166). */
+/**
+ * One account-pool entry, model-free (ADR-0037). `enabled` (issue #10) is the operator-park
+ * state: `false` means the account is invisible to dispatch-time selection until re-enabled —
+ * togglable from the editor via the account arm of `/api/routing/edit`.
+ */
 export const effectiveRoutingAccountSchema = z
   .object({
     id: z.string(),
     provider: routingProviderSchema,
+    /** `false` = operator-parked (never selected at dispatch); `true` = in rotation. */
+    enabled: z.boolean(),
   })
   .strict();
 export type EffectiveRoutingAccount = z.infer<typeof effectiveRoutingAccountSchema>;

@@ -754,6 +754,20 @@ export const configSchema = z
      */
     accounts: z.array(accountSchema).default([]),
 
+    /**
+     * Operator-parked pool accounts (issue #10), keyed by **resolved pool id** — explicit
+     * `accounts:` entries and back-compat-slice accounts (`usageLimit.subscriptions` ids, the
+     * synthetic `openai`/`zai` ids) alike, which is why this is a top-level id list rather than a
+     * per-entry flag: a back-compat slice has no `accounts:` entry to carry one. A disabled
+     * account stays in the pool (the registry) but is invisible to dispatch-time selection: the
+     * headroom port never returns it and route resolution walks on exactly like the all-gated
+     * case. Runtime-mutable from the web control plane (the account arm of the routing edit),
+     * written through here so the state survives restart + self-update. Ids are validated against
+     * the resolved pool in `resolveTargets` (unknown id → fail loud), which also rejects a state
+     * where a provider selected by any preference list has zero enabled accounts.
+     */
+    disabledAccounts: z.array(nonEmpty).default([]),
+
     scheduler: z
       .object({
         /** Max agents running at once across ALL targets (operator plan budget). */

@@ -162,3 +162,104 @@ describe("ProviderPoolMeter — generalised per-provider pool (ADR-0037 P2.1)", 
     expect(meter.hasHeadroom("zai", 85)).toBe(true); // unrelated pool untouched
   });
 });
+
+describe("UsageMeter — operator-disabled logins (issue #10)", () => {
+  const tokens = [
+    { id: "a", configDir: "/a" },
+    { id: "b", configDir: "/b" },
+  ];
+
+  /** A meter whose disabled set is LIVE — mutate `disabled` to park/unpark without a rebuild. */
+  function disableableMeter() {
+    const clock = { now: NOW };
+    const disabled = new Set<string>();
+    const meter = new UsageMeter({ tokens, now: () => clock.now, isDisabled: (id) => disabled.has(id) });
+    return { meter, clock, disabled };
+  }
+
+  it("acquire never binds a disabled login — rotation lands on the enabled sibling", () => {
+    const { meter, disabled } = disableableMeter();
+    disabled.add("a");
+    expect(meter.acquire(85).id).toBe("b");
+  });
+
+  it("the predicate is live: parking the ACTIVE login flips the next acquire, no rebuild", () => {
+    const { meter, disabled } = disableableMeter();
+    expect(meter.acquire(85).id).toBe("a");
+    disabled.add("a"); // the operator parks it mid-life
+    expect(meter.acquire(85).id).toBe("b");
+    // Un-park + gate b: rotation returns to the re-enabled login.
+    disabled.delete("a");
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 95 }, "b");
+    expect(meter.acquire(85).id).toBe("a");
+  });
+
+  it("a GATED disabled sibling never pauses the pool while an enabled login has headroom", () => {
+    const { meter, disabled } = disableableMeter();
+    disabled.add("a");
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 99 }, "a");
+    expect(meter.gate(85).admit).toBe(true); // disabled is operator intent, not a gate state
+  });
+
+  it("a disabled login's headroom does NOT count: gate refuses when every ENABLED login is gated", () => {
+    const { meter, disabled } = disableableMeter();
+    disabled.add("a"); // a has headroom but is parked
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 95 }, "b");
+    expect(meter.gate(85).admit).toBe(false);
+  });
+
+  it("all-disabled pool: gate ADMITS (never pauses the daemon on operator intent), acquireIfHeadroom is null", () => {
+    // Reachable only when claude is selected by no preference list (the config gate rejects it
+    // otherwise), so the whole-daemon claude gate must not hold other providers' work back —
+    // while the acquire path still never hands out a parked credential.
+    const { meter, disabled } = disableableMeter();
+    disabled.add("a");
+    disabled.add("b");
+    expect(meter.gate(85).admit).toBe(true);
+    expect(meter.acquireIfHeadroom(85)).toBeNull();
+  });
+
+  it("snapshot carries the disabled ids alongside the full configured id list", () => {
+    const { meter, disabled } = disableableMeter();
+    disabled.add("b");
+    const snap = meter.snapshot();
+    expect(snap.ids).toEqual(["a", "b"]);
+    expect(snap.disabledIds).toEqual(["b"]);
+  });
+});
+
+describe("ProviderPoolMeter — disabled accounts (issue #10)", () => {
+  const accounts: Account[] = [
+    { id: "claude-a", provider: "claude", configDir: "/c/a" },
+    { id: "claude-b", provider: "claude", configDir: "/c/b" },
+    { id: "zai-1", provider: "zai", authTokenEnv: "ZAI_KEY_1" },
+  ];
+
+  function disableablePool() {
+    const clock = { now: NOW };
+    const disabled = new Set<string>();
+    const meter = new ProviderPoolMeter({ accounts, now: () => clock.now, isDisabled: (id) => disabled.has(id) });
+    return { meter, clock, disabled };
+  }
+
+  it("acquireAccount never returns a disabled account — it skips to an enabled sibling", () => {
+    const { meter, disabled } = disableablePool();
+    disabled.add("claude-a");
+    expect(meter.acquireAccount("claude", 85)?.id).toBe("claude-b");
+  });
+
+  it("a provider whose only account is disabled reads as no headroom (skipped like the all-gated case)", () => {
+    const { meter, disabled } = disableablePool();
+    disabled.add("zai-1");
+    expect(meter.hasHeadroom("zai", 85)).toBe(false);
+    expect(meter.acquireAccount("zai", 85)).toBeNull();
+  });
+
+  it("one disabled+gated account plus one enabled-with-headroom keeps the pool available", () => {
+    const { meter, disabled } = disableablePool();
+    disabled.add("claude-a");
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 99 }, "claude-a");
+    expect(meter.hasHeadroom("claude", 85)).toBe(true);
+    expect(meter.acquireAccount("claude", 85)?.id).toBe("claude-b");
+  });
+});

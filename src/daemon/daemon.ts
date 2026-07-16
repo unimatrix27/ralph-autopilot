@@ -196,16 +196,30 @@ export interface AssembledDaemon {
  *
  * `repo` is accepted (the ADR keys everything by repo for per-repo deviation) but ignored in
  * v1 — the pool is daemon-wide and the per-repo patch is empty.
+ *
+ * `isAccountDisabled` is the LIVE operator-park predicate (issue #10), read per acquire: a
+ * disabled account is never returned — claude selection flows through the meter (which skips
+ * disabled logins in rotation; the residual all-disabled pointer is nulled here), zai/openai
+ * hand back their first ENABLED pool account. A null walks route resolution on to the next
+ * preference entry (or the no-provider wait), exactly like the all-gated case.
  */
-export function buildRouteWorld(usageMeter: UsageMeter, pool: Account[], admitBelowPercent: number): RouteWorld {
+export function buildRouteWorld(
+  usageMeter: UsageMeter,
+  pool: Account[],
+  admitBelowPercent: number,
+  isAccountDisabled: (id: string) => boolean = () => false,
+): RouteWorld {
   const byProvider = groupAccountsByProvider(pool);
   return {
     acquireAccount: (_repo, provider) => {
       if (provider === "claude") {
         const token = usageMeter.acquire(admitBelowPercent);
+        if (isAccountDisabled(token.id)) {
+          return null;
+        }
         return { id: token.id, provider: "claude", configDir: token.configDir ?? "" };
       }
-      return byProvider.get(provider)?.[0] ?? null;
+      return byProvider.get(provider)?.find((account) => !isAccountDisabled(account.id)) ?? null;
     },
   };
 }
@@ -216,12 +230,18 @@ export function buildRouteWorld(usageMeter: UsageMeter, pool: Account[], admitBe
  * impl provider is claude (zai/openai hand back their pool account un-metered in {@link
  * buildRouteWorld}), so the soonest reset across the claude logins' gating windows / cooldowns is
  * the honest ETA: the pool regains headroom as soon as the **earliest** login frees. Returns null
- * when no login carries a known future reset, so the wait still renders without an ETA. Pure given
- * the meter snapshot + clock.
+ * when no login carries a known future reset, so the wait still renders without an ETA. An
+ * operator-disabled login is excluded (issue #10): its windows resetting never returns it to
+ * rotation, so its (possibly sooner) reset would be a dishonest ETA. Pure given the meter
+ * snapshot + clock.
  */
 export function implProviderResetsAt(usageMeter: UsageMeter, admitBelowPercent: number, nowMs: number): string | null {
-  const states = Object.values(usageMeter.snapshot().states);
-  const resets = states.map((s) => soonestReset(s, nowMs, admitBelowPercent)).filter((n): n is number => n !== null);
+  const snap = usageMeter.snapshot();
+  const disabled = new Set(snap.disabledIds);
+  const resets = Object.entries(snap.states)
+    .filter(([id]) => !disabled.has(id))
+    .map(([, s]) => soonestReset(s, nowMs, admitBelowPercent))
+    .filter((n): n is number => n !== null);
   return resets.length > 0 ? new Date(Math.min(...resets)).toISOString() : null;
 }
 
@@ -268,10 +288,16 @@ export function buildRateLimitRecorder(
  * login (ADR-0008 no-silent-fallback). The same meter is the reconciler's admission gate and the
  * sink that streamed claude rate-limit signals fold into. Exported so the real claude-from-pool
  * wiring is unit-testable without standing up the whole orchestrator.
+ *
+ * `isAccountDisabled` is the LIVE operator-park predicate (issue #10) — in production a thunk
+ * into the {@link RoutingStore} overlay, so a web account edit is invisible to the very next
+ * dispatch with no restart: the claude meter skips disabled logins in rotation AND excludes them
+ * from its whole-daemon pause, and the headroom port never returns a disabled account.
  */
 export function buildUsageRouting(
   config: RalphConfig,
   logger: Logger,
+  isAccountDisabled: (id: string) => boolean = () => false,
 ): { usageMeter: UsageMeter; routeWorld: RouteWorld } {
   // The resolved ACCOUNT POOL is the single credential source for ALL providers: explicit
   // `accounts:` plus the back-compat slices folded from `usageLimit.subscriptions` (claude),
@@ -289,6 +315,7 @@ export function buildUsageRouting(
     tokens: subscriptions.length > 0 ? subscriptions : undefined,
     rotateEveryMs: config.usageLimit.rotateEveryMinutes != null ? config.usageLimit.rotateEveryMinutes * 60_000 : null,
     onActiveChange: ({ from, to }) => logger.info("usage.token-flip", { from, to }),
+    isDisabled: isAccountDisabled,
   });
   if (subscriptions.length > 0) {
     logger.info("usage.subscriptions", {
@@ -298,8 +325,8 @@ export function buildUsageRouting(
   }
   // Route resolution at every agent start reads this daemon-wide headroom port; claude account
   // choice flows through the shared OAuth `usageMeter` (itself now sourced from the pool's claude
-  // slice, ADR-0028 rotation), while z.ai/openai hand back their pool account.
-  const routeWorld = buildRouteWorld(usageMeter, pool, config.usageLimit.admitBelowPercent);
+  // slice, ADR-0028 rotation), while z.ai/openai hand back their first enabled pool account.
+  const routeWorld = buildRouteWorld(usageMeter, pool, config.usageLimit.admitBelowPercent, isAccountDisabled);
   return { usageMeter, routeWorld };
 }
 
@@ -390,12 +417,22 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
   // reconciler's orphan sweep kills through the same registry via the executor.
   const abortRegistry = new RunAbortRegistry();
 
+  // The runtime routing overlay (ADR-0037 P4.1, issue #166): one daemon-wide store seeded from the
+  // loaded config. It is the live source every per-target `routing` thunk reads, so a web routing
+  // edit takes effect on the next dispatch with no restart, and writes through to `config.yaml`
+  // (gitignored → survives the self-update reset). The web control plane reads/writes it through a
+  // port; the reconciler + executors only read it via the per-target thunks. Built BEFORE the
+  // meters so the account-disable overlay (issue #10) backs their live predicate.
+  const routingStore = new RoutingStore({ config, targets, configPath: deps.configPath, logger });
+
   // The shared Claude usage meter (ADR-0028) + the route-resolution headroom port (ADR-0037
   // P2.2), both built over the resolved account pool. The meter is sourced from the pool's
   // CLAUDE SLICE (`usageLimit.subscriptions` ∪ explicit `accounts:` claude entries), so a login
   // listed only under `accounts:` routes to its own configDir instead of the box default. The
   // reconciler reads the meter's gate to admit new work; impl runners fold rate-limit signals in.
-  const { usageMeter, routeWorld } = buildUsageRouting(config, logger);
+  // The overlay's account-disable state (issue #10) is read LIVE per selection, so a web account
+  // edit is invisible to the very next dispatch — no restart, in-flight runs untouched.
+  const { usageMeter, routeWorld } = buildUsageRouting(config, logger, (id) => routingStore.isAccountDisabled(id));
   // The separate z.ai cooldown meter (keyed "zai", ADR-0034): GLM rate-limit signals fold here,
   // never into the Claude plan window; the reconciler's admission gate reads it.
   const providerUsageMeter = new UsageMeter({ tokens: [{ id: "zai" }] });
@@ -408,19 +445,15 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
   // of its route (issue #270): the in-container runner loadConfig-validates the FULL mounted
   // config at startup, so any `types.* → zai` route makes these vars a startup requirement for
   // every container — a claude/codex run missing them dies at config load, never emitting a
-  // result frame, and the review loop maxes the run out. Pool-sourced so it matches exactly the
-  // set `load.ts` validates. Startup-fixed like the pool itself (the routing overlay swaps
-  // routes at runtime, but only among these accounts).
+  // result frame, and the review loop maxes the run out. Pool-sourced — the WHOLE pool,
+  // disabled accounts included (issue #10): `load.ts` only requires ENABLED accounts' vars, but
+  // an account disabled at boot can be re-enabled at runtime, and a var docker never forwarded
+  // could not reach the containers dispatched after that (an unset var is simply not forwarded).
+  // Startup-fixed like the pool itself (the routing overlay swaps routes and enablement at
+  // runtime, but only among these accounts).
   const zaiKeyEnvNames = [
     ...new Set(resolveAccountPool(config).flatMap((a) => (a.provider === "zai" ? [a.authTokenEnv] : []))),
   ];
-
-  // The runtime routing overlay (ADR-0037 P4.1, issue #166): one daemon-wide store seeded from the
-  // loaded config. It is the live source every per-target `routing` thunk reads, so a web routing
-  // edit takes effect on the next dispatch with no restart, and writes through to `config.yaml`
-  // (gitignored → survives the self-update reset). The web control plane reads/writes it through a
-  // port; the reconciler + executors only read it via the thunk below.
-  const routingStore = new RoutingStore({ config, targets, configPath: deps.configPath, logger });
 
   for (const target of targets) {
     ensureTargetClone(target.targetRepo, target.paths.targetClone, logger);

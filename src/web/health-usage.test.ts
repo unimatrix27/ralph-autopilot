@@ -37,7 +37,7 @@ function daemon(over: Partial<DaemonHealthView> = {}): DaemonHealthView {
 
 /** The default single-login meter snapshot (no streamed state yet). */
 function meter(over: Partial<UsageMeterSnapshot> = {}): UsageMeterSnapshot {
-  return { activeId: "default", ids: ["default"], states: {}, ...over };
+  return { activeId: "default", ids: ["default"], states: {}, disabledIds: [], ...over };
 }
 
 describe("buildHealthUsage", () => {
@@ -170,5 +170,56 @@ describe("buildHealthUsage", () => {
     expect(b.gated).toBe(true);
     expect(b.cooldownUntil).toBeNull(); // a past cooldown is not surfaced
     expect(usage.paused).toBe(true); // both gated → whole-daemon hold
+  });
+});
+
+describe("buildHealthUsage — operator-disabled logins (issue #10)", () => {
+  it("one disabled(+gated) login plus one enabled-with-headroom login → marked disabled, NOT paused", () => {
+    const usageSnap = meter({
+      activeId: "b",
+      ids: ["a", "b"],
+      states: {
+        // a is parked AND gated — its gating must not count toward the whole-daemon hold.
+        a: { windows: { five_hour: { utilization: 99, resetsAtMs: null } }, cooldownUntilMs: null },
+        b: { windows: { five_hour: { utilization: 10, resetsAtMs: null } }, cooldownUntilMs: null },
+      },
+      disabledIds: ["a"],
+    });
+    const { usage } = buildHealthUsage(emptySnapshot(), [], usageSnap, { now: () => NOW, admitBelowPercent: 85 });
+    const a = usage.logins.find((l) => l.id === "a")!;
+    const b = usage.logins.find((l) => l.id === "b")!;
+    expect(a.disabled).toBe(true);
+    expect(b.disabled).toBe(false);
+    expect(usage.paused).toBe(false); // disabled is operator intent, not a gate state
+  });
+
+  it("a disabled login's HEADROOM does not count either: the only enabled login gated → paused", () => {
+    const usageSnap = meter({
+      activeId: "b",
+      ids: ["a", "b"],
+      states: {
+        // a is parked with plenty of headroom; b (the only enabled login) is gated.
+        b: { windows: { five_hour: { utilization: 99, resetsAtMs: null } }, cooldownUntilMs: null },
+      },
+      disabledIds: ["a"],
+    });
+    const { usage } = buildHealthUsage(emptySnapshot(), [], usageSnap, { now: () => NOW, admitBelowPercent: 85 });
+    expect(usage.paused).toBe(true);
+  });
+
+  it("every login disabled → not paused (nothing usage-gated; the state is operator intent)", () => {
+    const usageSnap = meter({ activeId: "a", ids: ["a"], states: {}, disabledIds: ["a"] });
+    const { usage } = buildHealthUsage(emptySnapshot(), [], usageSnap, { now: () => NOW, admitBelowPercent: 85 });
+    expect(usage.logins[0]!.disabled).toBe(true);
+    expect(usage.paused).toBe(false);
+  });
+
+  it("the disabled flag round-trips through the wire schema", () => {
+    const out = buildHealthUsage(emptySnapshot(), [], meter({ disabledIds: ["default"] }), {
+      now: () => NOW,
+      admitBelowPercent: 85,
+    });
+    expect(healthUsageResponseSchema.safeParse(out).success).toBe(true);
+    expect(healthUsageResponseSchema.parse(JSON.parse(JSON.stringify(out))).usage.logins[0]!.disabled).toBe(true);
   });
 });

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { parseConfig } from "../config/load";
 import type { RalphConfig } from "../config/schema";
 import { createLogger } from "../log/logger";
-import { buildRateLimitRecorder, buildUsageRouting } from "./daemon";
+import { buildRateLimitRecorder, buildUsageRouting, implProviderResetsAt } from "./daemon";
 import { UsageMeter } from "./usage-meter";
 
 const silent = createLogger({ write: () => {} });
@@ -176,5 +176,74 @@ describe("buildRateLimitRecorder — fold a container-reported signal into the r
     expect(() => recorder("openai", "o1", { status: "rejected", resetsAt: future() })).not.toThrow();
 
     expect(JSON.stringify({ c: usageMeter.snapshot().states, z: providerUsageMeter.snapshot().states })).toBe(before);
+  });
+});
+
+describe("buildUsageRouting — operator-disabled accounts are invisible to dispatch (issue #10)", () => {
+  it("claude: a disabled login is never dispatched; selection lands on the enabled sibling, live", () => {
+    const config = configWith({
+      accounts: [
+        { id: "c1", provider: "claude", configDir: loggedInConfigDir() },
+        { id: "c2", provider: "claude", configDir: loggedInConfigDir() },
+      ],
+    });
+    const disabled = new Set<string>();
+    const { routeWorld } = buildUsageRouting(config, silent, (id) => disabled.has(id));
+
+    expect(routeWorld.acquireAccount(REPO, "claude")?.id).toBe("c1");
+    disabled.add("c1"); // the web edit lands in the overlay — no rebuild, next dispatch sees it
+    expect(routeWorld.acquireAccount(REPO, "claude")?.id).toBe("c2");
+    disabled.delete("c1");
+    disabled.add("c2");
+    expect(routeWorld.acquireAccount(REPO, "claude")?.id).toBe("c1");
+  });
+
+  it("claude: every pool login disabled → no route (never a parked credential, never the box default)", () => {
+    const config = configWith({
+      accounts: [{ id: "c1", provider: "claude", configDir: loggedInConfigDir() }],
+    });
+    const { routeWorld } = buildUsageRouting(config, silent, (id) => id === "c1");
+    expect(routeWorld.acquireAccount(REPO, "claude")).toBeNull();
+  });
+
+  it("zai/openai: the first ENABLED pool account backs the route; all-disabled → null (walk on / wait)", () => {
+    const config = configWith({
+      providers: { zai: {}, openai: { codexHome: "~/.codex" } },
+      accounts: [
+        { id: "z1", provider: "zai", authTokenEnv: "K1" },
+        { id: "z2", provider: "zai", authTokenEnv: "K2" },
+      ],
+    });
+    const disabled = new Set<string>(["z1"]);
+    const { routeWorld } = buildUsageRouting(config, silent, (id) => disabled.has(id));
+
+    expect(routeWorld.acquireAccount(REPO, "zai")?.id).toBe("z2");
+    disabled.add("z2");
+    expect(routeWorld.acquireAccount(REPO, "zai")).toBeNull();
+    // The back-compat openai slice account is addressable by its synthetic pool id too.
+    expect(routeWorld.acquireAccount(REPO, "openai")?.id).toBe("openai");
+    disabled.add("openai");
+    expect(routeWorld.acquireAccount(REPO, "openai")).toBeNull();
+  });
+});
+
+describe("implProviderResetsAt — a disabled login's windows never shape the ETA (issue #10)", () => {
+  it("ignores the disabled login's earlier reset; the enabled gated login's reset is the honest ETA", () => {
+    const NOW = 1_750_000_000_000;
+    const disabled = new Set<string>(["c1"]);
+    const meter = new UsageMeter({
+      tokens: [{ id: "c1" }, { id: "c2" }],
+      now: () => NOW,
+      isDisabled: (id) => disabled.has(id),
+    });
+    // c1 (disabled) would reset SOONER; c2 (enabled) is gated with a later reset.
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 99, resetsAt: NOW + 60_000 }, "c1");
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 99, resetsAt: NOW + 600_000 }, "c2");
+    expect(implProviderResetsAt(meter, 85, NOW)).toBe(new Date(NOW + 600_000).toISOString());
+    // With every gating login disabled and the enabled sibling un-gated, there is no ETA at all.
+    disabled.add("c2");
+    disabled.delete("c1");
+    meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 10 }, "c1");
+    expect(implProviderResetsAt(meter, 85, NOW)).toBeNull();
   });
 });

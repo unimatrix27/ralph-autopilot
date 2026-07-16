@@ -62,7 +62,26 @@ export function resolveTargets(config: RalphConfig): TargetConfig[] {
   // `providers.zai.authTokenEnv` (zai). Grouped by provider so a selected provider can be
   // checked for "has at least one account" — the credential check that used to live on the
   // now-optional `providers.*` fields.
-  const poolByProvider = groupAccountsByProvider(resolveAccountPool(config));
+  const pool = resolveAccountPool(config);
+  const poolByProvider = groupAccountsByProvider(pool);
+
+  // Operator-parked accounts (issue #10): `disabledAccounts` is keyed by resolved pool id, so an
+  // id naming nothing in the pool is a typo (or a since-removed account) — fail loud rather than
+  // silently parking nothing. Checked before the per-provider walks so their "every account
+  // disabled" messages can trust the ids.
+  const disabledIds = new Set(config.disabledAccounts);
+  const poolIds = new Set(pool.map((account) => account.id));
+  for (const id of disabledIds) {
+    if (!poolIds.has(id)) {
+      throw new ConfigError(
+        `Invalid configuration: disabledAccounts names unknown account id '${id}' — resolved pool ids: ${
+          pool.length > 0 ? pool.map((account) => account.id).join(", ") : "(none)"
+        }`,
+      );
+    }
+  }
+  const enabledOf = (provider: ProviderName): Account[] =>
+    (poolByProvider.get(provider) ?? []).filter((account) => !disabledIds.has(account.id));
 
   // Fail loud, at load time, walking EVERY entry of EVERY type's `(provider, model)`
   // preference list ACROSS ALL PHASES (ADR-0037 P1.2/#169 — not just the head, and not just
@@ -88,6 +107,18 @@ export function resolveTargets(config: RalphConfig): TargetConfig[] {
             `Invalid configuration: agent type '${type}' for target ${target.targetRepo} routes to provider '${provider}', which is not tools-capable — this type requires the in-session escalate/stuck tools (ADR-0037 capability gate)`,
           );
         }
+        // A selected provider must keep at least one ENABLED account (issue #10): a pool whose
+        // accounts are all operator-parked is as un-dispatchable as an empty one, and claude must
+        // never silently fall back to the box-default login when its pool accounts are all
+        // disabled (ADR-0008 no-silent-fallback). An empty claude pool IS the box-default login
+        // (nothing to disable), so claude is only checked when pool accounts exist.
+        if (provider === "claude") {
+          if ((poolByProvider.get("claude")?.length ?? 0) > 0 && enabledOf("claude").length === 0) {
+            throw new ConfigError(
+              `Invalid configuration: agent type '${type}' for target ${target.targetRepo} selects provider 'claude' but every claude account in the pool is disabled (disabledAccounts) — re-enable one; the daemon never falls back to the box-default login`,
+            );
+          }
+        }
         if (provider === "openai") {
           if (!target.providers.openai) {
             throw new ConfigError(
@@ -97,6 +128,11 @@ export function resolveTargets(config: RalphConfig): TargetConfig[] {
           if (!poolByProvider.get("openai")?.length) {
             throw new ConfigError(
               `Invalid configuration: agent type '${type}' for target ${target.targetRepo} selects provider 'openai' but no openai account is in the pool — set providers.openai.codexHome or add an accounts entry`,
+            );
+          }
+          if (enabledOf("openai").length === 0) {
+            throw new ConfigError(
+              `Invalid configuration: agent type '${type}' for target ${target.targetRepo} selects provider 'openai' but every openai account in the pool is disabled (disabledAccounts) — re-enable one or remove the route`,
             );
           }
         }
@@ -112,11 +148,19 @@ export function resolveTargets(config: RalphConfig): TargetConfig[] {
               `Invalid configuration: agent type '${type}' for target ${target.targetRepo} selects provider 'zai' but no zai account is in the pool — set providers.zai.authTokenEnv or add an accounts entry`,
             );
           }
-          // The z.ai key lives in an env var, never in config (ADR-0034). Require each zai
-          // account's env var to be present and non-empty NOW, so a missing key fails at
+          const enabledZaiAccounts = enabledOf("zai");
+          if (enabledZaiAccounts.length === 0) {
+            throw new ConfigError(
+              `Invalid configuration: agent type '${type}' for target ${target.targetRepo} selects provider 'zai' but every zai account in the pool is disabled (disabledAccounts) — re-enable one or remove the route`,
+            );
+          }
+          // The z.ai key lives in an env var, never in config (ADR-0034). Require each ENABLED
+          // zai account's env var to be present and non-empty NOW, so a missing key fails at
           // startup rather than at the first GLM session — z.ai has no OAuth store to fall
-          // back to. Discriminated on `provider`, so `authTokenEnv` is in scope.
-          for (const account of zaiAccounts) {
+          // back to. A DISABLED account's var may be gone: taking a key offline is the very
+          // use case of parking it (issue #10). Discriminated on `provider`, so `authTokenEnv`
+          // is in scope.
+          for (const account of enabledZaiAccounts) {
             if (account.provider !== "zai") {
               continue;
             }

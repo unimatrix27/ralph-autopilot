@@ -40,6 +40,8 @@ export interface UsageMeterSnapshot {
   ids: string[];
   /** Per-login usage state, keyed by login id; a login absent here has streamed nothing yet. */
   states: Record<string, UsageState>;
+  /** The operator-disabled login ids (issue #10) — marked on the wire, excluded from `paused`. */
+  disabledIds: string[];
 }
 
 /**
@@ -147,24 +149,30 @@ function toAnomalies(snapshot: RuntimeSnapshot, anomalyLog: AnomalyLogRow[]): An
  * The dual-login usage picture (ADR-0028). Every configured login appears (even a
  * never-streamed one — optimistically un-gated until its first session); `gated` reuses
  * the same proactive-gate predicate admission uses, so the UI's "would this admit?" read
- * can't drift from the daemon's. `paused` is the whole-daemon hold: every login gated.
+ * can't drift from the daemon's. `paused` is the whole-daemon hold: every **enabled**
+ * login gated — an operator-disabled login (issue #10) is marked but counts toward
+ * neither side (its gating never pauses; its headroom never un-pauses), mirroring the
+ * meter's own gate so the UI's read can't drift from admission's.
  */
 function toUsage(usage: UsageMeterSnapshot, nowMs: number, admitBelowPercent: number): UsageSummary {
+  const disabledIds = new Set(usage.disabledIds);
   const logins: UsageLogin[] = usage.ids.map((id) => {
     const state = usage.states[id];
     return {
       id,
       active: id === usage.activeId,
       gated: isTokenGated(state, nowMs, admitBelowPercent),
+      disabled: disabledIds.has(id),
       windows: toWindows(state),
       cooldownUntil: activeCooldown(state, nowMs),
     };
   });
+  const enabled = logins.filter((l) => !l.disabled);
 
   return {
     admitBelowPercent,
     activeId: usage.activeId,
-    paused: logins.length > 0 && logins.every((l) => l.gated),
+    paused: enabled.length > 0 && enabled.every((l) => l.gated),
     logins,
   };
 }
