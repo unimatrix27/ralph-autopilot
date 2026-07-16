@@ -14,12 +14,12 @@
  * cross the wire — never a `configDir`/`codexHome` path, an OAuth token, or an env-var value.
  */
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { expandHome } from "../config/load";
 import type { Account } from "../config/schema";
-import { EMPTY_USAGE, isTokenGated, type UsageState } from "../core/usage";
 import type { UsageMeterSnapshot } from "./health-usage";
-import type { AccountIdentity, AccountUsage, AccountsResponse, PoolAccount } from "./contract";
+import { toWireUsage } from "./usage-projection";
+import type { AccountIdentity, AccountsResponse, PoolAccount } from "./contract";
 
 export interface BuildAccountsInput {
   /** The resolved account pool (`resolveAccountPool`), in pool order. */
@@ -46,13 +46,6 @@ export function buildAccounts(input: BuildAccountsInput): AccountsResponse {
   const nowMs = input.now().getTime();
   const disabled = new Set(input.disabledAccounts);
   const accounts = input.pool.map((account): PoolAccount => {
-    const state = input.usage.states[account.id];
-    const usage: AccountUsage = {
-      active: input.usage.activeId === account.id,
-      gated: isTokenGated(state, nowMs, input.admitBelowPercent),
-      cooldownUntil: activeCooldown(state, nowMs),
-      windows: toWindows(state),
-    };
     const identity = input.identities[account.id];
     return {
       id: account.id,
@@ -62,7 +55,12 @@ export function buildAccounts(input: BuildAccountsInput): AccountsResponse {
       ...(identity ? { identity } : {}),
       // The zai auth-token env-var NAME may be shown — never its value (ADR-0034).
       ...(account.provider === "zai" ? { authTokenEnvName: account.authTokenEnv } : {}),
-      usage,
+      // The per-account usage fold shared verbatim with `/api/health/usage` (see usage-projection).
+      usage: toWireUsage(input.usage.states[account.id], {
+        active: input.usage.activeId === account.id,
+        nowMs,
+        admitBelowPercent: input.admitBelowPercent,
+      }),
     };
   });
   return {
@@ -70,24 +68,6 @@ export function buildAccounts(input: BuildAccountsInput): AccountsResponse {
     admitBelowPercent: input.admitBelowPercent,
     accounts,
   };
-}
-
-/** A login's plan windows as wire rows, type-ordered; epoch-ms resets become absolute ISO instants. */
-function toWindows(state: UsageState | undefined): AccountUsage["windows"] {
-  const windows = (state ?? EMPTY_USAGE).windows;
-  return Object.entries(windows)
-    .map(([type, w]) => ({
-      type,
-      utilization: w.utilization,
-      resetsAt: w.resetsAtMs === null ? null : new Date(w.resetsAtMs).toISOString(),
-    }))
-    .sort((a, b) => a.type.localeCompare(b.type));
-}
-
-/** The ISO instant an *active* (future) cooldown lifts, or null — a lapsed cooldown is not surfaced. */
-function activeCooldown(state: UsageState | undefined, nowMs: number): string | null {
-  const until = state?.cooldownUntilMs ?? null;
-  return until !== null && until > nowMs ? new Date(until).toISOString() : null;
 }
 
 /**
@@ -116,11 +96,6 @@ export function parseOauthIdentity(claudeJson: unknown): AccountIdentity | undef
   take("displayName");
   take("organizationName");
   return Object.keys(identity).length > 0 ? identity : undefined;
-}
-
-/** Expand a leading `~` to the box home dir (the `CLAUDE_CONFIG_DIR` stores use `~`-relative paths). */
-function expandHome(path: string): string {
-  return path.startsWith("~") ? join(homedir(), path.slice(1).replace(/^[/\\]/, "")) : path;
 }
 
 /**

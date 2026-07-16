@@ -17,14 +17,14 @@
  * uptime / time-to-next-tick live between polls against its own render-time clock.
  */
 import type { RuntimeSnapshot } from "../projection/snapshot";
-import { EMPTY_USAGE, isTokenGated, type UsageState } from "../core/usage";
+import type { UsageState } from "../core/usage";
+import { toWireUsage } from "./usage-projection";
 import type {
   AnomalyItem,
   DaemonHealth,
   HealthUsageResponse,
   UsageLogin,
   UsageSummary,
-  UsageWindow,
 } from "./contract";
 
 /**
@@ -156,17 +156,11 @@ function toAnomalies(snapshot: RuntimeSnapshot, anomalyLog: AnomalyLogRow[]): An
  */
 function toUsage(usage: UsageMeterSnapshot, nowMs: number, admitBelowPercent: number): UsageSummary {
   const disabledIds = new Set(usage.disabledIds);
-  const logins: UsageLogin[] = usage.ids.map((id) => {
-    const state = usage.states[id];
-    return {
-      id,
-      active: id === usage.activeId,
-      gated: isTokenGated(state, nowMs, admitBelowPercent),
-      disabled: disabledIds.has(id),
-      windows: toWindows(state),
-      cooldownUntil: activeCooldown(state, nowMs),
-    };
-  });
+  const logins: UsageLogin[] = usage.ids.map((id) => ({
+    id,
+    disabled: disabledIds.has(id),
+    ...toWireUsage(usage.states[id], { active: id === usage.activeId, nowMs, admitBelowPercent }),
+  }));
   const enabled = logins.filter((l) => !l.disabled);
 
   return {
@@ -175,22 +169,4 @@ function toUsage(usage: UsageMeterSnapshot, nowMs: number, admitBelowPercent: nu
     paused: enabled.length > 0 && enabled.every((l) => l.gated),
     logins,
   };
-}
-
-/** A login's plan windows as wire rows, type-ordered; epoch-ms resets become absolute ISO instants. */
-function toWindows(state: UsageState | undefined): UsageWindow[] {
-  const windows = (state ?? EMPTY_USAGE).windows;
-  return Object.entries(windows)
-    .map(([type, w]) => ({
-      type,
-      utilization: w.utilization,
-      resetsAt: w.resetsAtMs === null ? null : new Date(w.resetsAtMs).toISOString(),
-    }))
-    .sort((a, b) => a.type.localeCompare(b.type));
-}
-
-/** The ISO instant an *active* (future) cooldown lifts, or null — a lapsed cooldown is not surfaced. */
-function activeCooldown(state: UsageState | undefined, nowMs: number): string | null {
-  const until = state?.cooldownUntilMs ?? null;
-  return until !== null && until > nowMs ? new Date(until).toISOString() : null;
 }
