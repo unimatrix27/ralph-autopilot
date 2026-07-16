@@ -223,8 +223,8 @@ export {
 } from "./core/fenced-payload";
 
 // ---- executor: worktree + impl agent -----------------------------------
-export { GitWorktreeManager } from "./executor/worktree";
-export type { WorktreeManager, GitWorktreeOptions, RebaseResult } from "./executor/worktree";
+export { GitWorktreeManager, BranchDivergedError } from "./executor/worktree";
+export type { WorktreeManager, GitWorktreeOptions, RebaseResult, RebaseOptions } from "./executor/worktree";
 export { Executor } from "./executor/executor";
 export type { PickedIssue, ClaimedRun, ExecutorResult, ExecutorDeps } from "./executor/executor";
 export {

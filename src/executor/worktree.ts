@@ -54,6 +54,37 @@ export type RebaseResult =
   | { kind: "clean"; moved: boolean }
   | { kind: "conflict"; files: string[]; baseSha: string };
 
+/**
+ * The #255 divergence guard fired: the daemon worktree's local `branch` ref and `origin/<branch>`
+ * have diverged (neither is an ancestor of the other) and the daemon could NOT attribute the
+ * origin-side rewrite to its own push (no matching recorded runner-pushed head, #21). A distinct
+ * error type so the review loop can catch *this* case — a possible hand force-push / unknown
+ * rewrite — and park the run HEALABLE (review-maxed, PR preserved) rather than let it terminalize
+ * to `agent-stuck` with the reviewed PR auto-closed (the orphaning #273 exists to eliminate). The
+ * message still carries `diverged`/`#255` so existing operator diagnostics and log matches hold.
+ */
+export class BranchDivergedError extends Error {
+  constructor(branch: string) {
+    super(
+      `refusing to operate on ${branch}: local worktree and origin/${branch} have diverged ` +
+        `(neither is an ancestor of the other) — resolve manually so no side is clobbered (#255).`,
+    );
+    this.name = "BranchDivergedError";
+  }
+}
+
+/**
+ * Options threaded into {@link WorktreeManager.rebaseOntoBase} (and its internal branch-sync).
+ * `trustedRemoteHead` is the SHA the daemon recorded when its container rebase-conflict fix's
+ * runner force-pushed the rewritten history (#21/#273). When local and `origin/<branch>` have
+ * diverged BUT `origin/<branch>` equals that SHA (or descends from it), origin is the daemon's own
+ * verified write by construction — the sync hard-resets the stale local ref to origin instead of
+ * tripping the #255 guard. Absent/`null` → the guard fires on any divergence, exactly as before.
+ */
+export interface RebaseOptions {
+  trustedRemoteHead?: string | null;
+}
+
 /** The worktree operations the executor depends on. */
 export interface WorktreeManager {
   /** Create a worktree on a *new* `branch` at `<root>/<dirName>`; resolve its absolute path. */
@@ -82,7 +113,21 @@ export interface WorktreeManager {
    * be cruft the container never sees, so it is never left behind. This is what lets
    * high-concurrency runs self-heal the parallel-edit conflict pileup.
    */
-  rebaseOntoBase(worktreePath: string, branch: string, baseBranch: string): Promise<RebaseResult>;
+  rebaseOntoBase(
+    worktreePath: string,
+    branch: string,
+    baseBranch: string,
+    opts?: RebaseOptions,
+  ): Promise<RebaseResult>;
+  /**
+   * The current SHA of `origin/<branch>`, or `null` when the branch cannot be fetched/resolved
+   * (never pushed, or a transient fetch failure). Fetches first so the answer reflects origin's
+   * live head. The review loop reads this right after its container rebase-conflict fix's runner
+   * force-push, to record the daemon's own runner-pushed head on the run (#21) — so a later resume
+   * can recognise the resulting divergence as the daemon's own write and hard-sync to origin rather
+   * than trip the #255 guard.
+   */
+  remoteBranchHead(worktreePath: string, branch: string): Promise<string | null>;
   /**
    * Verify a rebase-conflict resolution actually **landed on origin** (issue #273). After the
    * container fix agent redoes the rebase in its clone and the runner force-pushes the result,
@@ -288,10 +333,19 @@ export class GitWorktreeManager implements WorktreeManager {
    * hash path no longer touches the local ref — it hashes `origin/<branch>` directly,
    * see {@link branchDiffHash}, so it is immune to the rewritten-history divergence a
    * container conflict resolution leaves behind, #273.)
+   *
+   * The ONE exception (issue #21): a rebase-conflict self-heal rewrites history — the container
+   * fix agent redoes the rebase in its clone and the runner force-pushes it (#273), so origin
+   * diverges from this worktree's pre-rebase local ref by construction and can NEVER fast-forward.
+   * When `trustedRemoteHead` is the SHA the daemon recorded for that runner push and `origin/<branch>`
+   * equals it (or descends from it), origin is the daemon's OWN verified write — hard-reset the local
+   * ref to it rather than tripping the guard, which exists only for divergence the daemon cannot
+   * attribute to its own push (a hand force-push / unknown rewrite → {@link BranchDivergedError}).
    */
   private async syncBranchToOrigin(
     worktreePath: string,
     branch: string,
+    trustedRemoteHead?: string | null,
   ): Promise<void> {
     const inWorktree = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
       execFileAsync("git", ["-C", resolve(worktreePath), ...args]);
@@ -317,10 +371,16 @@ export class GitWorktreeManager implements WorktreeManager {
       return;
     }
     if (await isAncestor(`origin/${branch}`, head)) return; // local ahead: keep it
-    throw new Error(
-      `refusing to operate on ${branch}: local worktree and origin/${branch} have diverged ` +
-        `(neither is an ancestor of the other) — resolve manually so no side is clobbered (#255).`,
-    );
+    // Diverged. If origin is the daemon's own recorded runner push (or a descendant of it), it is
+    // verified truth by construction (#21) — hard-sync the stale pre-rebase local ref to it.
+    if (
+      trustedRemoteHead &&
+      (remote === trustedRemoteHead || (await isAncestor(trustedRemoteHead, `origin/${branch}`)))
+    ) {
+      await inWorktree(["reset", "--hard", `origin/${branch}`]);
+      return;
+    }
+    throw new BranchDivergedError(branch);
   }
 
   /**
@@ -354,12 +414,14 @@ export class GitWorktreeManager implements WorktreeManager {
     worktreePath: string,
     branch: string,
     baseBranch: string,
+    opts: RebaseOptions = {},
   ): Promise<RebaseResult> {
     const inWorktree = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
       execFileAsync("git", ["-C", resolve(worktreePath), ...args]);
 
-    // Rebase the branch's true state, not the possibly-stale local ref (#255).
-    await this.syncBranchToOrigin(worktreePath, branch);
+    // Rebase the branch's true state, not the possibly-stale local ref (#255). A divergence the
+    // daemon can attribute to its own recorded runner push hard-syncs to origin instead of throwing (#21).
+    await this.syncBranchToOrigin(worktreePath, branch, opts.trustedRemoteHead);
     await inWorktree(["fetch", "origin", baseBranch]);
     // Snapshot the base the rebase is being attempted against — on a conflict this is the base the
     // container fix agent will rebase onto, and the fixed anchor its resolution is verified against
@@ -426,6 +488,20 @@ export class GitWorktreeManager implements WorktreeManager {
     } catch {
       // Diff unavailable (e.g. a ref could not be fetched) → null; the caller falls back to the
       // conservative re-review path rather than skipping it blind.
+      return null;
+    }
+  }
+
+  async remoteBranchHead(worktreePath: string, branch: string): Promise<string | null> {
+    const inWorktree = (args: string[]): Promise<{ stdout: string; stderr: string }> =>
+      execFileAsync("git", ["-C", resolve(worktreePath), ...args]);
+    try {
+      // Fetch so the answer is origin's live head (the runner just force-pushed it, #273), then
+      // resolve the remote-tracking ref. A branch that was never pushed → the fetch errors → null.
+      await inWorktree(["fetch", "origin", branch]);
+      const sha = (await inWorktree(["rev-parse", `origin/${branch}`])).stdout.trim();
+      return sha.length > 0 ? sha : null;
+    } catch {
       return null;
     }
   }

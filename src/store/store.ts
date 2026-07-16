@@ -42,6 +42,12 @@ interface RunRow {
   pr_number: number | null;
   /** The GitHub issue title, captured at dispatch (issue #13); null for pre-migration rows. */
   issue_title: string | null;
+  /**
+   * The head SHA the daemon's container rebase-conflict fix runner force-pushed to origin/<branch>
+   * (issue #21); null when no such push has happened. Read on resume to hard-sync a diverged local
+   * ref to origin rather than trip the #255 guard. Written only by {@link Store.setRunnerPushedHead}.
+   */
+  runner_pushed_sha: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -150,6 +156,7 @@ export class Store {
       worktreePath: row.worktree_path,
       prNumber: row.pr_number,
       issueTitle: row.issue_title ?? null,
+      runnerPushedSha: row.runner_pushed_sha ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -207,6 +214,19 @@ export class Store {
       .prepare<[string, number], RunRow>("SELECT * FROM runs WHERE repo = ? AND issue_number = ?")
       .get(repo, issueNumber);
     return row ? this.mapRun(row) : undefined;
+  }
+
+  /**
+   * Record the head SHA the daemon's container rebase-conflict fix runner force-pushed to
+   * origin/<branch> (issue #21). A targeted UPDATE — the only writer of `runner_pushed_sha`, kept
+   * out of {@link upsertRun} so an unrelated upsert (recording the PR, re-attaching on resume) never
+   * clobbers it. Read on resume ({@link Run.runnerPushedSha}) to hard-sync a diverged local ref to
+   * origin instead of tripping the #255 guard. A no-op if no run exists for the (repo, issue).
+   */
+  setRunnerPushedHead(repo: string, issueNumber: number, sha: string): void {
+    this.db
+      .prepare("UPDATE runs SET runner_pushed_sha = ?, updated_at = ? WHERE repo = ? AND issue_number = ?")
+      .run(sha, this.now(), repo, issueNumber);
   }
 
   /**
@@ -1047,6 +1067,9 @@ export class ScopedStore {
   }
   getRunByIssue(issueNumber: number): Run | undefined {
     return this.store.getRunByIssue(this.repo, issueNumber);
+  }
+  setRunnerPushedHead(issueNumber: number, sha: string): void {
+    this.store.setRunnerPushedHead(this.repo, issueNumber, sha);
   }
   deleteRunByIssue(issueNumber: number): void {
     this.store.deleteRunByIssue(this.repo, issueNumber);

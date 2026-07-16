@@ -15,7 +15,7 @@ import { UsageLimitError } from "../core/usage";
 import type { PullRequest } from "../github/types";
 import { ScriptedFixAgent, ScriptedReviewAgent } from "../testing/fake-review-agents";
 import { ReviewLoop } from "../review/review-loop";
-import { GitWorktreeManager } from "./worktree";
+import { BranchDivergedError, GitWorktreeManager } from "./worktree";
 import { Executor } from "./executor";
 
 const silent = createLogger({ write: () => {} });
@@ -727,6 +727,54 @@ describe("Executor", () => {
     // The PR the impl agent opened (recorded on the run row) is closed, not left open.
     expect(await github.listOpenPullRequests()).toHaveLength(0);
     expect(worktrees.removed).toContain(worktrees.created[0]!.path);
+  });
+
+  // #21: healing a rebase-conflict park must never orphan the reviewed PR. Even on the guard path
+  // that DOES terminalize (a divergence the daemon cannot attribute to its own runner push), the
+  // reviewed work is parked HEALABLE instead of terminalizing to agent-stuck with the PR auto-closed.
+  it("resume whose branch diverged unattributably parks review-maxed and leaves the reviewed PR OPEN (#21)", async () => {
+    github.seed({ number: 21, title: "diverged heal" });
+    const branch = "ralph/21-diverged-heal";
+    const wt = "/wt/21";
+    const pr = github.openPullRequest(branch, "Closes #21");
+    const run = store.upsertRun({ issueNumber: 21, mode: "tdd", status: "running", branch, worktreePath: wt, prNumber: pr.number });
+    await store.recordRunStarted({ runId: run.id, issueNumber: 21, mode: "tdd", branch, worktreePath: wt });
+    // Model a rebase-conflict heal park at phase 0 (a review-maxed heal-card the operator answered).
+    await store.recordReviewMaxedQuestion({ issueNumber: 21, runId: run.id, phase: 0, headline: "heal" });
+    expect(store.getRunByIssue(21)!.status).toBe("review-maxed");
+
+    // On resume the pre-review sync finds origin diverged from the local ref by a rewrite the daemon
+    // CANNOT attribute to its own push (no recorded runner head) → the #255 guard fires.
+    worktrees.scriptRebase(new BranchDivergedError(branch));
+    const reviewLoop = new ReviewLoop({
+      store,
+      github,
+      reviewAgent: new ScriptedReviewAgent([{ items: [] }]),
+      fixAgent: new ScriptedFixAgent(),
+      logger: silent,
+      maxFixAttempts: 3,
+      worktrees,
+      baseBranch: "main",
+      merge: { method: "squash", waitForChecks: false, ciTimeoutMinutes: 30, pollIntervalSeconds: 30, deleteBranch: true },
+    });
+    const ex = new Executor({ store, github, worktrees, agentRunner, logger: silent, reviewLoop });
+
+    // The resume returns cleanly — it is NOT propagated into withFailureGuard (which would
+    // terminalize agent-stuck and auto-close the PR).
+    await ex.resume({
+      issue: github.issues.get(21)!,
+      mode: "tdd",
+      run: store.getRunByIssue(21)!,
+      answer: "retry the resolve",
+      // A phase → review-loop re-entry (a review-maxed heal, issue #9).
+      context: { phase: 0, question: { headline: "heal" } as never },
+    });
+
+    // Parked HEALABLE, not orphaned: review-maxed (NOT agent-stuck), the reviewed PR left OPEN.
+    expect(store.getRunByIssue(21)!.status).toBe("review-maxed");
+    expect(github.issues.get(21)!.labels).not.toContain(LABEL_AGENT_STUCK);
+    expect(github.closedPulls).toHaveLength(0);
+    expect((await github.findPullRequestForBranch(branch))!.state).toBe("OPEN");
   });
 
   it("still labels + closes the orphan PR when the failure-log append throws (#34, AC1/AC2)", async () => {
