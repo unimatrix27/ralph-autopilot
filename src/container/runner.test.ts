@@ -172,12 +172,13 @@ describe("in-container runner (ADR-0038 / issue #185)", () => {
     // The runner pushed WIP + posted the comment directly (runner-direct), against the run's
     // own cloned workspace — independent of the pipe.
     expect(escalation.published).toEqual([{ assignment, question: q, workspacePath: "/ws/esc" }]);
-    // The terminal frame relays the already-posted comment so the daemon can swap the label.
+    // The terminal frame relays the already-posted comment so the daemon can swap the label,
+    // and the full question so the daemon records the run's resume context at indexing time (#9).
     expect(frames.at(-1)).toEqual({
       kind: "result",
       outcome: "escalated",
       detail: expect.any(String),
-      escalation: { headline: q.headline, commentId: 9001, prNumber: 7 },
+      escalation: { headline: q.headline, commentId: 9001, prNumber: 7, question: q },
     });
   });
 

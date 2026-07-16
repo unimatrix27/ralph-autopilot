@@ -114,6 +114,14 @@ const escalationResultSchema = z
     commentId: z.number(),
     /** The draft PR the WIP was checkpointed onto, when one was opened. */
     prNumber: z.number().optional(),
+    /**
+     * The full (validated, bar-clearing) escalation question, relayed so the daemon can record
+     * the run's resume context at escalation indexing time (#9) — without it every answered
+     * container escalation wedges as `paused-run-unresumable`. Optional so a question-less frame
+     * from an older runner build still decodes; the daemon then falls back to a headline-derived
+     * payload (the full question stays readable in the posted comment either way).
+     */
+    question: escalationQuestionSchema.optional(),
   })
   .strict();
 

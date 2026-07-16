@@ -29,7 +29,10 @@ import { createLogger } from "../log/logger";
 import type { Issue } from "../github/types";
 import type { EscalationQuestion } from "../review/escalation";
 import type { StuckReport } from "../executor/stuck-tool";
-import type { RalphAnswer } from "../hitl/answer";
+import { formatRalphAnswer, type RalphAnswer } from "../hitl/answer";
+import { LABEL_READY } from "../hitl/labels";
+import { scanPausedRuns } from "../hitl/resume";
+import { FakeGitHub } from "../testing/fake-github";
 import type { Assignment } from "./assignment";
 import type { Account, ProviderName } from "../config/schema";
 import type { RouteWorld, RoutingSource } from "../providers/resolve";
@@ -187,6 +190,108 @@ describe("ContainerAgentRunner — Option X routing (ADR-0038 / issue #185)", ()
     expect(open).toHaveLength(1);
     expect(open[0]).toMatchObject({ kind: "escalate", headline: escalationQuestion.headline, commentId: 4242, runId: seeded.id });
     expect(store.listRunsByStatus("awaiting-answer").map((r) => r.id)).toContain(seeded.id);
+  });
+
+  it("records resume context at escalation indexing time — the WIP branch + question keyed to the comment (#9)", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    const seeded = store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    const escalation = new FakeEscalation({ commentId: 4242, prNumber: 9 });
+
+    const runner = new ContainerAgentRunner({
+      docker: dockerEscalating(escalatingSession(), escalation),
+      store,
+      config: config(),
+      baseBranch: "main",
+    });
+    await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "x",
+      branch: "ralph/185-impl",
+      runId: seeded.id,
+      logger: silent,
+    });
+
+    // The resume context the answered run resolves through (`resolveResumable`): the full
+    // question keyed to the posted comment, plus the WIP branch the resume clones. Without it
+    // every answered container escalation wedges as `paused-run-unresumable` (#9).
+    const ctx = store.getResumeContext(seeded.id);
+    expect(ctx).toBeDefined();
+    expect(ctx?.branch).toBe("ralph/185-impl");
+    expect(ctx?.context.question).toEqual(escalationQuestion);
+    expect(ctx?.context.commentId).toBe(4242);
+    // An impl-agent escalate carries NO phase — phase-absence IS the impl-resume dispatch axis.
+    expect(ctx?.context.phase).toBeUndefined();
+  });
+
+  it("regression #9: runner-direct escalation frame → scanPausedRuns reports the run resumable once an answer lands", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    const seeded = store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    const escalation = new FakeEscalation({ commentId: 4242, prNumber: 9 });
+
+    const runner = new ContainerAgentRunner({
+      docker: dockerEscalating(escalatingSession(), escalation),
+      store,
+      config: config(),
+      baseBranch: "main",
+    });
+    await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "x",
+      branch: "ralph/185-impl",
+      runId: seeded.id,
+      logger: silent,
+    });
+
+    // The operator answers via the answer flow: the swap-back re-arms `ready-for-agent` and a
+    // `ralph-answer` comment lands after the escalation's question comment (FakeGitHub ids start
+    // at 5001, post-dating the relayed commentId 4242 — the #10 correlation holds).
+    const github = new FakeGitHub();
+    github.seed({ number: 185, labels: [LABEL_READY, "afk", "mode:tdd"] });
+    const answer: RalphAnswer = { kind: "accept-recommendation", text: escalationQuestion.recommendation };
+    void github.postComment(185, formatRalphAnswer(answer));
+
+    const scan = await scanPausedRuns(github, store);
+
+    // The answered, re-armed run resumes — never a `paused-run-unresumable` wedge.
+    expect(scan.strandedAnswered).toEqual([]);
+    expect(scan.resumable.map((r) => r.run.id)).toEqual([seeded.id]);
+    expect(scan.resumable[0]!.answer).toEqual(answer);
+    expect(scan.resumable[0]!.context.question.headline).toBe(escalationQuestion.headline);
+    expect(scan.resumable[0]!.context.commentId).toBe(4242);
+  });
+
+  it("still records a resumable context when a stale runner relays no question (headline fallback, never a wedge)", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    const seeded = store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    // A runner built before the question rode the escalated frame relays only
+    // headline/commentId/prNumber. The daemon must still leave the run resumable —
+    // the full question lives in the ralph-question comment on GitHub either way.
+    const docker = new FakeDocker((t) =>
+      void t.send({
+        kind: "result",
+        outcome: "escalated",
+        detail: "escalated to the operator (issue #185)",
+        escalation: { headline: escalationQuestion.headline, commentId: 4242 },
+      }),
+    );
+
+    const runner = new ContainerAgentRunner({ docker, store, config: config(), baseBranch: "main" });
+    const result = await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "x",
+      branch: "ralph/185-impl",
+      runId: seeded.id,
+      logger: silent,
+    });
+
+    expect(result).toEqual({ ok: false, escalated: true, stuck: null });
+    const ctx = store.getResumeContext(seeded.id);
+    expect(ctx?.branch).toBe("ralph/185-impl");
+    expect(ctx?.context.commentId).toBe(4242);
+    expect(ctx?.context.question.headline).toBe(escalationQuestion.headline);
   });
 
   it("maps a stuck container run to the agent's self-stop report (#187)", async () => {
