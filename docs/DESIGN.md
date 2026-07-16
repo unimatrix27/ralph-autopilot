@@ -267,7 +267,17 @@ pushing — the **runner** (not the agent session) then force-pushes the rewritt
 history (force-push is blocked inside agent sessions, §8; the harness — not the
 agent — owns every rebase force-push), and the daemon **verifies** `origin/<branch>`
 actually moved past the merge-base rather than assuming it landed (legacy issue 273) — a
-conflict implying a risky structural change escalates, never resolved blind. Then,
+conflict implying a risky structural change escalates, never resolved blind. That runner
+force-push rewrites history, so the daemon worktree's stale local ref can never fast-forward
+onto it; the daemon therefore **records the runner-pushed head SHA on the run** (recorded
+whether or not the landed-verification then passes, since the push happened either way) so a
+later resume or the integration re-sync recognises the divergence as its **own** verified write
+and hard-syncs the local ref to `origin/<branch>` instead of tripping the divergence guard —
+which otherwise fires on the daemon's own legitimate push and orphans the reviewed PR (issue 21).
+The divergence guard stays fully intact for a divergence the daemon **cannot** attribute to its
+own push (a hand force-push / unknown rewrite): rather than terminalize to `agent-stuck` with the
+reviewed PR auto-closed, that case parks **healable** (`review-maxed` + heal-card, PR preserved)
+so a human resolves it and re-enables the run. Then,
 keyed on whether the branch **moved**: a no-op rebase merges directly; a moved
 branch (base advanced under a reviewed branch) is **re-reviewed under the lease**
 (net diff taken against `origin/<branch>`, so a conflict resolution that changed the

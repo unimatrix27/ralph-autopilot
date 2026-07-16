@@ -5,6 +5,7 @@ import { FakeGitHub } from "../testing/fake-github";
 import { FakeWorktreeManager } from "../testing/fake-worktree";
 import { ScriptedFixAgent, ScriptedReviewAgent } from "../testing/fake-review-agents";
 import { WallClockExceededError } from "../executor/wall-clock";
+import { BranchDivergedError } from "../executor/worktree";
 import {
   AgentOutputParseError,
   RunnerInfraError,
@@ -432,10 +433,10 @@ describe("ReviewLoop", () => {
 
     // The branch is rebased onto base twice — once before review (so review never
     // runs on a non-mergeable branch) and once before the merge (catching base
-    // moving while review ran).
+    // moving while review ran). No recorded runner push on a clean run → trustedRemoteHead null (#21).
     expect(worktrees.rebased).toEqual([
-      { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE },
-      { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE },
+      { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE, trustedRemoteHead: null },
+      { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE, trustedRemoteHead: null },
     ]);
     expect(github.merges).toHaveLength(1);
   });
@@ -971,6 +972,79 @@ describe("ReviewLoop", () => {
     expect(body).toContain("did not land on origin");
     expect(body).toContain("force-push landed nothing");
     expect(body).not.toContain("base branch advanced");
+  });
+
+  it("records the runner-pushed head on a rebase-conflict resolve, so a later resume can hard-sync (#21)", async () => {
+    const ctx = setup();
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
+    // The container fix agent redid the rebase and the runner force-pushed; remoteBranchHead reads
+    // origin's new (rewritten) head.
+    worktrees.scriptRemoteBranchHead("cafef00dcafef00dcafef00dcafef00dcafef00d");
+    const { loop } = wire({ review: [clean], fix: [{ kind: "fixed" }] });
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "merged" });
+    // The daemon recorded the runner's pushed SHA on the run — the divergence-attribution key that
+    // lets a resume recognise origin as its OWN verified write and hard-sync instead of tripping #255.
+    expect(store.getRunByIssue(3)!.runnerPushedSha).toBe("cafef00dcafef00dcafef00dcafef00dcafef00d");
+  });
+
+  it("records the runner-pushed head even when landed-verification fails (the #20 race), so the heal is not a dead-end (#21)", async () => {
+    const ctx = setup();
+    worktrees.scriptRebase({ kind: "conflict", files: ["src/app.ts"], baseSha: "base-1" });
+    worktrees.scriptRemoteBranchHead("beefbeefbeefbeefbeefbeefbeefbeefbeefbeef");
+    // The runner DID force-push, but landed-verification raced (#20) and returned false → maxout.
+    worktrees.scriptRebaseVerify(false);
+    const { loop } = wire({ review: [clean], fix: [{ kind: "fixed" }] });
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    // The head is recorded REGARDLESS of the verify verdict: the push happened, so the heal-card's
+    // own recommended "re-enable to retry" can hard-sync rather than dead-end on the #255 guard (#21).
+    expect(store.getRunByIssue(3)!.runnerPushedSha).toBe("beefbeefbeefbeefbeefbeefbeefbeefbeefbeef");
+  });
+
+  it("threads the recorded runner-pushed head into the rebase on resume, so the diverged local ref hard-syncs (#21)", async () => {
+    const ctx = setup();
+    // The prior rebase-conflict park recorded the runner-pushed head.
+    store.setRunnerPushedHead(3, "cafef00dcafef00dcafef00dcafef00dcafef00d");
+    // On resume the worktree hard-syncs local to origin, so its rebase is a clean no-op.
+    worktrees.scriptRebase({ kind: "clean", moved: false });
+    const { loop } = wire({ review: [clean], fix: [], merge: { waitForChecks: false } });
+
+    // Re-enter the build flow at phase 0 (a review-maxed heal) with the operator's guidance.
+    const outcome = await loop.runReview({ ...ctx, resume: { phase: 0, guidance: "retry the resolve" } });
+
+    // The rebase was handed the recorded SHA as its trusted remote head — the attribution key that
+    // turns the #255 refusal into a hard-sync to origin (#21). No agent-stuck: it reaches the merge
+    // hand-off.
+    expect(worktrees.rebased[0]).toMatchObject({
+      branch: BRANCH,
+      trustedRemoteHead: "cafef00dcafef00dcafef00dcafef00dcafef00d",
+    });
+    expect(outcome).toEqual({ kind: "awaiting-merge" });
+  });
+
+  it("parks a truly-diverged branch healable (review-maxed), never letting the #255 guard orphan the reviewed PR (#21)", async () => {
+    const ctx = setup();
+    // No recorded runner push → the divergence is unattributable (a hand force-push / unknown
+    // rewrite): the worktree sync throws BranchDivergedError, exactly as the #255 guard fires today.
+    worktrees.scriptRebase(new BranchDivergedError(BRANCH));
+    const { loop } = wire({ review: [clean], fix: [] });
+
+    const outcome = await loop.run(ctx);
+
+    // Parked HEALABLE (review-maxed + heal-card, PR preserved) — NOT propagated to withFailureGuard,
+    // which would terminalize agent-stuck and auto-close the reviewed PR (the orphaning #273 fixes).
+    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(github.merges).toHaveLength(0);
+    // A heal-card explaining the divergence was surfaced (resume-from-WIP re-runs the resolve).
+    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
+    expect(body).toContain("diverged");
   });
 
   it("a rebase conflict implying a risky structural change escalates (never resolved blind)", async () => {

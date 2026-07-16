@@ -52,7 +52,7 @@ import type { Issue } from "../github/types";
 import type { Logger } from "../log/logger";
 import type { ScopedStore } from "../store/store";
 import type { Mode, Phase } from "../store/types";
-import type { WorktreeManager } from "../executor/worktree";
+import { BranchDivergedError, type RebaseResult, type WorktreeManager } from "../executor/worktree";
 import { AgentOutputParseError, RunnerInfraError, type FixAgentRunner, type ReviewAgentRunner } from "./agents";
 import {
   buildHealCardQuestion,
@@ -904,6 +904,11 @@ export class ReviewLoop {
   ): Promise<SyncResult> {
     const log = ctx.logger;
     this.setPhase(ctx, MERGE);
+    // The daemon's own recorded runner-pushed head (#21): when a prior rebase-conflict self-heal's
+    // runner force-pushed the rewritten history, origin diverges from this worktree's pre-rebase
+    // local ref by construction. Hand that SHA to each rebase below so it can attribute the divergence
+    // to its own write and hard-sync to origin, instead of tripping the #255 guard on resume.
+    const trustedRemoteHead = this.deps.store.getRunByIssue(ctx.issue.number)?.runnerPushedSha ?? null;
 
     // Bounded resolution rounds (issue #20). A rebase conflict is resolved out-of-tree, but base can
     // advance again inside that fix window (a sibling PR merging on a hot repo). A landed resolution
@@ -912,11 +917,30 @@ export class ReviewLoop {
     // Bound the rounds so a pathologically hot base still terminates in an honest heal-card.
     let branchMoved = false;
     for (let round = 0; ; ) {
-      const rebase = await this.deps.worktrees.rebaseOntoBase(
-        ctx.worktreePath,
-        ctx.branch,
-        this.deps.baseBranch,
-      );
+      let rebase: RebaseResult;
+      try {
+        rebase = await this.deps.worktrees.rebaseOntoBase(
+          ctx.worktreePath,
+          ctx.branch,
+          this.deps.baseBranch,
+          { trustedRemoteHead },
+        );
+      } catch (err) {
+        if (err instanceof BranchDivergedError) {
+          // origin/<branch> diverged from this worktree by a rewrite the daemon CANNOT attribute to
+          // its own runner push (a hand force-push / unknown rewrite) — the case the #255 guard exists
+          // for. But letting it propagate to withFailureGuard would terminalize the run to agent-stuck
+          // and AUTO-CLOSE the PR, orphaning any fully-reviewed work on origin (#21 part 4). Park it
+          // HEALABLE instead: review-maxed + heal-card, PR preserved — a human resolves the divergence
+          // and re-enables. Converting a recoverable pause into orphaned work is the defect #273 fixes.
+          log.warn("review.rebase-diverged", { branch: ctx.branch });
+          return {
+            kind: "terminal",
+            outcome: await this.reviewMaxed(ctx, CI_PHASE, divergedBranchWorklist(ctx.branch), 1),
+          };
+        }
+        throw err;
+      }
       log.info("review.rebase", { kind: rebase.kind, ...(rebase.kind === "clean" ? { moved: rebase.moved } : { files: rebase.files.length }) });
 
       if (rebase.kind === "clean") {
@@ -1017,16 +1041,23 @@ export class ReviewLoop {
         if (outcome.kind === "escalated") {
           return { kind: "escalated", question: outcome.question };
         }
-        // The container fix agent redid the rebase in its own clone and the runner force-pushed the
-        // resolved history (the agent cannot — git-guardrails, DESIGN §8). The daemon-side rebase was
-        // aborted, so the daemon worktree's branch ref is NOT the source of that push — a bare `fixed`
-        // is not enough. Verify origin/<branch> actually integrated the base it was DISPATCHED against
-        // (`dispatchBaseSha`, not origin's current base — a sibling PR merging inside the fix window
-        // would otherwise fail a perfectly-landed resolution, #20). A resolution that reported success
-        // but did not land (a silent no-op push that once "succeeded" then merged a still-conflicting
-        // PR, #273) maxes out healably rather than proceeding to a merge that cannot land. `attempts`
-        // is this resolution's `round`; the not-landed maxout flows through settle→reviewMaxed
-        // uniformly with the container-fault one below.
+        // The container fix agent redid the rebase and the runner force-pushed the rewritten history
+        // (force-push is blocked in agent sessions, DESIGN §8). Record origin/<branch>'s new head as
+        // the daemon's OWN runner-pushed SHA (#21) BEFORE the landed-verification below: a resume of
+        // a park from EITHER a verify pass OR the #20 landed-verification race must be able to
+        // recognise the resulting local/origin divergence as the daemon's own write and hard-sync to
+        // origin — otherwise the heal-card's own recommended "re-enable to retry" dead-ends on the
+        // #255 guard. Best-effort: a failed head read must not convert a good resolution into a fault
+        // (a resume with no recorded head just falls back to the healable divergence park, not orphaning).
+        await this.recordRunnerPushedHead(ctx);
+        // The daemon-side rebase was aborted, so the daemon worktree's branch ref is NOT the source of
+        // that push — a bare `fixed` is not enough. Verify origin/<branch> actually integrated the base
+        // it was DISPATCHED against (`dispatchBaseSha`, not origin's current base — a sibling PR merging
+        // inside the fix window would otherwise fail a perfectly-landed resolution, #20). A resolution
+        // that reported success but did not land (a silent no-op push that once "succeeded" then merged
+        // a still-conflicting PR, #273) maxes out healably rather than proceeding to a merge that cannot
+        // land. `attempts` is this resolution's `round`; the not-landed maxout flows through
+        // settle→reviewMaxed uniformly with the container-fault one below.
         const landed = await this.deps.worktrees.verifyBranchRebasedOntoBase(
           ctx.worktreePath,
           ctx.branch,
@@ -1064,6 +1095,26 @@ export class ReviewLoop {
         }
         return degraded.outcome;
       }
+    }
+  }
+
+  /**
+   * Record origin/<branch>'s current head as the daemon's own runner-pushed SHA on the run (#21),
+   * after the container rebase-conflict fix's runner force-push. Read on resume (and integration
+   * re-sync) to hard-sync a diverged local ref to origin rather than trip the #255 guard (see
+   * {@link syncWithBase}). Best-effort by design — a failed head read or store write must not turn
+   * a good conflict resolution into a fault; a resume with no recorded head simply falls back to the
+   * healable divergence park ({@link divergedBranchWorklist}) instead of orphaning the reviewed PR.
+   */
+  private async recordRunnerPushedHead(ctx: ReviewLoopContext): Promise<void> {
+    try {
+      const head = await this.deps.worktrees.remoteBranchHead(ctx.worktreePath, ctx.branch);
+      if (head) {
+        this.deps.store.setRunnerPushedHead(ctx.issue.number, head);
+        ctx.logger.info("review.runner-pushed-head", { branch: ctx.branch });
+      }
+    } catch (err) {
+      ctx.logger.warn("review.runner-pushed-head-failed", { error: String(err) });
     }
   }
 
@@ -1283,6 +1334,33 @@ function parseFailureWorklist(err: AgentOutputParseError): Worklist {
           `Parser error: ${err.lastError}. The agent's final message must be exactly one valid JSON ` +
             `object — double-quoted strings, no backticks used as delimiters. Last output tail: ${err.rawTail}`,
         ),
+        source: "review",
+      },
+    ],
+  };
+}
+
+/**
+ * The heal-card worklist for a branch whose local worktree ref and origin have diverged by a
+ * rewrite the daemon could NOT attribute to its own runner push (issue #21 part 4): a hand
+ * force-push, or an unknown rewrite — the case the #255 guard exists for. Rather than let that
+ * guard terminalize the run to `agent-stuck` and auto-close a fully-reviewed PR (orphaning the
+ * work), the run parks HEALABLE with this card: the PR is preserved on origin, and a human resolves
+ * the divergence (or confirms which side is truth) before re-enabling the run.
+ */
+function divergedBranchWorklist(branch: string): Worklist {
+  return {
+    items: [
+      {
+        severity: "P0",
+        title: `origin/${branch} has diverged from the daemon worktree by an unattributable rewrite`,
+        detail:
+          `The local worktree ref and origin/${branch} have diverged — neither is an ancestor of ` +
+          `the other — and the divergence does NOT match the daemon's own recorded rebase-conflict ` +
+          `push, so it cannot be trusted as the daemon's write (a hand force-push, or an unknown ` +
+          `rewrite). The reviewed work is preserved on the PR; nothing was clobbered. Inspect ` +
+          `origin/${branch} vs the local branch, resolve the divergence so one side is authoritative, ` +
+          `then re-enable the run to retry the resolve+verify.`,
         source: "review",
       },
     ],

@@ -6,15 +6,20 @@
  */
 
 import { posix } from "node:path";
-import type { RebaseResult, WorktreeManager } from "../executor/worktree";
+import type { RebaseOptions, RebaseResult, WorktreeManager } from "../executor/worktree";
 
 export class FakeWorktreeManager implements WorktreeManager {
   readonly created: Array<{ branch: string; dirName: string; path: string }> = [];
   readonly attached: Array<{ branch: string; dirName: string; path: string }> = [];
   readonly checkpointed: Array<{ worktreePath: string; branch: string }> = [];
   readonly removed: string[] = [];
-  /** Audit trail of rebase calls, for assertions. */
-  readonly rebased: Array<{ worktreePath: string; branch: string; baseBranch: string }> = [];
+  /** Audit trail of rebase calls (with the trusted-remote-head threaded through, #21), for assertions. */
+  readonly rebased: Array<{
+    worktreePath: string;
+    branch: string;
+    baseBranch: string;
+    trustedRemoteHead?: string | null;
+  }> = [];
   /** Audit trail of {@link verifyBranchRebasedOntoBase} calls, for assertions. */
   readonly rebaseVerifyCalls: Array<{
     worktreePath: string;
@@ -33,21 +38,38 @@ export class FakeWorktreeManager implements WorktreeManager {
   readonly pruneCalls: Array<ReadonlySet<string>> = [];
   /** Branch names pruned across all {@link pruneOrphans} calls, for assertions. */
   readonly prunedBranches: string[] = [];
-  /** Scripted rebase results, consumed in order; the default is a clean no-op rebase. */
-  private readonly rebaseResults: RebaseResult[] = [];
+  /** Audit trail of {@link remoteBranchHead} calls, for assertions. */
+  readonly remoteBranchHeadCalls: Array<{ worktreePath: string; branch: string }> = [];
+  /**
+   * Scripted rebase results, consumed in order; the default is a clean no-op rebase. An `Error`
+   * entry is THROWN instead of returned — so a test can model {@link BranchDivergedError} (the #255
+   * guard firing, #21) from the fake without real git.
+   */
+  private readonly rebaseResults: Array<RebaseResult | Error> = [];
   /** Scripted {@link verifyBranchRebasedOntoBase} results, consumed in order; default `true`. */
   private readonly rebaseVerifyResults: boolean[] = [];
   /** Scripted {@link branchDiffHash} results, consumed in order; default `null` (unavailable). */
   private readonly branchDiffHashes: Array<string | null> = [];
+  /** Scripted {@link remoteBranchHead} results, consumed in order; default `null` (unpushed). */
+  private readonly remoteBranchHeads: Array<string | null> = [];
   private readonly root: string;
 
   constructor(root = "/fake-wt") {
     this.root = root;
   }
 
-  /** Queue rebase results returned (in order) by {@link rebaseOntoBase}. */
-  scriptRebase(...results: RebaseResult[]): void {
+  /**
+   * Queue rebase results returned (in order) by {@link rebaseOntoBase}. An `Error` entry is thrown
+   * rather than returned, so a test can model the #255 divergence guard firing ({@link
+   * BranchDivergedError}, #21) without real git.
+   */
+  scriptRebase(...results: Array<RebaseResult | Error>): void {
     this.rebaseResults.push(...results);
+  }
+
+  /** Queue SHAs returned (in order) by {@link remoteBranchHead}; `null` models an unpushed branch. */
+  scriptRemoteBranchHead(...heads: Array<string | null>): void {
+    this.remoteBranchHeads.push(...heads);
   }
 
   /**
@@ -90,9 +112,19 @@ export class FakeWorktreeManager implements WorktreeManager {
     worktreePath: string,
     branch: string,
     baseBranch: string,
+    opts: RebaseOptions = {},
   ): Promise<RebaseResult> {
-    this.rebased.push({ worktreePath, branch, baseBranch });
-    return this.rebaseResults.shift() ?? { kind: "clean", moved: false };
+    this.rebased.push({ worktreePath, branch, baseBranch, trustedRemoteHead: opts.trustedRemoteHead });
+    const next = this.rebaseResults.shift();
+    if (next instanceof Error) {
+      throw next;
+    }
+    return next ?? { kind: "clean", moved: false };
+  }
+
+  async remoteBranchHead(worktreePath: string, branch: string): Promise<string | null> {
+    this.remoteBranchHeadCalls.push({ worktreePath, branch });
+    return this.remoteBranchHeads.length > 0 ? this.remoteBranchHeads.shift()! : null;
   }
 
   async verifyBranchRebasedOntoBase(

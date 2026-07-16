@@ -144,6 +144,17 @@ describe("migrations", () => {
     db.close();
   });
 
+  it("adds the nullable runner_pushed_sha column additively (v10)", () => {
+    const db = new BetterSqlite3(MEMORY_DB);
+    runMigrations(db);
+    const cols = db
+      .prepare<[], { name: string }>("PRAGMA table_info(runs)")
+      .all()
+      .map((r) => r.name);
+    expect(cols).toContain("runner_pushed_sha");
+    db.close();
+  });
+
   it("applies the issue_title migration idempotently against a pre-migration DB, reading old rows back with a null title (#13)", () => {
     const dir = mkdtempSync(join(tmpdir(), "ralph-title-migration-"));
     const path = join(dir, "ralph.sqlite");
@@ -267,6 +278,24 @@ describe("Store", () => {
     it("leaves the issue title null when a run is created without one (#13)", () => {
       const created = store.upsertRun({ repo: REPO, issueNumber: 51, mode: "tdd" });
       expect(created.issueTitle).toBeNull();
+    });
+
+    it("records the runner-pushed head and preserves it across an unrelated upsert (#21)", () => {
+      const created = store.upsertRun({ repo: REPO, issueNumber: 21, mode: "tdd", branch: "ralph/21-x" });
+      // A fresh run has no recorded runner push — the divergence guard is unaffected.
+      expect(created.runnerPushedSha).toBeNull();
+
+      // The container rebase-conflict fix's runner force-pushed this head — record it on the run.
+      store.setRunnerPushedHead(REPO, 21, "deadbeefcafe1234567890abcdef1234567890ab");
+      expect(store.getRunByIssue(REPO, 21)?.runnerPushedSha).toBe(
+        "deadbeefcafe1234567890abcdef1234567890ab",
+      );
+
+      // A later upsert (e.g. the resume re-attaching the worktree) that does not re-pass the SHA
+      // must NOT clobber it — resume reads it to hard-sync the diverged local ref to origin (#21).
+      const updated = store.upsertRun({ repo: REPO, issueNumber: 21, mode: "tdd", worktreePath: "/wt/21", prNumber: 5 });
+      expect(updated.runnerPushedSha).toBe("deadbeefcafe1234567890abcdef1234567890ab");
+      expect(updated.prNumber).toBe(5);
     });
 
     it("derives status from the issue stream's facts (append → fold → derived status)", async () => {

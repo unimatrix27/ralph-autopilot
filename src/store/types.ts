@@ -116,6 +116,16 @@ export interface Run {
    * the column — every consumer degrades to the `repo #issue` reference.
    */
   issueTitle: string | null;
+  /**
+   * The head SHA the daemon's container rebase-conflict fix runner force-pushed to origin/<branch>
+   * (issue #21), or `null` when no such push has happened for this run. Recorded via
+   * {@link import("./store").ScopedStore.setRunnerPushedHead} and read on resume: if the local
+   * worktree ref and origin/<branch> have diverged but origin equals (or descends from) this SHA,
+   * origin is the daemon's own verified write and the resume hard-syncs to it rather than tripping
+   * the #255 divergence guard (which would orphan the reviewed PR). Row bookkeeping like `branch`,
+   * preserved across upserts — never re-derived from GitHub.
+   */
+  runnerPushedSha: string | null;
   createdAt: string;
   updatedAt: string;
 }

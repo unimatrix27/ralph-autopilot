@@ -800,6 +800,98 @@ describe("GitWorktreeManager syncs the stale local ref to origin/<branch> (#255)
     expect(git(clone, "ls-remote", "origin", "ralph/255-div")).toContain("ralph/255-div");
   });
 
+  // #21: a rebase-conflict self-heal rewrites history — the container fix agent redoes the
+  // rebase in its clone and the runner force-pushes the result (#273), leaving the daemon
+  // worktree's local ref at the pre-rebase head. That divergence can NEVER fast-forward, so on
+  // resume the #255 guard would fire on the daemon's OWN legitimate push and orphan the reviewed
+  // PR. When origin/<branch> is the daemon's own recorded runner push (or a descendant of it),
+  // origin is verified truth by construction — hard-sync the local ref to it instead of refusing.
+  it("hard-syncs the stale local ref to origin when origin is the daemon's own recorded runner push (#21)", async () => {
+    const mgr = new GitWorktreeManager(clone, wtRoot, { baseBranch: "master" });
+    const path = await mgr.create("ralph/21-heal", "21-heal");
+
+    // The daemon worktree's local ref holds the pre-rebase head (a local commit).
+    writeFileSync(join(path, "feature.txt"), "pre-rebase\n");
+    git(path, "add", "feature.txt");
+    git(path, "commit", "-m", "pre-rebase head");
+
+    // The container rebase-conflict fix rewrites history and the runner force-pushes: origin/<branch>
+    // is now a DIFFERENT commit, so local and origin have diverged (neither is an ancestor).
+    agentPush("ralph/21-heal", "feature.txt", "rewritten-by-container\n");
+    const trustedRemoteHead = git(clone, "ls-remote", "origin", "ralph/21-heal").trim().split(/\s+/)[0];
+
+    // With the runner-pushed SHA supplied, the guard recognises the divergence as the daemon's own
+    // write and hard-resets local to origin rather than refusing. Base did not advance → clean no-op.
+    const result = await mgr.rebaseOntoBase(path, "ralph/21-heal", "master", {
+      trustedRemoteHead,
+    });
+    expect(result).toEqual({ kind: "clean", moved: false });
+
+    // Local now matches origin (the runner's verified push); the pre-rebase local commit is gone.
+    expect(readFileSync(join(path, "feature.txt"), "utf8")).toBe("rewritten-by-container\n");
+    expect(git(path, "rev-parse", "HEAD").trim()).toBe(trustedRemoteHead);
+    // Origin is untouched — nothing moved, so no force-push clobbered the verified work.
+    expect(git(clone, "ls-remote", "origin", "ralph/21-heal").trim().split(/\s+/)[0]).toBe(
+      trustedRemoteHead,
+    );
+  });
+
+  it("hard-syncs when origin is a DESCENDANT of the recorded runner push (#21)", async () => {
+    const mgr = new GitWorktreeManager(clone, wtRoot, { baseBranch: "master" });
+    const path = await mgr.create("ralph/21-desc", "21-desc");
+
+    writeFileSync(join(path, "feature.txt"), "pre-rebase\n");
+    git(path, "add", "feature.txt");
+    git(path, "commit", "-m", "pre-rebase head");
+
+    // The runner pushed once (recorded), then a commit was appended on top on origin, so
+    // origin is a descendant of the recorded SHA (still diverged from the local pre-rebase ref).
+    agentPush("ralph/21-desc", "feature.txt", "rewritten\n");
+    const recorded = git(clone, "ls-remote", "origin", "ralph/21-desc").trim().split(/\s+/)[0];
+    agentPush("ralph/21-desc", "more.txt", "follow-up\n");
+    const originHead = git(clone, "ls-remote", "origin", "ralph/21-desc").trim().split(/\s+/)[0];
+    expect(originHead).not.toBe(recorded);
+
+    const result = await mgr.rebaseOntoBase(path, "ralph/21-desc", "master", {
+      trustedRemoteHead: recorded,
+    });
+    expect(result).toEqual({ kind: "clean", moved: false });
+    // Local hard-synced to origin's current head (the descendant), not the stale recorded SHA.
+    expect(git(path, "rev-parse", "HEAD").trim()).toBe(originHead);
+  });
+
+  it("still refuses loudly when a recorded runner push does NOT match/descend the diverged origin (#21 guard intact)", async () => {
+    const mgr = new GitWorktreeManager(clone, wtRoot, { baseBranch: "master" });
+    const path = await mgr.create("ralph/21-hand", "21-hand");
+
+    // A local-only commit and a different, unattributable origin rewrite (a genuine hand
+    // force-push) → neither is an ancestor of the other.
+    writeFileSync(join(path, "local.txt"), "local only\n");
+    git(path, "add", "local.txt");
+    git(path, "commit", "-m", "local only");
+    const staleRecorded = git(path, "rev-parse", "HEAD").trim();
+    agentPush("ralph/21-hand", "remote.txt", "remote only\n");
+
+    // The recorded SHA is neither origin's head nor an ancestor of it — the daemon cannot attribute
+    // the current divergence to its own push, so the #255 guard fires exactly as today.
+    await expect(
+      mgr.rebaseOntoBase(path, "ralph/21-hand", "master", { trustedRemoteHead: staleRecorded }),
+    ).rejects.toThrow(/diverged/);
+    expect(git(clone, "ls-remote", "origin", "ralph/21-hand")).toContain("ralph/21-hand");
+  });
+
+  it("remoteBranchHead returns origin/<branch>'s current SHA and null for an unpushed branch (#21)", async () => {
+    const mgr = new GitWorktreeManager(clone, wtRoot, { baseBranch: "master" });
+    const path = await mgr.create("ralph/21-head", "21-head");
+
+    // Not pushed yet → no origin/<branch> → null.
+    expect(await mgr.remoteBranchHead(path, "ralph/21-head")).toBeNull();
+
+    agentPush("ralph/21-head", "feature.txt", "work\n");
+    const head = await mgr.remoteBranchHead(path, "ralph/21-head");
+    expect(head).toBe(git(clone, "ls-remote", "origin", "ralph/21-head").trim().split(/\s+/)[0]);
+  });
+
   it("keeps a local ref that is AHEAD of origin (unpushed harness-side work is not discarded)", async () => {
     const mgr = new GitWorktreeManager(clone, wtRoot, { baseBranch: "master" });
     const path = await mgr.create("ralph/255-ahead", "255-ahead");

@@ -239,6 +239,21 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE runs ADD COLUMN issue_title TEXT;
     `,
   },
+  {
+    version: 10,
+    name: "run-runner-pushed-sha",
+    // Runner-pushed head recovery (issue #21): when the daemon's container rebase-conflict fix's
+    // runner force-pushes the rewritten history (#273, DESIGN §8), record that pushed SHA on the
+    // run so a later resume can recognise the resulting local/origin divergence as the daemon's OWN
+    // verified write and hard-sync to origin — instead of tripping the #255 guard (which fires on
+    // the daemon's own legitimate push) and orphaning the reviewed PR. Additive + nullable: a run
+    // with no rebase-conflict force-push simply has no recorded head, and the guard is unaffected.
+    // Non-derived bookkeeping like `branch`/`pr_number`, preserved across upserts (upsertRun never
+    // writes the column; the dedicated setRunnerPushedHead UPDATE is the only writer).
+    up: `
+      ALTER TABLE runs ADD COLUMN runner_pushed_sha TEXT;
+    `,
+  },
 ];
 
 /**
