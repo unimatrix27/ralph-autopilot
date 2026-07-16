@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildAccountToggleEdit,
   buildClearRoutingEdit,
   buildPhasedRoutingEdit,
   buildRoutingEditorModel,
@@ -37,9 +38,9 @@ function res(over: Partial<EffectiveRoutingResponse> = {}): EffectiveRoutingResp
       { provider: "zai", configured: true, toolsCapable: true },
     ],
     accounts: [
-      { id: "claude-1", provider: "claude" },
-      { id: "zai-1", provider: "zai" },
-      { id: "zai-2", provider: "zai" },
+      { id: "claude-1", provider: "claude", enabled: true },
+      { id: "zai-1", provider: "zai", enabled: true },
+      { id: "zai-2", provider: "zai", enabled: false },
     ],
   };
   // Parse so the fixture can never drift from the wire shape.
@@ -71,11 +72,14 @@ describe("buildRoutingEditorModel", () => {
     const model = buildRoutingEditorModel(res());
     const byProvider = Object.fromEntries(model.pool.map((g) => [g.provider, g]));
     expect(model.pool.map((g) => g.provider)).toEqual(["claude", "openai", "zai"]);
-    expect(byProvider.claude!.accountIds).toEqual(["claude-1"]);
-    expect(byProvider.zai!.accountIds).toEqual(["zai-1", "zai-2"]);
+    expect(byProvider.claude!.accounts).toEqual([{ id: "claude-1", enabled: true }]);
+    expect(byProvider.zai!.accounts).toEqual([
+      { id: "zai-1", enabled: true },
+      { id: "zai-2", enabled: false },
+    ]);
     // openai is configured but has no accounts — shown as an empty pool, not omitted.
     expect(byProvider.openai!.configured).toBe(true);
-    expect(byProvider.openai!.accountIds).toEqual([]);
+    expect(byProvider.openai!.accounts).toEqual([]);
     expect(byProvider.openai!.toolsCapable).toBe(false);
   });
 });
@@ -335,5 +339,21 @@ describe("phasedPreferenceIsPostable", () => {
         phase2: [{ provider: "claude", model: "   " }],
       }),
     ).toBe(false);
+  });
+});
+
+// ── account enable/disable toggle (issue #10) ───────────────────────────────────
+
+describe("buildAccountToggleEdit — the per-account park/un-park body", () => {
+  it("builds a wire-valid disable body addressed by resolved pool id", () => {
+    const body = buildAccountToggleEdit("zai-2", false);
+    expect(body).toEqual({ target: "account", id: "zai-2", enabled: false });
+    expect(routingEditRequestBodySchema.safeParse(body).success).toBe(true);
+  });
+
+  it("builds a wire-valid re-enable body", () => {
+    const body = buildAccountToggleEdit("openai", true);
+    expect(body).toEqual({ target: "account", id: "openai", enabled: true });
+    expect(routingEditRequestBodySchema.safeParse(body).success).toBe(true);
   });
 });

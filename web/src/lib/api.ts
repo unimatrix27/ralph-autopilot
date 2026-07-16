@@ -64,7 +64,17 @@ async function postJson<T>(path: string, body: unknown, parse: (raw: unknown) =>
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    throw new Error(`${path} → ${res.status} ${res.statusText}`);
+    // Error responses carry `{ error: <reason> }` (the server's clear edge message — e.g. why a
+    // routing/account edit was rejected); surface that reason rather than a bare status line.
+    const reason = await res
+      .json()
+      .then((raw: unknown) =>
+        raw !== null && typeof raw === "object" && typeof (raw as { error?: unknown }).error === "string"
+          ? (raw as { error: string }).error
+          : null,
+      )
+      .catch(() => null);
+    throw new Error(reason ?? `${path} → ${res.status} ${res.statusText}`);
   }
   return parse(await res.json());
 }

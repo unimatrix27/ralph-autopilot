@@ -38,22 +38,33 @@ import { resolveEffectiveRouting, type RoutingConfig, type RoutingSource } from 
 
 /**
  * One routing edit (ADR-0037 P4.1). A discriminated union on `target` so account / provider edits
- * are additive arms later (#170 / a follow-up). The v1 arm sets a **type's routing**: `routing` is
+ * are additive arms (#170 / issue #10). The `type` arm sets a **type's routing**: `routing` is
  * the new value — a single entry / preference list, or (for `review`/`fix`) the per-phase object
  * form (ADR-0037 #169) — or `null` to **clear** the override (the type falls back to the global
- * default). Structurally matches the contract's `RoutingEditRequestBody` (sans `repo`, ignored in
- * v1), so the web adapter passes it through.
+ * default). The `account` arm (issue #10) parks / un-parks one resolved-pool account by id:
+ * `enabled: false` adds it to `disabledAccounts` (invisible to dispatch-time selection from the
+ * next dispatch on), `enabled: true` removes it. Both structurally match the contract's
+ * `RoutingEditRequestBody` (sans `repo`, ignored in v1), so the web adapter passes them through.
  */
-export type RoutingEdit = { target: "type"; type: AgentType; routing: ReviewFixRouting | null };
+export type RoutingEdit =
+  | { target: "type"; type: AgentType; routing: ReviewFixRouting | null }
+  | { target: "account"; id: string; enabled: boolean };
 
-/** The outcome of {@link RoutingStore.applyEdit}: applied, or rejected with a clear edge error. */
+/**
+ * The outcome of {@link RoutingStore.applyEdit}: applied, or rejected with a clear edge error.
+ * `cleared` is the type arm's "override removed" flag; an account edit always reports `false`.
+ */
 export type RoutingEditOutcome = { ok: true; cleared: boolean } | { ok: false; error: string };
 
-/** The global routing snapshot the web read serialises (ADR-0037 P4.1): agent + providers + pool. */
+/**
+ * The global routing snapshot the web read serialises (ADR-0037 P4.1): agent + providers + pool,
+ * plus the operator-parked pool ids (issue #10) so the read surfaces mark disabled accounts.
+ */
 export interface RoutingSnapshot {
   agent: AgentSettings;
   providers: ProvidersSettings;
   accounts: Account[];
+  disabledAccounts: string[];
 }
 
 export interface RoutingStoreDeps {
@@ -120,7 +131,17 @@ export class RoutingStore {
       agent: this.config.agent,
       providers: this.config.providers,
       accounts: resolveAccountPool(this.config),
+      disabledAccounts: [...this.config.disabledAccounts],
     };
+  }
+
+  /**
+   * Whether the named pool account is operator-disabled right now (issue #10) — the LIVE
+   * predicate the daemon's headroom port and the claude usage meter read per selection, so a
+   * web account edit is reflected on the next dispatch with no restart.
+   */
+  isAccountDisabled(id: string): boolean {
+    return this.config.disabledAccounts.includes(id);
   }
 
   /**
@@ -130,6 +151,9 @@ export class RoutingStore {
    * after a successful validate + persist, so the file and the overlay never diverge.
    */
   applyEdit(edit: RoutingEdit): RoutingEditOutcome {
+    if (edit.target === "account") {
+      return this.applyAccountEdit(edit);
+    }
     const cleared = edit.routing === null;
     const newTypes: Record<string, ReviewFixRouting> = { ...this.config.agent.types };
     if (edit.routing === null) {
@@ -155,9 +179,53 @@ export class RoutingStore {
       }
     }
 
-    // Defence in depth: run the candidate through the SAME load-time validation the daemon boots
-    // on. This both re-checks the capability gate and rejects a config that would fail to reload
-    // (a selected provider with no block/account), so a runtime edit can never wedge the next start.
+    const outcome = this.validateAndCommit(candidate, edit);
+    if (outcome.ok) {
+      this.logger?.info("routing.edit-applied", { type: edit.type, cleared });
+    }
+    return outcome.ok ? { ok: true, cleared } : outcome;
+  }
+
+  /**
+   * Park / un-park one pool account (issue #10, the account arm). Addressed by **resolved pool
+   * id** — explicit `accounts:` entries and back-compat-slice accounts alike; an id naming
+   * nothing in the pool is rejected with a clear error (this is also where a box-default
+   * `default` login lands: it is not a pool account, so it cannot be parked). The candidate
+   * config runs through the SAME load-time gate as a type edit, so disabling the last enabled
+   * account of a provider any preference list selects is rejected at the edge with the load-time
+   * message, and the persisted state can never fail the next restart.
+   */
+  private applyAccountEdit(edit: { target: "account"; id: string; enabled: boolean }): RoutingEditOutcome {
+    const pool = resolveAccountPool(this.config);
+    if (!pool.some((account) => account.id === edit.id)) {
+      return {
+        ok: false,
+        error: `unknown account id '${edit.id}' — resolved pool ids: ${
+          pool.length > 0 ? pool.map((account) => account.id).join(", ") : "(none)"
+        }`,
+      };
+    }
+    const current = this.config.disabledAccounts;
+    const disabledAccounts = edit.enabled
+      ? current.filter((id) => id !== edit.id)
+      : current.includes(edit.id)
+        ? current
+        : [...current, edit.id];
+    const candidate: RalphConfig = { ...this.config, disabledAccounts };
+    const outcome = this.validateAndCommit(candidate, edit);
+    if (outcome.ok) {
+      this.logger?.info("routing.account-edit-applied", { id: edit.id, enabled: edit.enabled });
+    }
+    return outcome;
+  }
+
+  /**
+   * The shared tail of every edit: run the candidate through the SAME load-time validation the
+   * daemon boots on (rejects a config that would fail to reload — no restart-wedge), write
+   * through FIRST (the file is the source of truth), then commit the overlay — so file and
+   * overlay never diverge; a persist failure rejects the edit with the overlay untouched.
+   */
+  private validateAndCommit(candidate: RalphConfig, edit: RoutingEdit): RoutingEditOutcome {
     let targets: TargetConfig[];
     try {
       targets = resolveTargets(candidate);
@@ -168,10 +236,8 @@ export class RoutingStore {
       throw err;
     }
 
-    // Write through FIRST (the file is the source of truth); commit the overlay only once persisted,
-    // so file + overlay never diverge. A persist failure rejects the edit with the overlay untouched.
     try {
-      this.writeThrough(candidate);
+      this.writeThrough(candidate, edit);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       this.logger?.error("routing.write-through-failed", { configPath: this.configPath, error: reason });
@@ -180,21 +246,30 @@ export class RoutingStore {
 
     this.config = candidate;
     this.targetByRepo = new Map(targets.map((target) => [target.targetRepo, target]));
-    this.logger?.info("routing.edit-applied", { type: edit.type, cleared });
-    return { ok: true, cleared };
+    return { ok: true, cleared: false };
   }
 
   /**
-   * Persist the global per-type routing to `config.yaml` (overlay-only when no path is wired).
-   * Edits the parsed document in place (`agent.types`) so the operator's comments and the rest of
-   * the file survive — the gitignored file the self-update reset never touches.
+   * Persist the edited surface to `config.yaml` (overlay-only when no path is wired). Edits the
+   * parsed document in place — only the key the edit owns (`agent.types` for a type edit,
+   * `disabledAccounts` for an account edit) — so the operator's comments and the rest of the file
+   * survive: the gitignored file the self-update reset never touches. An emptied disabled list
+   * deletes the key entirely, returning the file to its pre-#10 shape.
    */
-  private writeThrough(candidate: RalphConfig): void {
+  private writeThrough(candidate: RalphConfig, edit: RoutingEdit): void {
     if (!this.configPath) {
       return;
     }
     const doc = parseDocument(this.readFile(this.configPath));
-    doc.setIn(["agent", "types"], candidate.agent.types);
+    if (edit.target === "account") {
+      if (candidate.disabledAccounts.length > 0) {
+        doc.setIn(["disabledAccounts"], candidate.disabledAccounts);
+      } else {
+        doc.deleteIn(["disabledAccounts"]);
+      }
+    } else {
+      doc.setIn(["agent", "types"], candidate.agent.types);
+    }
     this.writeFile(this.configPath, doc.toString());
   }
 }

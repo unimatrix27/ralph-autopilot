@@ -314,13 +314,21 @@ describe("health + usage contract", () => {
           id: "primary",
           active: true,
           gated: false,
+          disabled: false,
           windows: [
             { type: "five_hour", utilization: 40, resetsAt: "2026-06-21T13:00:00.000Z" },
             { type: "seven_day", utilization: null, resetsAt: null },
           ],
           cooldownUntil: null,
         },
-        { id: "secondary", active: false, gated: true, windows: [], cooldownUntil: "2026-06-21T12:30:00.000Z" },
+        {
+          id: "secondary",
+          active: false,
+          gated: true,
+          disabled: true,
+          windows: [],
+          cooldownUntil: "2026-06-21T12:30:00.000Z",
+        },
       ],
     },
   };

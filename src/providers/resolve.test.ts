@@ -267,3 +267,49 @@ describe("per-tier impl route resolution (issue #278)", () => {
     expect(route).toEqual({ provider: "claude", model: target.agent.model, account: CLAUDE });
   });
 });
+
+describe("resolveRoute — operator-disabled accounts (issue #10 regression)", () => {
+  /**
+   * The disabled-accounts port shape: `acquireAccount` returns only ENABLED accounts with
+   * headroom (the production `buildRouteWorld` filters the pool through the live
+   * `disabledAccounts` overlay), so from the pure resolver's seat a provider whose accounts are
+   * all disabled is indistinguishable from an all-gated pool — and MUST resolve identically.
+   */
+  function worldWithDisabled(
+    pools: Partial<Record<ProviderName, Account[]>>,
+    disabled: Set<string>,
+  ): RouteWorld {
+    return {
+      acquireAccount: (_repo, provider) =>
+        (pools[provider] ?? []).find((account) => !disabled.has(account.id)) ?? null,
+    };
+  }
+
+  it("walks past a preference entry whose provider has only disabled accounts, exactly like the all-gated case", () => {
+    const r = routing({ types: { review: [{ provider: "zai", model: "glm-5.2" }, { provider: "claude" }] } });
+    const w = worldWithDisabled({ zai: [ZAI], claude: [CLAUDE] }, new Set([ZAI.id]));
+    expect(resolveRoute(r, REPO, "review", w)).toEqual({ provider: "claude", account: CLAUDE });
+  });
+
+  it("waits no-provider when every entry's accounts are disabled — a wait, never an error", () => {
+    const r = routing({ types: { review: [{ provider: "zai" }, { provider: "claude" }] } });
+    const w = worldWithDisabled({ zai: [ZAI], claude: [CLAUDE] }, new Set([ZAI.id, CLAUDE.id]));
+    expect(resolveRoute(r, REPO, "review", w)).toEqual({ wait: "no-provider" });
+  });
+
+  it("selects the enabled sibling within a provider's pool (disable is per-account, not per-provider)", () => {
+    const z2: Account = { id: "z2", provider: "zai", authTokenEnv: "ZAI_KEY_2" };
+    const r = routing({ types: { review: [{ provider: "zai", model: "glm-5.2" }] } });
+    const w = worldWithDisabled({ zai: [ZAI, z2] }, new Set([ZAI.id]));
+    expect(resolveRoute(r, REPO, "review", w)).toEqual({ provider: "zai", model: "glm-5.2", account: z2 });
+  });
+
+  it("re-resolves onto a re-enabled account next dispatch (the live-overlay contract)", () => {
+    const disabled = new Set<string>([ZAI.id]);
+    const r = routing({ types: { review: [{ provider: "zai" }] } });
+    const w = worldWithDisabled({ zai: [ZAI] }, disabled);
+    expect(resolveRoute(r, REPO, "review", w)).toEqual({ wait: "no-provider" });
+    disabled.delete(ZAI.id); // the operator re-enables; nothing is rebuilt
+    expect(resolveRoute(r, REPO, "review", w)).toEqual({ provider: "zai", account: ZAI });
+  });
+});

@@ -57,7 +57,7 @@ import { executeRoutingEdit, getEffectiveRouting, type RoutingControlPort } from
 export type UsageSnapshotReader = () => UsageMeterSnapshot;
 
 /** The box-default usage picture when no meter is wired: one login, nothing streamed. */
-const DEFAULT_USAGE_SNAPSHOT: UsageMeterSnapshot = { activeId: "default", ids: ["default"], states: {} };
+const DEFAULT_USAGE_SNAPSHOT: UsageMeterSnapshot = { activeId: "default", ids: ["default"], states: {}, disabledIds: [] };
 
 type WebTargetMetadata = Pick<TargetConfig, "targetRepo" | "priorityLabels">;
 

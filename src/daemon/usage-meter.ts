@@ -42,6 +42,14 @@ export interface UsageMeterOptions {
    * in the log. Absent → no notification (e.g. tests / single-login).
    */
   onActiveChange?: (change: { from: string; to: string }) => void;
+  /**
+   * LIVE operator-disable predicate (issue #10): `true` parks the login — selection never
+   * binds it and its state never counts toward the pool's headroom OR its pause (disabled
+   * is operator intent, not a gate state). A thunk, read fresh on every select, so a web
+   * account edit takes effect on the next dispatch with no meter rebuild. Absent → nothing
+   * is disabled (byte-for-byte the pre-#10 behaviour).
+   */
+  isDisabled?: (id: string) => boolean;
 }
 
 export class UsageMeter {
@@ -50,6 +58,7 @@ export class UsageMeter {
   private readonly rotateEveryMs: number | null;
   private readonly now: () => number;
   private readonly onActiveChange?: (change: { from: string; to: string }) => void;
+  private readonly isDisabled: (id: string) => boolean;
   private activeId: string;
   private lastRotateMs: number;
 
@@ -58,20 +67,37 @@ export class UsageMeter {
     this.rotateEveryMs = opts.rotateEveryMs ?? null;
     this.now = opts.now ?? ((): number => Date.now());
     this.onActiveChange = opts.onActiveChange;
+    this.isDisabled = opts.isDisabled ?? ((): boolean => false);
     this.activeId = (this.tokens[0] as Subscription).id;
     this.lastRotateMs = this.now();
+  }
+
+  /** The login ids not operator-disabled right now — the LIVE selectable set (issue #10). */
+  private enabledIds(): string[] {
+    return this.tokens.map((t) => t.id).filter((id) => !this.isDisabled(id));
   }
 
   /**
    * Re-evaluate the active pointer for *now* (apply the threshold/rotation flip).
    * Idempotent given the same clock + state; called before every read/acquire so a
    * just-tripped token flips the daemon onto the other login within the same tick.
+   *
+   * Selection runs over the ENABLED ids only (issue #10): a parked login is never a
+   * candidate, and a just-parked ACTIVE login is force-flipped off before the pure
+   * rotation runs. With every login parked there is nothing to select — the pointer is
+   * left standing and the acquire paths refuse to hand it out.
    */
   private select(admitBelowPercent: number): void {
+    const ids = this.enabledIds();
+    if (ids.length === 0) {
+      return;
+    }
     const next = pickActiveToken({
-      ids: this.tokens.map((t) => t.id),
+      ids,
       states: Object.fromEntries(this.states),
-      activeId: this.activeId,
+      // A disabled active pointer normalises onto the first enabled login; the pure
+      // rotation then walks on from there if that one is gated.
+      activeId: ids.includes(this.activeId) ? this.activeId : (ids[0] as string),
       lastRotateMs: this.lastRotateMs,
       nowMs: this.now(),
       admitBelowPercent,
@@ -111,7 +137,13 @@ export class UsageMeter {
    * login is picked up the same tick.
    */
   acquireIfHeadroom(admitBelowPercent: number): ActiveToken | null {
-    return this.gate(admitBelowPercent).admit ? this.activeToken() : null;
+    if (!this.gate(admitBelowPercent).admit) {
+      return null;
+    }
+    const token = this.activeToken();
+    // Defence in depth (issue #10): with EVERY login operator-disabled the gate admits (see
+    // gate()) but the standing pointer is a parked credential — never hand it out.
+    return this.isDisabled(token.id) ? null : token;
   }
 
   /** Fold a streamed rate-limit signal into a token's state (default: the active one). */
@@ -127,22 +159,37 @@ export class UsageMeter {
   /**
    * May admission launch new agents right now? Flips onto a token with headroom if
    * the active one is gated; returns the active token's gate result. Refuses
-   * (defers) only when EVERY token is gated — the whole-daemon pause of ADR-0023,
-   * now reached only when both logins are exhausted.
+   * (defers) only when EVERY **enabled** token is gated — the whole-daemon pause of
+   * ADR-0023, now reached only when both logins are exhausted. An operator-disabled
+   * login counts toward neither side (issue #10): its headroom never admits (it is
+   * un-bindable) and its gating never pauses (disabled is operator intent, not a
+   * gate state). With EVERY login disabled the gate ADMITS: that state is reachable
+   * only when no preference list selects this pool's provider (the config gate
+   * rejects it otherwise), so refusing would wrongly pause other providers' work —
+   * the acquire paths still never hand out a parked credential.
    */
   gate(admitBelowPercent: number): UsageGateResult {
     this.select(admitBelowPercent);
+    if (this.enabledIds().length === 0) {
+      return { admit: true };
+    }
     return usageGate(this.states.get(this.activeId) ?? EMPTY_USAGE, this.now(), admitBelowPercent);
   }
 
   /**
    * The current usage picture (read-only snapshot for diagnostics / the web Health
    * view, issue #116): the active login pointer, every configured login id (so a
-   * never-streamed login still appears), and the per-login state. Pure read — it
-   * never flips the active pointer.
+   * never-streamed login still appears), the per-login state, and which logins are
+   * operator-disabled right now (issue #10 — the live predicate, evaluated at
+   * snapshot time). Pure read — it never flips the active pointer.
    */
-  snapshot(): { activeId: string; ids: string[]; states: Record<string, UsageState> } {
-    return { activeId: this.activeId, ids: this.tokens.map((t) => t.id), states: Object.fromEntries(this.states) };
+  snapshot(): { activeId: string; ids: string[]; states: Record<string, UsageState>; disabledIds: string[] } {
+    return {
+      activeId: this.activeId,
+      ids: this.tokens.map((t) => t.id),
+      states: Object.fromEntries(this.states),
+      disabledIds: this.tokens.map((t) => t.id).filter((id) => this.isDisabled(id)),
+    };
   }
 }
 
@@ -163,6 +210,12 @@ export interface ProviderPoolMeterOptions {
   now?: () => number;
   /** Notified whenever a pool's active account flips, tagged with the provider. */
   onActiveChange?: (change: { provider: ProviderName; from: string; to: string }) => void;
+  /**
+   * LIVE operator-disable predicate keyed by pool account id (issue #10), threaded into every
+   * per-provider {@link UsageMeter}: a disabled account is invisible to `acquireAccount` and
+   * never counts toward `hasHeadroom`. Absent → nothing is disabled.
+   */
+  isDisabled?: (id: string) => boolean;
 }
 
 /**
@@ -208,14 +261,20 @@ export class ProviderPoolMeter {
           onActiveChange: opts.onActiveChange
             ? (change): void => opts.onActiveChange!({ provider, ...change })
             : undefined,
+          isDisabled: opts.isDisabled,
         }),
       );
     }
   }
 
-  /** Does `provider` have at least one account with headroom right now? */
+  /**
+   * Does `provider` have at least one **enabled** account with headroom right now? Read via
+   * `acquireIfHeadroom` rather than the raw gate: the gate deliberately admits an all-disabled
+   * pool (so the whole-daemon claude pause never fires on operator intent, issue #10), but for
+   * pool availability an all-disabled provider is exactly as unavailable as an all-gated one.
+   */
   hasHeadroom(provider: ProviderName, admitBelowPercent: number): boolean {
-    return this.meters.get(provider)?.gate(admitBelowPercent).admit ?? false;
+    return (this.meters.get(provider)?.acquireIfHeadroom(admitBelowPercent) ?? null) !== null;
   }
 
   /**

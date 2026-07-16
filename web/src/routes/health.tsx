@@ -1,6 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
-import type { AnomalyItem, DaemonHealth, UsageLogin, UsageSummary } from "@contract";
-import { fetchHealthUsage } from "@/lib/api";
+import * as React from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { buildAccountToggleEdit, type AnomalyItem, type DaemonHealth, type UsageLogin, type UsageSummary } from "@contract";
+import { fetchHealthUsage, postRoutingEdit } from "@/lib/api";
+import { Button } from "@/components/ui/button";
 import { formatDuration, relativeTo, useNow } from "@/lib/time";
 import { PageHeader } from "@/components/page";
 import { PushCard } from "@/components/push-card";
@@ -134,6 +136,19 @@ function AnomaliesCard({ anomalies, now }: { anomalies: AnomalyItem[]; now: numb
 }
 
 function UsageCard({ usage, now }: { usage: UsageSummary; now: number }) {
+  const queryClient = useQueryClient();
+  const [toggleError, setToggleError] = React.useState<string | null>(null);
+  const toggle = useMutation({
+    mutationFn: postRoutingEdit,
+    onSuccess: () => {
+      setToggleError(null);
+      // The disabled state lands on the next /api/health/usage read (and the routing snapshot).
+      queryClient.invalidateQueries({ queryKey: ["health-usage"] });
+      queryClient.invalidateQueries({ queryKey: ["routing"] });
+    },
+    onError: (err) => setToggleError(err instanceof Error ? err.message : "The toggle could not be posted — retry."),
+  });
+
   return (
     <Card>
       <CardHeader>
@@ -143,34 +158,76 @@ function UsageCard({ usage, now }: { usage: UsageSummary; now: number }) {
         </CardTitle>
         <CardDescription>
           Dual-login utilization &amp; cooldowns — new work is held above{" "}
-          <span className="font-medium">{usage.admitBelowPercent}%</span>, paused only when every login is spent.
+          <span className="font-medium">{usage.admitBelowPercent}%</span>, paused only when every enabled login is
+          spent. A disabled login is operator-parked: never dispatched, and never counted toward the pause.
         </CardDescription>
       </CardHeader>
       <CardContent>
         <ul className="space-y-3">
           {usage.logins.map((login) => (
-            <UsageLoginRow key={login.id} login={login} threshold={usage.admitBelowPercent} now={now} />
+            <UsageLoginRow
+              key={login.id}
+              login={login}
+              threshold={usage.admitBelowPercent}
+              now={now}
+              pending={toggle.isPending}
+              onToggle={() => {
+                setToggleError(null);
+                toggle.mutate(buildAccountToggleEdit(login.id, login.disabled));
+              }}
+            />
           ))}
         </ul>
+        {toggleError && <p className="mt-3 text-xs text-status-danger">{toggleError}</p>}
       </CardContent>
     </Card>
   );
 }
 
-function UsageLoginRow({ login, threshold, now }: { login: UsageLogin; threshold: number; now: number }) {
+function UsageLoginRow({
+  login,
+  threshold,
+  now,
+  pending,
+  onToggle,
+}: {
+  login: UsageLogin;
+  threshold: number;
+  now: number;
+  pending: boolean;
+  onToggle: () => void;
+}) {
   return (
     <li className="rounded-md border p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="font-mono text-sm">{login.id}</span>
-          {login.active && <Badge variant="running">active</Badge>}
-          {login.gated ? <Badge variant="danger">gated</Badge> : <Badge variant="success">headroom</Badge>}
+          {login.active && !login.disabled && <Badge variant="running">active</Badge>}
+          {login.disabled ? (
+            <Badge variant="outline">disabled</Badge>
+          ) : login.gated ? (
+            <Badge variant="danger">gated</Badge>
+          ) : (
+            <Badge variant="success">headroom</Badge>
+          )}
         </div>
-        {login.cooldownUntil && (
-          <span className="text-xs text-muted-foreground" title={login.cooldownUntil}>
-            cooldown {relativeTo(login.cooldownUntil, now)}
-          </span>
-        )}
+        <div className="flex items-center gap-2">
+          {login.cooldownUntil && (
+            <span className="text-xs text-muted-foreground" title={login.cooldownUntil}>
+              cooldown {relativeTo(login.cooldownUntil, now)}
+            </span>
+          )}
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            aria-label={`${login.disabled ? "Enable" : "Disable"} login ${login.id}`}
+            disabled={pending}
+            onClick={onToggle}
+          >
+            {login.disabled ? "Enable" : "Disable"}
+          </Button>
+        </div>
       </div>
       <div className="mt-2 space-y-1">
         {login.windows.length === 0 ? (

@@ -1249,3 +1249,123 @@ describe("agent.tiers — per-complexity-tier agent profiles (issue #278)", () =
     expect(() => resolveTargets(cfg)).toThrow(/not tools-capable/);
   });
 });
+
+describe("disabledAccounts — operator-parked pool accounts (issue #10)", () => {
+  const BASE = { targets: [{ repo: "a/b", commands: { build: "x", test: "y" } }] };
+  const ENV_A = "RALPH_DISABLED_TEST_KEY_A";
+  const ENV_B = "RALPH_DISABLED_TEST_KEY_B";
+  beforeEach(() => {
+    delete process.env[ENV_A];
+    delete process.env[ENV_B];
+  });
+  afterEach(() => {
+    delete process.env[ENV_A];
+    delete process.env[ENV_B];
+  });
+
+  it("defaults to an empty list; disabled accounts stay IN the resolved pool (the registry), parked not removed", () => {
+    expect(parseConfig(BASE).disabledAccounts).toEqual([]);
+    const cfg = parseConfig({
+      ...BASE,
+      accounts: [
+        { id: "c1", provider: "claude", configDir: "~/.c1" },
+        { id: "c2", provider: "claude", configDir: "~/.c2" },
+      ],
+      disabledAccounts: ["c2"],
+    });
+    expect(cfg.disabledAccounts).toEqual(["c2"]);
+    // The pool is the account registry; disabled is an overlay attribute, not a removal.
+    expect(resolveAccountPool(cfg).map((a) => a.id)).toEqual(["c1", "c2"]);
+    expect(() => resolveTargets(cfg)).not.toThrow();
+  });
+
+  it("addresses back-compat-slice accounts by their resolved pool id (subscriptions / synthetic openai id)", () => {
+    const cfg = parseConfig({
+      ...BASE,
+      usageLimit: {
+        subscriptions: [
+          { id: "sub-a", configDir: "~/.a" },
+          { id: "sub-b", configDir: "~/.b" },
+        ],
+      },
+      providers: { openai: { codexHome: "~/.codex" } },
+      disabledAccounts: ["sub-b", "openai"],
+    });
+    // openai is unselected, so parking its only (back-compat) account is fine; one claude
+    // login stays enabled for the default claude routing.
+    expect(() => resolveTargets(cfg)).not.toThrow();
+  });
+
+  it("fails loud when disabledAccounts names an unknown pool id (typo protection)", () => {
+    const cfg = parseConfig({
+      ...BASE,
+      accounts: [{ id: "c1", provider: "claude", configDir: "~/.c1" }],
+      disabledAccounts: ["c-typo"],
+    });
+    expect(() => resolveTargets(cfg)).toThrow(ConfigError);
+    expect(() => resolveTargets(cfg)).toThrow(/disabledAccounts names unknown account id 'c-typo'/);
+  });
+
+  it("fails loud when a selected provider's accounts are all disabled (zai, explicit accounts)", () => {
+    process.env[ENV_A] = "key-a";
+    const cfg = parseConfig({
+      ...BASE,
+      agent: { types: { review: { provider: "zai" } } },
+      providers: { zai: {} },
+      accounts: [{ id: "z1", provider: "zai", authTokenEnv: ENV_A }],
+      disabledAccounts: ["z1"],
+    });
+    expect(() => resolveTargets(cfg)).toThrow(ConfigError);
+    expect(() => resolveTargets(cfg)).toThrow(/every zai account in the pool is disabled/);
+  });
+
+  it("fails loud when the selected provider's only (back-compat slice) account is disabled (openai)", () => {
+    const cfg = parseConfig({
+      ...BASE,
+      agent: { types: { review: { provider: "openai" } } },
+      providers: { openai: { codexHome: "~/.codex" } },
+      disabledAccounts: ["openai"],
+    });
+    expect(() => resolveTargets(cfg)).toThrow(/every openai account in the pool is disabled/);
+  });
+
+  it("fails loud when every claude pool account is disabled and claude is selected — never a silent box-login fallback", () => {
+    const cfg = parseConfig({
+      ...BASE, // default routing: every type resolves to claude
+      usageLimit: { subscriptions: [{ id: "sub-a", configDir: "~/.a" }] },
+      disabledAccounts: ["sub-a"],
+    });
+    expect(() => resolveTargets(cfg)).toThrow(ConfigError);
+    expect(() => resolveTargets(cfg)).toThrow(/every claude account in the pool is disabled/);
+  });
+
+  it("passes while at least one enabled account remains, and skips the zai key env check for disabled accounts", () => {
+    process.env[ENV_A] = "key-a";
+    // ENV_B deliberately unset: the disabled account's key is offline — the very use case.
+    const cfg = parseConfig({
+      ...BASE,
+      agent: { types: { review: { provider: "zai" } } },
+      providers: { zai: {} },
+      accounts: [
+        { id: "z1", provider: "zai", authTokenEnv: ENV_A },
+        { id: "z2", provider: "zai", authTokenEnv: ENV_B },
+      ],
+      disabledAccounts: ["z2"],
+    });
+    expect(() => resolveTargets(cfg)).not.toThrow();
+  });
+
+  it("still fails loud when an ENABLED zai account's key env var is unset", () => {
+    process.env[ENV_A] = "key-a";
+    const cfg = parseConfig({
+      ...BASE,
+      agent: { types: { review: { provider: "zai" } } },
+      providers: { zai: {} },
+      accounts: [
+        { id: "z1", provider: "zai", authTokenEnv: ENV_A },
+        { id: "z2", provider: "zai", authTokenEnv: ENV_B },
+      ],
+    });
+    expect(() => resolveTargets(cfg)).toThrow(new RegExp(`'${ENV_B}'.*unset or empty`));
+  });
+});

@@ -98,7 +98,14 @@ export function getEffectiveRouting(query: { repo?: string }, deps: RoutingActio
     configured: provider === "claude" || snap.providers[provider] !== undefined,
     toolsCapable: providerToolsCapable(snap.providers, provider),
   }));
-  const accounts = snap.accounts.map((account) => ({ id: account.id, provider: account.provider }));
+  // The pool with each account's operator-park state (issue #10): the registry stays whole —
+  // a disabled account is marked, never hidden, so the editor can offer the re-enable toggle.
+  const disabledAccounts = new Set(snap.disabledAccounts);
+  const accounts = snap.accounts.map((account) => ({
+    id: account.id,
+    provider: account.provider,
+    enabled: !disabledAccounts.has(account.id),
+  }));
   return {
     generatedAt: deps.now().toISOString(),
     repo: query.repo ?? null,
@@ -112,11 +119,29 @@ export function getEffectiveRouting(query: { repo?: string }, deps: RoutingActio
 
 /**
  * Apply one routing edit for `/api/routing/edit` (ADR-0037 P4.1): set or clear a type's preference
- * list. `body.repo` is accepted (forward-compat #170) but ignored — the edit is global in v1. The
- * store validates (capability gate + full load-time validation) and writes through to config.yaml;
- * a rejected edit returns `bad-request` with a clear reason. Never throws on a bad edit.
+ * list, or park / un-park one pool account (issue #10, the account arm). `body.repo` is accepted
+ * (forward-compat #170) but ignored — the edit is global in v1. The store validates (capability
+ * gate + full load-time validation — an account edit that would strand a selected provider with
+ * zero enabled accounts is rejected there) and writes through to config.yaml; a rejected edit
+ * returns `bad-request` with a clear reason. Never throws on a bad edit.
  */
 export function executeRoutingEdit(body: RoutingEditRequestBody, deps: RoutingActionDeps): RoutingEditPortResult {
+  if (body.target === "account") {
+    const outcome = deps.routing.applyEdit({ target: "account", id: body.id, enabled: body.enabled });
+    if (!outcome.ok) {
+      return { kind: "bad-request", error: outcome.error };
+    }
+    return {
+      kind: "applied",
+      response: {
+        generatedAt: deps.now().toISOString(),
+        target: "account",
+        id: body.id,
+        enabled: body.enabled,
+        appliesNextDispatchSeconds: deps.reconcileIntervalSeconds,
+      },
+    };
+  }
   const outcome = deps.routing.applyEdit({ target: "type", type: body.type, routing: body.routing });
   if (!outcome.ok) {
     return { kind: "bad-request", error: outcome.error };

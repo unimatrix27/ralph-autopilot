@@ -6,14 +6,20 @@ import { parseConfig, resolveAccountPool } from "../config/load";
 
 const NOW = new Date("2026-06-29T12:00:00.000Z");
 
-function snapshot(cfg: { agent?: Record<string, unknown>; providers?: Record<string, unknown>; accounts?: unknown[] } = {}): RoutingSnapshot {
+function snapshot(cfg: { agent?: Record<string, unknown>; providers?: Record<string, unknown>; accounts?: unknown[]; disabledAccounts?: string[] } = {}): RoutingSnapshot {
   const config = parseConfig({
     targets: [{ repo: "owner/a", commands: { build: "b", test: "t" } }],
     agent: cfg.agent ?? {},
     providers: cfg.providers ?? {},
     accounts: (cfg.accounts ?? []) as never,
+    disabledAccounts: cfg.disabledAccounts ?? [],
   });
-  return { agent: config.agent, providers: config.providers, accounts: resolveAccountPool(config) };
+  return {
+    agent: config.agent,
+    providers: config.providers,
+    accounts: resolveAccountPool(config),
+    disabledAccounts: config.disabledAccounts,
+  };
 }
 
 function fakePort(snap: RoutingSnapshot, applyEdit?: (edit: RoutingEdit) => RoutingEditOutcome): RoutingControlPort {
@@ -53,7 +59,25 @@ describe("getEffectiveRouting (ADR-0037 P4.1)", () => {
     expect(byProvider.claude).toEqual({ provider: "claude", configured: true, toolsCapable: true });
     expect(byProvider.openai).toEqual({ provider: "openai", configured: false, toolsCapable: false });
     expect(byProvider.zai).toEqual({ provider: "zai", configured: false, toolsCapable: true });
-    expect(res.accounts).toEqual([{ id: "c", provider: "claude" }]);
+    expect(res.accounts).toEqual([{ id: "c", provider: "claude", enabled: true }]);
+  });
+
+  it("marks a disabled pool account on the read surface (issue #10)", () => {
+    const port = fakePort(
+      snapshot({
+        accounts: [
+          { id: "c", provider: "claude", configDir: "/c" },
+          { id: "c2", provider: "claude", configDir: "/c2" },
+        ],
+        disabledAccounts: ["c2"],
+      }),
+    );
+    const res = getEffectiveRouting({}, deps(port));
+    expect(effectiveRoutingResponseSchema.safeParse(res).success).toBe(true);
+    expect(res.accounts).toEqual([
+      { id: "c", provider: "claude", enabled: true },
+      { id: "c2", provider: "claude", enabled: false },
+    ]);
   });
 });
 
@@ -168,5 +192,52 @@ describe("routingEditRequestBodySchema — per-phase validation (ADR-0037 #169)"
       routing: [{ provider: "claude" }, { provider: "claude", model: "opus" }],
     });
     expect(list.success).toBe(true);
+  });
+});
+
+describe("executeRoutingEdit — account enable/disable arm (issue #10)", () => {
+  it("threads the account edit to the overlay and maps it to a contract-valid account response", () => {
+    let received: RoutingEdit | undefined;
+    const port = fakePort(snapshot(), (edit) => {
+      received = edit;
+      return { ok: true, cleared: false };
+    });
+    const result = executeRoutingEdit({ target: "account", id: "c2", enabled: false }, deps(port));
+    expect(received).toEqual({ target: "account", id: "c2", enabled: false });
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") throw new Error("unreachable");
+    expect(routingEditResponseSchema.safeParse(result.response).success).toBe(true);
+    expect(result.response).toEqual({
+      generatedAt: NOW.toISOString(),
+      target: "account",
+      id: "c2",
+      enabled: false,
+      appliesNextDispatchSeconds: 30,
+    });
+  });
+
+  it("maps a rejected outcome (last enabled account of a selected provider) to a bad-request", () => {
+    const port = fakePort(snapshot(), () => ({
+      ok: false,
+      error: "agent type 'impl' for target owner/a selects provider 'claude' but every claude account in the pool is disabled",
+    }));
+    const result = executeRoutingEdit({ target: "account", id: "c1", enabled: false }, deps(port));
+    expect(result.kind).toBe("bad-request");
+    expect(result.kind === "bad-request" && result.error).toMatch(/every claude account in the pool is disabled/);
+  });
+});
+
+describe("routingEditRequestBodySchema — account arm (issue #10)", () => {
+  it("accepts a park and an un-park body", () => {
+    expect(routingEditRequestBodySchema.safeParse({ target: "account", id: "zai", enabled: false }).success).toBe(true);
+    expect(routingEditRequestBodySchema.safeParse({ target: "account", id: "sub-b", enabled: true }).success).toBe(true);
+  });
+
+  it("rejects a blank id, a missing enabled, and unknown keys (strict)", () => {
+    expect(routingEditRequestBodySchema.safeParse({ target: "account", id: "", enabled: false }).success).toBe(false);
+    expect(routingEditRequestBodySchema.safeParse({ target: "account", id: "x" }).success).toBe(false);
+    expect(
+      routingEditRequestBodySchema.safeParse({ target: "account", id: "x", enabled: true, routing: null }).success,
+    ).toBe(false);
   });
 });
