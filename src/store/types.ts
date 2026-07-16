@@ -110,6 +110,12 @@ export interface Run {
   branch: string | null;
   worktreePath: string | null;
   prNumber: number | null;
+  /**
+   * The GitHub issue title, captured at dispatch (issue #13) so the fleet/run views can head
+   * a run with *which* issue it is without a read-time GitHub call. `null` for rows predating
+   * the column — every consumer degrades to the `repo #issue` reference.
+   */
+  issueTitle: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -129,6 +135,12 @@ export interface RunInput {
   branch?: string | null;
   worktreePath?: string | null;
   prNumber?: number | null;
+  /**
+   * The GitHub issue title, passed at dispatch (issue #13). Absent/`null` leaves any
+   * previously-persisted title untouched (the store COALESCEs it), so a later upsert that
+   * does not know the title never clobbers it.
+   */
+  issueTitle?: string | null;
 }
 
 /**

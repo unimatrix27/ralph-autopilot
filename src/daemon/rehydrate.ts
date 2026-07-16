@@ -94,6 +94,7 @@ export async function rehydrateRunsFromGitHub(
       tier: readTier(issue.labels),
       branch: marker.branch,
       prNumber: pr.number,
+      issueTitle: issue.title,
     });
 
     if (paused) {

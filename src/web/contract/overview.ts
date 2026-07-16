@@ -58,6 +58,12 @@ export const fleetAgentSchema = z
   .object({
     repo: repoSlug,
     issue: issueNumber,
+    /**
+     * The GitHub issue title, captured at dispatch (issue #13), so the fleet row heads with
+     * *which* issue the agent is on. `null` for a run predating the column — the UI falls back
+     * to the `repo #issue` reference.
+     */
+    title: z.string().nullable(),
     /** Display phase: `impl`, `review-1`, `fix-1`, … */
     phase: z.string(),
     /** Live fix-attempt count for the current review phase (0 in impl). */

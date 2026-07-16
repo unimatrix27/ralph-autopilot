@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RuntimeSnapshot, QueueItem } from "../projection/snapshot";
-import { overviewResponseSchema } from "./contract";
+import { fleetAgentSchema, overviewResponseSchema } from "./contract";
 import { activitySummary, snapshotToOverview } from "./overview";
 
 const NOW = new Date("2026-06-21T12:00:00.000Z");
@@ -148,6 +148,29 @@ describe("snapshotToOverview", () => {
     expect(byIssue.get(11)).toEqual({ provider: "claude", model: "opus", account: "c1" });
     expect(byIssue.get(12)).toEqual({ provider: "zai", model: null, account: "z3" });
     expect(byIssue.get(13)).toBeNull();
+  });
+
+  it("carries each running agent's issue title onto the fleet, null-safe for a title-less run (#13)", () => {
+    const snap = emptySnapshot();
+    snap.runningAgents = [
+      { repo: "owner/a", issueNumber: 11, phase: "impl", fixAttempt: 0, phaseStartedAt: NOW.toISOString(), route: null, title: "Live + Runs views" },
+      // A run predating the title column (or seeded without one) degrades to null.
+      { repo: "owner/b", issueNumber: 12, phase: "impl", fixAttempt: 0, phaseStartedAt: "2026-06-21T11:59:00.000Z", route: null, title: null },
+    ];
+    const out = snapshotToOverview(snap, { now: () => NOW });
+    // fleetAgentSchema round-trips the new nullable field across a JSON serialize + parse (ADR-0031).
+    expect(overviewResponseSchema.parse(JSON.parse(JSON.stringify(out))).fleet).toEqual(out.fleet);
+    const byIssue = new Map(out.fleet.map((f) => [f.issue, f.title]));
+    expect(byIssue.get(11)).toBe("Live + Runs views");
+    expect(byIssue.get(12)).toBeNull();
+  });
+
+  it("fleetAgentSchema round-trips the nullable title on its own (serialize + parse, ADR-0031)", () => {
+    const base = { repo: "owner/a", issue: 11, phase: "impl", fixAttempt: 0, phaseStartedAt: NOW.toISOString(), route: null };
+    for (const title of ["A concrete title", null]) {
+      const agent = { ...base, title };
+      expect(fleetAgentSchema.parse(JSON.parse(JSON.stringify(agent)))).toEqual(agent);
+    }
   });
 
   it("drops a malformed running agent (no run row) from the fleet", () => {

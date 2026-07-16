@@ -73,6 +73,18 @@ describe("buildSnapshot", () => {
     expect(buildSnapshot(store).runningAgents[0]!.route).toEqual({ provider: "zai", account: "z3" });
   });
 
+  it("carries the run's issue title onto the running agent, null for a title-less (pre-migration) run (#13)", () => {
+    const titled = repoStore.upsertRun({ issueNumber: 30, mode: "tdd", branch: "ralph/30", issueTitle: "One agent per line" });
+    repoStore.addAgent({ runId: titled.id, worktreePath: "/wt/30", branch: "ralph/30" });
+    // A run predating the issue_title column reads back null; the projection stays total.
+    const legacy = repoStore.upsertRun({ issueNumber: 31, mode: "tdd", branch: "ralph/31" });
+    repoStore.addAgent({ runId: legacy.id, worktreePath: "/wt/31", branch: "ralph/31" });
+
+    const byIssue = new Map(buildSnapshot(store).runningAgents.map((a) => [a.issueNumber, a.title]));
+    expect(byIssue.get(30)).toBe("One agent per line");
+    expect(byIssue.get(31)).toBeNull();
+  });
+
   it("excludes ended agents from the running list", () => {
     const run = repoStore.upsertRun({ issueNumber: 3, mode: "tdd", branch: "ralph/3-x" });
     const agent = repoStore.addAgent({ runId: run.id, worktreePath: "/wt/3", branch: "ralph/3-x" });

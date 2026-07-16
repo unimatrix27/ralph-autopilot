@@ -125,6 +125,7 @@ export class EscalationCheckpointer {
       branch: ctx.branch,
       worktreePath: ctx.worktreePath,
       prNumber: pr.number,
+      issueTitle: ctx.issue.title,
     });
 
     // 2. Record the escalation (comment + label + resume context + status).

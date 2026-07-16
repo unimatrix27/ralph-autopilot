@@ -108,6 +108,8 @@ describe("overview contract", () => {
       {
         repo: "owner/a",
         issue: 12,
+        // The GitHub issue title captured at dispatch (issue #13); nullable on the wire.
+        title: "Live + Runs views",
         phase: "fix-1",
         fixAttempt: 2,
         phaseStartedAt: "2026-06-20T23:30:00.000Z",

@@ -197,6 +197,8 @@ export function snapshotToOverview(
     .map((a) => ({
       repo: a.repo,
       issue: a.issueNumber,
+      // The issue title plumbed at dispatch (issue #13); null-safe for a pre-migration run.
+      title: a.title ?? null,
       phase: a.phase,
       fixAttempt: a.fixAttempt,
       phaseStartedAt: a.phaseStartedAt,

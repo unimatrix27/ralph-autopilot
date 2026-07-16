@@ -27,6 +27,12 @@ export interface AgentView {
   /** The target repo slug the run belongs to (aggregate-first; the web filter narrows on it). */
   repo: string;
   issueNumber: number;
+  /**
+   * The GitHub issue title, captured on the run row at dispatch (issue #13), so the fleet
+   * view heads each agent with *which* issue it is. `null` for a run predating the column —
+   * the view falls back to the `repo #issue` reference.
+   */
+  title: string | null;
   /** Display phase: `impl`, `review-1`, `fix-1`, `review-2`, `fix-2`, … */
   phase: string;
   /** Live fix-attempt count for the current review phase (0 in impl). */
@@ -185,6 +191,9 @@ export function buildSnapshot(store: Store, options: SnapshotOptions = {}): Runt
     return {
       repo: run?.repo ?? "",
       issueNumber: run?.issueNumber ?? 0,
+      // The issue title from the run row, plumbed at dispatch (issue #13); null-safe for a
+      // missing run row or a pre-migration run.
+      title: run?.issueTitle ?? null,
       phase: phaseLabel(phase),
       fixAttempt: phaseNum === null ? 0 : store.getFixAttempts(agent.runId, phaseNum),
       phaseStartedAt: phaseStart,

@@ -130,6 +130,7 @@ const ports: WebControlPlanePorts = {
           run: {
             repo: query.repo,
             issue: query.issue,
+            title: "A merged run",
             runId: "1",
             status: "merged",
             mode: "tdd",
