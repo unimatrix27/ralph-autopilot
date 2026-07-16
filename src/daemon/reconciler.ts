@@ -748,6 +748,10 @@ export class Reconciler {
 
     // Resolve desired + actual state once for this tick, shared by fill and surface.
     const issues = await this.deps.github.listOpenIssues();
+    // Fail loud on any `## Blocked by` section the gate cannot fully evaluate
+    // (cross-repo refs, zero-parse sections) before anything acts on this tick's
+    // issue set (issue #8).
+    this.surfaceBlockedByAnomalies(issues);
     // One scan of the paused runs yields both the re-armed runs to resume and the
     // answered-but-stranded runs a rate-limited resume re-arm left wedged (#132). The
     // stranded set feeds the completeness pass, which both surfaces them as anomalies
@@ -817,6 +821,7 @@ export class Reconciler {
       // `admit` calls this lazily (only when something is eligible), so a quiet tick
       // never probes the meter; absent routing/routeWorld → always-headroom (tests).
       hasImplProviderHeadroom: () => this.hasImplProviderHeadroom(),
+      repo: this.deps.targetRepo,
     };
     const plan = await admit(issues, world);
 
@@ -836,6 +841,7 @@ export class Reconciler {
         plan,
         this.deps.priorityLabels,
         (n) => this.deps.github.isDependencySatisfied(n),
+        this.deps.targetRepo,
         noProviderResetsAt,
       ),
     );
@@ -1174,10 +1180,10 @@ export class Reconciler {
    */
   private isGateEligible(issue: Issue, depSatisfied: (n: number) => boolean): boolean {
     if (!issue.labels.includes(LABEL_DAEMON_ANOMALY)) {
-      return evaluateGate(issue, depSatisfied).eligible;
+      return evaluateGate(issue, depSatisfied, this.deps.targetRepo).eligible;
     }
     const withoutMarker = { ...issue, labels: issue.labels.filter((l) => l !== LABEL_DAEMON_ANOMALY) };
-    return evaluateGate(withoutMarker, depSatisfied).eligible;
+    return evaluateGate(withoutMarker, depSatisfied, this.deps.targetRepo).eligible;
   }
 
   /**
@@ -1201,13 +1207,42 @@ export class Reconciler {
   private async resolveDeps(issues: Issue[]): Promise<(n: number) => boolean> {
     const cache = new Map<number, boolean>();
     for (const issue of issues) {
-      for (const dep of parseBlockedBy(issue.body)) {
+      for (const dep of parseBlockedBy(issue.body, this.deps.targetRepo).refs) {
         if (!cache.has(dep)) {
           cache.set(dep, await this.deps.github.isDependencySatisfied(dep));
         }
       }
     }
     return (n: number): boolean => cache.get(n) ?? false;
+  }
+
+  /**
+   * Surface every `## Blocked by` section the gate cannot fully evaluate (issue #8):
+   * a cross-repo ref gates the issue closed (an unsatisfiable blocker in `admit` /
+   * `evaluateGate`) and is warned here, and a section whose non-empty list items
+   * yielded zero refs is warned — the original silent failure, where dependency
+   * chains written as markdown links parsed as `[]` and launched concurrently.
+   * Logged every tick while the body stays wrong, like `dependency.query-failed`:
+   * fail loud until a human fixes the section.
+   */
+  private surfaceBlockedByAnomalies(issues: Issue[]): void {
+    for (const issue of issues) {
+      const parsed = parseBlockedBy(issue.body, this.deps.targetRepo);
+      if (parsed.crossRepo.length > 0) {
+        this.deps.logger.warn("blocked-by.cross-repo-ref", {
+          repo: this.deps.targetRepo,
+          issue: issue.number,
+          refs: parsed.crossRepo,
+        });
+      }
+      if (parsed.refs.length === 0 && parsed.crossRepo.length === 0 && parsed.unparsed.length > 0) {
+        this.deps.logger.warn("blocked-by.no-refs-parsed", {
+          repo: this.deps.targetRepo,
+          issue: issue.number,
+          items: parsed.unparsed,
+        });
+      }
+    }
   }
 
   /**
@@ -1464,6 +1499,7 @@ export class Reconciler {
         available,
         (n) => this.deps.github.isDependencySatisfied(n),
         budget,
+        this.deps.targetRepo,
       );
     } catch (err) {
       this.deps.logger.error("moding.select-failed", { error: String(err) });

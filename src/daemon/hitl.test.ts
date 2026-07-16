@@ -207,6 +207,7 @@ describe("review-maxed heal → ralph-answer → resume re-enters the review loo
       logger: silent,
       budget: budgetFor(() => reconciler.activeCount(), 2), cap: 2,
       priorityLabels: [],
+      targetRepo: "owner/repo",
     });
   });
   afterEach(() => store.close());
@@ -347,6 +348,7 @@ describe("review-loop escalation → ralph-answer → resume re-enters the revie
       logger: silent,
       budget: budgetFor(() => reconciler.activeCount(), 2), cap: 2,
       priorityLabels: [],
+      targetRepo: "owner/repo",
     });
   });
   afterEach(() => store.close());

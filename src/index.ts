@@ -153,6 +153,7 @@ export type { LogLevel, LogFields, LoggerOptions } from "./log/logger";
 export { GhCliClient } from "./github/gh-cli";
 export type { GhCliOptions } from "./github/gh-cli";
 export { parseBlockedBy } from "./github/blocked";
+export type { BlockedByRefs } from "./github/blocked";
 export { buildLaunchMarker, parseLaunchMarker } from "./github/marker";
 export type { LaunchMarker } from "./github/marker";
 export { classifyChecks, commentIdFromUrl, isGitHubRateLimitError } from "./github/gh-cli";

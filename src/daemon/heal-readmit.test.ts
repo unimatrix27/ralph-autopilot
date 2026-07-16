@@ -79,6 +79,7 @@ describe("agent-stuck → ralph-answer → re-admit a fresh run with guidance (#
       budget: budgetFor(() => reconciler.activeCount(), 2),
       cap: 2,
       priorityLabels: [],
+      targetRepo: "owner/repo",
     });
   });
   afterEach(() => store.close());

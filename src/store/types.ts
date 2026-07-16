@@ -254,9 +254,14 @@ export interface RunLogInput {
  */
 export type BacklogPausedState = "awaiting-answer" | "review-maxed" | "agent-stuck" | "daemon-anomaly";
 
-/** One `## Blocked by` reference and whether it is satisfied (closed + merged). */
+/**
+ * One `## Blocked by` reference and whether it is satisfied (closed + merged).
+ * `ref` is a same-repo issue number, or the verbatim `owner/repo#n` of a
+ * cross-repo reference the gate cannot evaluate — always unsatisfied, so the
+ * issue fails closed and the read model shows why (issue #8).
+ */
 export interface BacklogBlockerRef {
-  ref: number;
+  ref: number | string;
   satisfied: boolean;
 }
 

@@ -33,6 +33,7 @@ describe("projectBacklog", () => {
       plan({ eligible: [{ issue: a, mode: "tdd" }, { issue: b, mode: "infra" }] }),
       ["priority:p0", "priority:p1"],
       noneSatisfied,
+      "owner/repo",
     );
     expect(view.eligible.map((e) => e.issueNumber)).toEqual([1, 2]);
     expect(view.eligible[0]).toEqual({ issueNumber: 1, title: "Issue 1", priority: null, priorityColor: null });
@@ -60,6 +61,7 @@ describe("projectBacklog", () => {
       plan({ eligible: issues.map((i) => ({ issue: i, mode: "tdd" as const })) }),
       labels,
       noneSatisfied,
+      "owner/repo",
     );
     // f = rank / max(1, N-1) with N=4 → 0, 1/3, 2/3, 1; banded <1/3 red, <2/3 yellow, else blue.
     // No priority label (#5) carries no colour.
@@ -71,7 +73,7 @@ describe("projectBacklog", () => {
     // N=1: the only configured label is most-urgent → red (no degenerate divide-by-zero).
     const solo = mk(1, "sev:blocker");
     expect(
-      (await projectBacklog([solo], plan({ eligible: [{ issue: solo, mode: "tdd" }] }), ["sev:blocker"], noneSatisfied))
+      (await projectBacklog([solo], plan({ eligible: [{ issue: solo, mode: "tdd" }] }), ["sev:blocker"], noneSatisfied, "owner/repo"))
         .eligible[0]!.priorityColor,
     ).toBe("red");
     // N=3: ranks 0,1,2 → f 0, 0.5, 1 → red, yellow, blue. Tracks any naming convention.
@@ -81,6 +83,7 @@ describe("projectBacklog", () => {
       plan({ eligible: issues.map((i) => ({ issue: i, mode: "tdd" as const })) }),
       ["sev:high", "sev:med", "sev:low"],
       noneSatisfied,
+      "owner/repo",
     );
     expect(view.eligible.map((e) => e.priorityColor)).toEqual(["red", "yellow", "blue"]);
   });
@@ -95,6 +98,7 @@ describe("projectBacklog", () => {
       plan({ excluded: [{ issue: a, reason: "no-provider" }, { issue: b, reason: "no-provider" }] }),
       [],
       noneSatisfied,
+      "owner/repo",
       "2026-06-29T14:30:00.000Z",
     );
     expect(view.noProvider).toEqual([
@@ -107,7 +111,7 @@ describe("projectBacklog", () => {
 
   it("leaves the reset ETA null when unknown (degrades gracefully)", async () => {
     const a = issue({ number: 1 });
-    const view = await projectBacklog([a], plan({ excluded: [{ issue: a, reason: "no-provider" }] }), [], noneSatisfied);
+    const view = await projectBacklog([a], plan({ excluded: [{ issue: a, reason: "no-provider" }] }), [], noneSatisfied, "owner/repo");
     expect(view.noProvider).toEqual([{ issueNumber: 1, title: "Issue 1", resetsAt: null }]);
   });
 
@@ -124,6 +128,7 @@ describe("projectBacklog", () => {
       }),
       [],
       noneSatisfied,
+      "owner/repo",
     );
     expect(view.blocked.map((b) => b.issueNumber)).toEqual([3, 5]);
     expect(view.blocked[1]!.blockers).toEqual([
@@ -145,6 +150,7 @@ describe("projectBacklog", () => {
       }),
       [],
       noneSatisfied,
+      "owner/repo",
     );
     expect(view.eligible).toHaveLength(0);
     expect(view.blocked).toHaveLength(0);
@@ -160,6 +166,7 @@ describe("projectBacklog", () => {
       plan({ excluded: [{ issue: held, reason: "not-afk" }] }),
       [],
       noneSatisfied,
+      "owner/repo",
     );
     expect(view.manualHolds).toEqual([{ issueNumber: 6, title: "operator paused" }]);
     expect(view.paused).toHaveLength(0);
@@ -183,6 +190,7 @@ describe("projectBacklog", () => {
       }),
       [],
       noneSatisfied,
+      "owner/repo",
     );
     expect(view.modingCandidates).toEqual([
       { issueNumber: 2, title: "also unmoded" },
@@ -221,6 +229,7 @@ describe("projectBacklog", () => {
       openSlots: 5,
       priorityLabels: [],
       hasImplProviderHeadroom: () => true,
+      repo: "owner/repo",
     };
 
     const plan = await admit([blockedUnmoded, depCleanUnmoded, plainUnmoded], world);
@@ -236,6 +245,7 @@ describe("projectBacklog", () => {
       plan,
       world.priorityLabels,
       isDependencySatisfied,
+      "owner/repo",
     );
     // The blocked-and-unmoded issue is filed under Blocked with its dep mini-graph...
     expect(view.blocked).toEqual([
@@ -258,7 +268,7 @@ describe("projectBacklog", () => {
     ];
     // Paused is read off the labels, independent of admission: even if #1 is held
     // by a still-active run, it still surfaces so a stuck issue never vanishes.
-    const view = await projectBacklog(issues, plan({ excluded: [{ issue: issues[1]!, reason: "held" }] }), [], noneSatisfied);
+    const view = await projectBacklog(issues, plan({ excluded: [{ issue: issues[1]!, reason: "held" }] }), [], noneSatisfied, "owner/repo");
     expect(view.paused).toEqual([
       { issueNumber: 1, title: "Issue 1", state: "awaiting-answer" },
       { issueNumber: 2, title: "Issue 2", state: "review-maxed" },

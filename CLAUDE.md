@@ -79,7 +79,8 @@ One pass through the system, mapped to modules (all under `src/`):
    `World` (in-flight test, run lookup, dependency port, open-slot count, priority labels)
    it returns a `LaunchPlan` (`picked` + `excluded` with reasons). It folds the **eligibility
    gate** (`OPEN` + `ready-for-agent` + `afk` + not `hitl` + carries a `mode:*` + all
-   `## Blocked by #n` deps closed-and-merged), the exclusions, and the slot-capped FIFO fill.
+   `## Blocked by` deps closed-and-merged — `#n`, same-repo issue URL, or `owner/repo#n`;
+   a cross-repo ref fails closed), the exclusions, and the slot-capped FIFO fill.
 
 3. **`executor/`** — per-issue execution. `worktree.ts` makes a `ralph/<n>-<slug>` git
    worktree (shared object store, isolated tree). `agent.ts` runs the Agent SDK session

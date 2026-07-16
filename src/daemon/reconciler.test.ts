@@ -1148,4 +1148,89 @@ describe("Reconciler — CI poller (off-slot pre-review CI gate, ADR-0022 stage 
       expect(store.readTranscript(110, "1")[0]!.type).toBe("TranscriptPruned");
     });
   });
+
+  // Issue #8: a `## Blocked by` dependency the gate cannot evaluate is a gate breach,
+  // not a no-op — cross-repo refs and zero-parse sections are warned every tick, and
+  // a cross-repo ref fails CLOSED (the issue is never launched past it).
+  describe("blocked-by section anomalies are surfaced, never silent", () => {
+    function wireCapturing() {
+      const lines: { event: string; [k: string]: unknown }[] = [];
+      const logger = createLogger({ write: (line) => lines.push(JSON.parse(line)) });
+      const worktrees = new FakeWorktreeManager();
+      const executor = new Executor({ store, github, worktrees, agentRunner: new PrOpeningAgentRunner(github), logger });
+      let reconciler: Reconciler;
+      reconciler = new Reconciler({
+        store,
+        github,
+        executor,
+        worktrees,
+        logger,
+        budget: budgetFor(() => reconciler.activeCount(), 5),
+        cap: 5,
+        priorityLabels: [],
+        targetRepo: "owner/repo",
+        reconcileIntervalSeconds: 30,
+      });
+      return { reconciler, lines };
+    }
+
+    it("warns on a cross-repo ref and does not launch the issue (fail closed)", async () => {
+      github.seed({
+        number: 3,
+        title: "Cross-repo dep",
+        body: "## Blocked by\n- [dep](https://github.com/other/thing/issues/5)\n",
+      });
+      const { reconciler, lines } = wireCapturing();
+
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+
+      const warns = lines.filter((l) => l.event === "blocked-by.cross-repo-ref");
+      expect(warns).toEqual([
+        expect.objectContaining({ level: "warn", repo: "owner/repo", issue: 3, refs: ["other/thing#5"] }),
+      ]);
+      // Fail closed: the dependency cannot be evaluated, so the issue is never launched.
+      expect(store.getRunByIssue(3)).toBeUndefined();
+      expect(github.issues.get(3)!.labels).toContain(LABEL_READY);
+    });
+
+    it("warns when a Blocked by section has non-empty items but zero parsed refs", async () => {
+      github.seed({
+        number: 4,
+        title: "Unparseable deps",
+        body: "## Blocked by\n- [spec](https://example.com/spec)\n- the auth refactor\n",
+      });
+      const { reconciler, lines } = wireCapturing();
+
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+
+      const warns = lines.filter((l) => l.event === "blocked-by.no-refs-parsed");
+      expect(warns).toEqual([
+        expect.objectContaining({
+          level: "warn",
+          repo: "owner/repo",
+          issue: 4,
+          items: ["[spec](https://example.com/spec)", "the auth refactor"],
+        }),
+      ]);
+    });
+
+    it("emits no blocked-by warning for a clean same-repo URL section", async () => {
+      github.seed({
+        number: 5,
+        title: "URL-form dep",
+        body: "## Blocked by\n- [prereq](https://github.com/owner/repo/issues/2)\n",
+      });
+      github.setDependencySatisfied(2);
+      const { reconciler, lines } = wireCapturing();
+
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+
+      expect(lines.filter((l) => String(l.event).startsWith("blocked-by."))).toEqual([]);
+      // And the URL-form ref gates identically to #n: satisfied → launched.
+      expect(store.getRunByIssue(5)).toBeDefined();
+    });
+  });
 });
