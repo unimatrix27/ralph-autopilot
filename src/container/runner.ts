@@ -395,6 +395,9 @@ function terminalResult(
         headline: escalation.question.headline,
         commentId: escalation.commentId,
         ...(escalation.prNumber !== undefined ? { prNumber: escalation.prNumber } : {}),
+        // The full question rides along so the daemon can record the run's resume context at
+        // escalation indexing time (#9) — the answered run must resume, never wedge.
+        question: escalation.question,
       },
     };
   }

@@ -72,6 +72,32 @@ describe("pipe protocol codec (ADR-0038 / issue #184)", () => {
     expect(decodeFrame(encodeFrame(frame))).toEqual(frame);
   });
 
+  it("round-trips an escalated result frame carrying the full escalation question (#9)", () => {
+    // The runner relays the validated question alongside the comment id so the daemon can
+    // persist the run's resume context at indexing time — without it every answered container
+    // escalation wedges as paused-run-unresumable (#9). Optional on the wire: an older runner's
+    // question-less frame still decodes (best-effort pipe, ADR-0038).
+    const frame = {
+      kind: "result",
+      outcome: "escalated",
+      detail: "operator question posted",
+      escalation: {
+        headline: "Which retention window?",
+        commentId: 987654,
+        prNumber: 42,
+        question: {
+          headline: "Which retention window?",
+          feature: "the run-archival job",
+          whereWeStand: "the prune job is built but the window is a product choice",
+          decision: "how long to keep a finished run",
+          stakes: "too short loses audit history; too long grows disk unbounded",
+          recommendation: "keep 90 days",
+        },
+      },
+    } as const;
+    expect(decodeFrame(encodeFrame(frame))).toEqual(frame);
+  });
+
   it("round-trips a stuck result frame carrying the self-stop report (#187)", () => {
     const frame = {
       kind: "result",

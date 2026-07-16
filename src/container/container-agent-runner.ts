@@ -12,8 +12,9 @@
  * dispatch through {@link ContainerExecution}, fold the streamed telemetry into the run's
  * transcript store (daemon = sole writer, ADR-0030), and map the terminal {@link ResultFrame}
  * to an {@link AgentRunResult}. On `escalated` (#187) the runner already posted the comment +
- * pushed WIP runner-direct, so this only indexes the open question (the `awaiting-answer` label
- * swaps next tick); on `stuck` it relays the self-stop report. On a **resume** (#188) the prompt
+ * pushed WIP runner-direct, so this indexes the open question (the `awaiting-answer` label swaps
+ * next tick) and checkpoints the run's resume context (#9); on `stuck` it relays the self-stop
+ * report. On a **resume** (#188) the prompt
  * is the resume prompt and the operator's answer rides on the assignment so the container clones
  * the WIP branch (not base) — resume-not-restart, no SDK-session rehydration.
  */
@@ -31,17 +32,22 @@ import { tierProfile } from "../providers/select";
 import { phaseLabel } from "../review/phase";
 import { recordDispatchedRoute, type RouteRecordingStore } from "./route-recording";
 import type { TargetConfig } from "../config/schema";
-import type { OpenQuestion, OpenQuestionInput } from "../store/types";
+import type { OpenQuestion, OpenQuestionInput, ResumePayload } from "../store/types";
+import type { EscalationQuestion } from "../review/escalation";
 
 /**
  * The narrow store port the adapter needs to record a runner-direct escalation (#187): index the
  * already-posted question so the daemon swaps `ready-for-agent → awaiting-answer` next tick off
- * the projected run status. {@link import("../store/store").ScopedStore} satisfies it structurally
- * (alongside {@link TranscriptRunRecorder}); faked in tests by the real store on a memory DB.
+ * the projected run status, and checkpoint the run's resume context so the answered run resolves
+ * through `resolveResumable` (#9). {@link import("../store/store").ScopedStore} satisfies it
+ * structurally (alongside {@link TranscriptRunRecorder}); faked in tests by the real store on a
+ * memory DB.
  */
 export interface ContainerRunStore extends TranscriptRunRecorder, RouteRecordingStore {
   /** Append the `Escalated` fact for the (already-posted) question; returns the indexed row. */
   addQuestion(input: Omit<OpenQuestionInput, "repo">): Promise<OpenQuestion>;
+  /** Checkpoint the paused run's resume context (question + comment key + WIP branch). */
+  setResumeContext(runId: number, context: ResumePayload, branch?: string | null): void;
 }
 
 /** Construction deps for {@link ContainerAgentRunner} (all known at the composition root). */
@@ -194,8 +200,9 @@ export class ContainerAgentRunner implements AgentRunner {
    *   - `pr-opened` — impl success; the executor reads the PR back from GitHub (source of truth);
    *   - `escalated` — the runner already posted the `ralph-question` + pushed WIP (runner-direct).
    *     The daemon indexes that already-posted question here (no re-post) so the `awaiting-answer`
-   *     label swaps next tick; the executor pauses the run. If the relayed payload is missing (a
-   *     dropped frame), the escalation is still on GitHub — the completeness pass reconciles it;
+   *     label swaps next tick, and records the run's resume context so the answered run resumes
+   *     (#9); the executor pauses the run. If the relayed payload is missing (a dropped frame),
+   *     the escalation is still on GitHub — the completeness pass reconciles it;
    *   - `stuck` — the agent self-stopped; relay the report so the executor labels `agent-stuck`;
    *   - `failed` — a non-success terminal with no work product.
    */
@@ -237,8 +244,11 @@ export class ContainerAgentRunner implements AgentRunner {
   /**
    * Index a runner-direct escalation in the daemon store: append the `Escalated` fact for the
    * already-posted comment so the run projects to `awaiting-answer` and the reconciler swaps the
-   * label next tick. The comment + WIP already landed on GitHub inside the container, so this is
-   * pure daemon-side bookkeeping — never a re-post. Resume context is wired in the next slice (#188).
+   * label next tick, and checkpoint the run's **resume context** (#9) — the relayed question keyed
+   * to the posted comment id, plus the WIP branch the runner pushed — so the operator's answer
+   * resolves through `resolveResumable` and the run resumes (resume, not restart) instead of
+   * wedging as `paused-run-unresumable`. The comment + WIP already landed on GitHub inside the
+   * container, so this is pure daemon-side bookkeeping — never a re-post.
    */
   private async recordEscalation(result: ResultFrame, ctx: AgentRunContext): Promise<void> {
     if (!result.escalation || ctx.runId == null) {
@@ -247,17 +257,47 @@ export class ContainerAgentRunner implements AgentRunner {
       ctx.logger.warn("container.escalation-unrecorded", { issue: ctx.issue.number });
       return;
     }
+    const { headline, commentId, prNumber, question } = result.escalation;
     await this.deps.store.addQuestion({
       issueNumber: ctx.issue.number,
       runId: ctx.runId,
       kind: "escalate",
-      headline: result.escalation.headline,
-      commentId: result.escalation.commentId,
+      headline,
+      commentId,
     });
+    if (!question) {
+      // An older runner build relayed no question. The run must still resume — never wedge — so
+      // fall back to a headline-derived payload; the full question stays readable in the posted
+      // `ralph-question` comment, which is where the answer flow reads it from anyway.
+      ctx.logger.warn("container.escalation-question-unrelayed", { issue: ctx.issue.number, commentId });
+    }
+    // `commentId` keys the resume to *this* question so a stale prior answer in the thread is not
+    // injected (#10); no `phase` — an impl-agent escalate resumes the impl session, and phase-
+    // absence IS that dispatch axis. `ctx.branch` is the WIP branch the runner checkpointed onto.
+    const context: ResumePayload = { question: question ?? fallbackQuestion(headline), commentId };
+    this.deps.store.setResumeContext(ctx.runId, context, ctx.branch);
     ctx.logger.info("container.escalated", {
       issue: ctx.issue.number,
-      commentId: result.escalation.commentId,
-      prNumber: result.escalation.prNumber,
+      commentId,
+      prNumber,
     });
   }
+}
+
+/**
+ * The headline-derived {@link EscalationQuestion} recorded when an older runner build relays an
+ * escalation without its full question. Only the resume-prompt injection reads these fields (the
+ * answer flow parses the question from the posted comment), so pointing at the comment keeps the
+ * resume honest while keeping the run resumable — the alternative is a permanent wedge (#9).
+ */
+function fallbackQuestion(headline: string): EscalationQuestion {
+  const unrelayed = "(not relayed by this runner build — read the full ralph-question comment on the issue)";
+  return {
+    headline,
+    feature: unrelayed,
+    whereWeStand: unrelayed,
+    decision: headline,
+    stakes: unrelayed,
+    recommendation: unrelayed,
+  };
 }
