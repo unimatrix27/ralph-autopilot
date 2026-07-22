@@ -118,6 +118,36 @@ describe("usageGate", () => {
     };
     expect(usageGate(state, NOW, 85).admit).toBe(false);
   });
+
+  it("skips a stale cooldown once its windows show headroom (cooldown analogue of #279)", () => {
+    // The real wedge: a long-horizon cooldown (a weekly/overage reset ~15h out) left
+    // standing over an account whose own windows all show headroom. Once every account
+    // is gated no fresh signal can supersede the cooldown, so it must not self-seal —
+    // an uncorroborated future cooldown degrades to optimism and the gate admits.
+    const state: UsageState = {
+      windows: {
+        five_hour: { utilization: 6, resetsAtMs: NOW + 2 * 3_600_000 },
+        seven_day: { utilization: 41, resetsAtMs: NOW + 15 * 3_600_000 },
+      },
+      cooldownUntilMs: NOW + 15 * 3_600_000,
+    };
+    expect(usageGate(state, NOW, 85)).toEqual({ admit: true });
+  });
+
+  it("still honours a cooldown corroborated by a gating window (a real cap stays parked)", () => {
+    const state: UsageState = {
+      windows: { seven_day: { utilization: 100, resetsAtMs: NOW + 15 * 3_600_000 } },
+      cooldownUntilMs: NOW + 15 * 3_600_000,
+    };
+    expect(usageGate(state, NOW, 85).admit).toBe(false);
+  });
+
+  it("still honours a bare cooldown with no window telemetry (a short backoff)", () => {
+    // A `rejected` carrying neither a window nor a reset — the DEFAULT_COOLDOWN backoff.
+    // Nothing contradicts it, so it must keep gating until it passes (not self-heal early).
+    const state: UsageState = { windows: {}, cooldownUntilMs: NOW + 60_000 };
+    expect(usageGate(state, NOW, 85).reason).toBe("cooldown");
+  });
 });
 
 describe("recordRateLimit", () => {
@@ -137,6 +167,19 @@ describe("recordRateLimit", () => {
   it("falls back to a default cooldown when `rejected` carries no reset", () => {
     const next = recordRateLimit(EMPTY_USAGE, { status: "rejected" }, NOW);
     expect(next.cooldownUntilMs).toBe(NOW + DEFAULT_COOLDOWN_MS);
+  });
+
+  it("marks a rejected window as at-limit (100%) when the signal carries no utilization", () => {
+    // A rejection is definitionally at the limit for its window; recording it as 100
+    // lets the window hold the gating truth so a real cap stays parked via usageGate's
+    // window path even after its scalar cooldown is treated as uncorroborated.
+    const next = recordRateLimit(
+      EMPTY_USAGE,
+      { status: "rejected", rateLimitType: "seven_day_overage_included", resetsAt: NOW / 1000 + 3600 },
+      NOW,
+    );
+    expect(next.windows.seven_day_overage_included?.utilization).toBe(100);
+    expect(usageGate(next, NOW, 85).admit).toBe(false);
   });
 
   it("never shortens an active cooldown (monotonic)", () => {

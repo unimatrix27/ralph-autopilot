@@ -90,8 +90,14 @@ export function recordRateLimit(state: UsageState, signal: RateLimitSignal, nowM
   const resetsAtMs = resetToMs(signal.resetsAt);
   if (signal.rateLimitType) {
     const prev = windows[signal.rateLimitType];
+    // A `rejected` signal is definitionally "at the limit" for its window: record it
+    // as fully utilized when the signal itself carries no utilization, so the window
+    // — not just the scalar cooldown — holds the gating truth (with its own reset).
+    // That keeps a real cap parked through {@link usageGate}'s window path and lets a
+    // stale cooldown that no window corroborates expire without self-sealing the pool.
+    const atLimit = signal.status === "rejected";
     windows[signal.rateLimitType] = {
-      utilization: signal.utilization ?? prev?.utilization ?? null,
+      utilization: signal.utilization ?? (atLimit ? 100 : prev?.utilization ?? null),
       resetsAtMs: resetsAtMs ?? prev?.resetsAtMs ?? null,
     };
   }
@@ -135,18 +141,41 @@ export interface UsageGateResult {
  * a never-seen token gets; the account's true usage re-records on its next session.
  * A window with an *unknown* reset (`resetsAtMs: null`) keeps gating — there is no
  * evidence it ended.
+ *
+ * The cooldown is subject to the same self-seal (the cooldown analogue of #279): a
+ * `rejected` on a long-horizon window (a weekly / overage reset) trips a cooldown
+ * many hours out, and once every account is gated no fresh signal can supersede it —
+ * the pool self-seals until that far timestamp even after the account's own windows
+ * show headroom. So a cooldown only gates while it is **corroborated** by the
+ * windows: either the account has no live window telemetry at all (a bare backoff —
+ * honour it) or at least one non-lapsed window is itself gating. A cooldown left
+ * standing after its windows have all reset or dropped below the threshold is stale
+ * and skipped — degrading to the same optimism a window gets, so the pool can probe
+ * once and the account's true usage re-records. (A real cap keeps its window at/above
+ * the threshold — see {@link recordRateLimit} — so it stays parked here.)
  */
 export function usageGate(state: UsageState, nowMs: number, admitBelowPercent: number): UsageGateResult {
-  if (state.cooldownUntilMs != null && nowMs < state.cooldownUntilMs) {
-    return { admit: false, reason: "cooldown", detail: new Date(state.cooldownUntilMs).toISOString() };
-  }
+  // First resolve the windows: the earliest gating one (if any) and whether any
+  // non-lapsed window telemetry exists at all — both feed the cooldown corroboration.
+  let gating: { type: string; utilization: number } | null = null;
+  let liveWindows = 0;
   for (const [type, w] of Object.entries(state.windows)) {
     if (w.resetsAtMs != null && w.resetsAtMs <= nowMs) {
-      continue;
+      continue; // #279 — a lapsed window's stored utilization is stale, ignore it.
     }
-    if (w.utilization != null && w.utilization >= admitBelowPercent) {
-      return { admit: false, reason: "utilization", detail: `${type}=${w.utilization}%` };
+    liveWindows += 1;
+    if (gating === null && w.utilization != null && w.utilization >= admitBelowPercent) {
+      gating = { type, utilization: w.utilization };
     }
+  }
+  // A cooldown gates only while corroborated (see doc-comment): no live window
+  // telemetry to contradict it, or a window that is itself gating. Otherwise it is a
+  // stale scalar that would self-seal the pool — skip it and let the windows decide.
+  if (state.cooldownUntilMs != null && nowMs < state.cooldownUntilMs && (liveWindows === 0 || gating !== null)) {
+    return { admit: false, reason: "cooldown", detail: new Date(state.cooldownUntilMs).toISOString() };
+  }
+  if (gating !== null) {
+    return { admit: false, reason: "utilization", detail: `${gating.type}=${gating.utilization}%` };
   }
   return { admit: true };
 }
