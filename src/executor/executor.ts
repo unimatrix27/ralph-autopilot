@@ -48,6 +48,14 @@ export interface ClaimedRun {
   agentId: number;
   branch: string;
   worktreePath: string;
+  /**
+   * The number of the OPEN marker-PR this claim attached to (issue #32), or `undefined` for a
+   * true fresh start (no open PR on the branch). Set when a re-admitted issue — an `agent-stuck →
+   * ready-for-agent` heal — still owns an open PR: `claim` attaches its pushed branch to preserve
+   * the work (#241), and `execute` then RE-REVIEWS that PR rather than running a futile fresh impl
+   * that cannot push over the already-committed branch (which self-stops `futility`).
+   */
+  existingPrNumber?: number;
 }
 
 export interface ExecutorResult {
@@ -276,7 +284,15 @@ export class Executor {
       store.appendLog({ runId: run.id, issueNumber: issue.number, level: "info", event: "pickup", data: { branch, mode } });
       await github.removeLabel(issue.number, LABEL_READY);
 
-      return { runId: run.id, agentId: agent.id, branch, worktreePath };
+      // Carry the attached open PR so `execute` re-reviews it instead of running a doomed fresh
+      // impl over the already-committed branch (#32). Only an OPEN PR resumes work (#241).
+      return {
+        runId: run.id,
+        agentId: agent.id,
+        branch,
+        worktreePath,
+        ...(resumeExistingWork && existingPr ? { existingPrNumber: existingPr.number } : {}),
+      };
     } catch (err) {
       store.deleteRunByIssue(issue.number);
       try {
@@ -294,6 +310,44 @@ export class Executor {
   /** Run the impl agent for a claimed issue, record its PR, and tear down. */
   async execute(claimed: ClaimedRun, { issue, mode }: PickedIssue): Promise<ExecutorResult> {
     const log = this.deps.logger.child({ issue: issue.number, branch: claimed.branch });
+
+    // A re-admitted issue (an `agent-stuck → ready-for-agent` heal, #86) that still owns an OPEN
+    // marker-PR was attached to its pushed branch by `claim` to preserve the work (#241). Running a
+    // fresh impl on it is futile — the work is already committed and pushed, so the agent cannot
+    // push over the branch and self-stops `futility` (#32), forcing a manual `gh pr close` + re-arm.
+    // Re-review the existing PR instead (the impl is done; only review/merge remains), exactly like a
+    // crash-survivor recovery. When the operator genuinely wants a fresh start they close the PR
+    // first, which routes back to the fresh-impl path below (no open PR → `claim` creates the branch).
+    if (claimed.existingPrNumber !== undefined) {
+      const prNumber = claimed.existingPrNumber;
+      log.info("agent.re-review-existing-pr", { pr: prNumber });
+      this.deps.store.appendLog({ runId: claimed.runId, issueNumber: issue.number, level: "info", event: "re-review-existing-pr", data: { prNumber } });
+      return this.withFailureGuard(
+        {
+          issueNumber: issue.number,
+          runId: claimed.runId,
+          agentId: claimed.agentId,
+          branch: claimed.branch,
+          worktreePath: claimed.worktreePath,
+          log,
+        },
+        async (abortSignal) => {
+          await this.runReviewLoop({
+            issue,
+            mode,
+            runId: claimed.runId,
+            agentId: claimed.agentId,
+            prNumber,
+            branch: claimed.branch,
+            worktreePath: claimed.worktreePath,
+            abortSignal,
+            log,
+          });
+          return { runId: claimed.runId, branch: claimed.branch, worktreePath: claimed.worktreePath, prNumber };
+        },
+      );
+    }
+
     // A fresh run on an issue whose prior attempt bounded out and was healed via
     // `ralph-answer` carries the operator's guidance into its impl prompt (#86). The
     // signal is GitHub-only (the issue's stuck-card + answer comments), so it survives
