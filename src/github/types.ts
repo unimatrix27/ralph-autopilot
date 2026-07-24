@@ -77,6 +77,40 @@ export interface ChecksSnapshot {
   failures: string[];
 }
 
+/**
+ * GitHub's computed merge-state for a PR (GraphQL `mergeStateStatus`) — the
+ * AUTHORITATIVE "will branch protection let this PR merge right now?" signal. Unlike
+ * `gh pr checks` (which reads raw check runs and can miss a required check GitHub has
+ * re-queued as EXPECTED after a force-push), this reflects required-status-check state
+ * directly. The rebase-aware merge polls it to a mergeable value before firing
+ * `gh pr merge`, so a required check re-queued by the pre-merge force-push is waited
+ * out rather than raced into a rejection (the merge-race that false-terminalizes a good
+ * PR to `agent-stuck` with the PR auto-closed, issue #25).
+ *
+ * - `CLEAN`     — mergeable; all required checks passed and the branch is current.
+ * - `UNSTABLE`  — mergeable; only NON-required checks are failing/pending.
+ * - `HAS_HOOKS` — mergeable; pre-receive hooks are configured and pass.
+ * - `BLOCKED`   — a REQUIRED check is pending/failing, or a required review is missing.
+ * - `BEHIND`    — the head is behind the base and must be updated first.
+ * - `DIRTY`     — the PR has a merge conflict with the base.
+ * - `DRAFT`     — the PR is a draft and cannot merge.
+ * - `UNKNOWN`   — GitHub has not finished (re)computing mergeability (e.g. just pushed).
+ */
+export type MergeStateStatus =
+  | "CLEAN"
+  | "UNSTABLE"
+  | "HAS_HOOKS"
+  | "BLOCKED"
+  | "BEHIND"
+  | "DIRTY"
+  | "DRAFT"
+  | "UNKNOWN";
+
+/** A single, non-blocking read of a PR's {@link MergeStateStatus}. */
+export interface MergeStatusSnapshot {
+  state: MergeStateStatus;
+}
+
 /** Bounds for {@link GitHubClient.awaitChecks}: how long to wait and how often to poll. */
 export interface AwaitChecksOptions {
   /** Give up (→ `timeout`) after this many minutes without a terminal verdict. */
@@ -216,6 +250,16 @@ export interface GitHubClient {
    * not this read, maps a persistent `pending` to a timeout).
    */
   readChecks(prNumber: number): Promise<ChecksSnapshot>;
+
+  /**
+   * Read a PR's GitHub-computed merge state ONCE, without polling (issue #25). The
+   * authoritative "will branch protection let this merge now?" signal, keyed on
+   * required-status-check state — the rebase-aware merge polls this to a mergeable
+   * state before firing `gh pr merge`, so a required check re-queued by the pre-merge
+   * force-push is waited out instead of racing the merge into a BLOCKED state. `gh`
+   * reports `mergeStateStatus` as `UNKNOWN` until it finishes recomputing after a push.
+   */
+  readMergeStatus(prNumber: number): Promise<MergeStatusSnapshot>;
 
   /**
    * Merge a PR directly (`gh pr merge <pr> --squash --delete-branch`): a
