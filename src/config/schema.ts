@@ -702,6 +702,17 @@ const targetSchema = z
     /** FIFO priority tie-breakers for this target (overrides scheduler.priorityLabels). */
     priorityLabels: z.array(nonEmpty).optional(),
     /**
+     * Cap on this target's OWN concurrently-running build agents (issue #27). The global
+     * `scheduler.maxConcurrentAgents` bounds the SUM across targets but cannot bound one
+     * heavy target: a memory-heavy repo (a `.NET` suite spiking to ~10 GB per container)
+     * can consume every global slot and OOM the box, while a low global cap throttles the
+     * light targets too. This per-target ceiling lets a heavy repo run few agents while
+     * the global cap stays high for the rest. Effective slots for this target are
+     * `min(global free budget, this cap − this target's in-flight)`. Omit → only the
+     * global cap applies (unbounded per-target, the pre-#27 behaviour).
+     */
+    maxConcurrentAgents: z.number().int().positive().optional(),
+    /**
      * **Deprecated and ignored (#227).** Every target runs in a fresh per-target container; there
      * is no in-process alternative and no mode to switch to. Accepted-but-ignored, optional, only
      * so a live daemon does not wedge on an operator's gitignored `config.yaml` that still sets it
@@ -772,6 +783,20 @@ export const configSchema = z
       .object({
         /** Max agents running at once across ALL targets (operator plan budget). */
         maxConcurrentAgents: z.number().int().positive().default(5),
+        /**
+         * Box-wide free-RAM floor (MiB) below which the daemon admits NO new agent
+         * (issue #27). Agent containers are memory-heavy — a `.NET` integration suite
+         * spikes to ~10 GB — so enough concurrent ones can exhaust the box and trigger
+         * a kernel OOM kill of the daemon (exit 137), crash-orphaning every in-flight
+         * run to a false `agent-stuck`. `maxConcurrentAgents` counts agents but is blind
+         * to RAM; this is the box-wide backstop it cannot express. Each tick, admission
+         * reads `os.freemem()` and holds ALL new launches (a **wait, not a stuck**: the
+         * `no-memory` exclusion) while free RAM is under this floor. In-flight work is
+         * unaffected. `0` (the default) disables the gate — exactly the pre-#27
+         * behaviour. Set it to leave headroom for the heaviest container the box runs
+         * (e.g. `20480` reserves 20 GiB on a 60 GB box).
+         */
+        minFreeMemoryMB: z.number().int().nonnegative().default(0),
         /** Seconds between reconcile ticks. */
         reconcileIntervalSeconds: z.number().int().positive().default(30),
         /** Labels used as FIFO tie-breakers, highest priority first (global default). */
@@ -1199,6 +1224,13 @@ export interface TargetConfig {
   /** Multi-provider connection settings (issue #131); daemon-wide, carried per target. */
   providers: ProvidersSettings;
   priorityLabels: string[];
+  /**
+   * Cap on this target's own concurrently-running build agents (issue #27), or `undefined`
+   * for "only the global cap applies". Effective slots = `min(global free budget, this cap
+   * − this target's in-flight)`; the box-wide memory floor (`scheduler.minFreeMemoryMB`) is
+   * the complementary backstop.
+   */
+  maxConcurrentAgents?: number;
   /**
    * Deprecated, accepted-but-ignored execution-mode key (#227): present only when an operator's
    * config still carries it, so the composition root can log a one-line deprecation. Every target

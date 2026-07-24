@@ -36,6 +36,7 @@
  */
 
 import { resolve } from "node:path";
+import { freemem as osFreemem } from "node:os";
 import { admit, evaluateGate, type World } from "../core/admission";
 import {
   PAUSED_LABELS,
@@ -220,6 +221,27 @@ export interface ReconcilerDeps {
   budget: ReconcileBudget;
   /** The global concurrency cap, surfaced in this repo's TUI snapshot header (issue #20). */
   cap: number;
+  /**
+   * Cap on THIS target's own concurrently-running build agents (issue #27), or omitted for
+   * "only the global cap applies". Effective open slots this tick are `min(global free
+   * budget, this cap − this target's in-flight build runs)`, so a memory-heavy repo can be
+   * bounded well below the global cap while light targets keep the higher ceiling. The
+   * complementary box-wide backstop is {@link minFreeMemoryMB}.
+   */
+  maxAgentsThisTarget?: number;
+  /**
+   * Box-wide free-RAM floor (MiB) below which admission launches NO new agent this tick
+   * (issue #27, `scheduler.minFreeMemoryMB`) — the box-wide OOM backstop `cap` cannot
+   * express. `0` / omitted disables the gate (pre-#27 behaviour). Read live each tick
+   * through {@link freeMemoryBytes} and folded into admission's `hasMemoryHeadroom`.
+   */
+  minFreeMemoryMB?: number;
+  /**
+   * Probe for the box's currently-free RAM in bytes, injected for tests; defaults to
+   * `os.freemem()`. Read only when {@link minFreeMemoryMB} is set and something is
+   * eligible (admission probes it lazily), so a quiet tick never touches it.
+   */
+  freeMemoryBytes?: () => number;
   priorityLabels: string[];
   /**
    * Consecutive claim failures tolerated for one issue before the reconciler
@@ -812,7 +834,9 @@ export class Reconciler {
       // never oversubscribe the operator's plan cap.
       // Zero slots while usage-gated: `admit` still runs (so the snapshot's waiting
       // queue stays live) but `picked` comes back empty — no new agents start.
-      openSlots: usageGate.admit ? this.deps.budget.available() : 0,
+      // Capped by this target's own agent budget (issue #27): a heavy repo is bounded
+      // below the global cap so it cannot consume every slot and OOM the box.
+      openSlots: usageGate.admit ? this.availableSlots() : 0,
       priorityLabels: this.deps.priorityLabels,
       // Re-resolve the impl route every tick (ADR-0037 P2.3): when no allowed provider
       // has a headroom account, admission excludes the otherwise-eligible queue with
@@ -821,9 +845,27 @@ export class Reconciler {
       // `admit` calls this lazily (only when something is eligible), so a quiet tick
       // never probes the meter; absent routing/routeWorld → always-headroom (tests).
       hasImplProviderHeadroom: () => this.hasImplProviderHeadroom(),
+      // Box-wide OOM backstop (issue #27): when free RAM is under `minFreeMemoryMB`,
+      // admission holds ALL new launches (`no-memory`, a wait not a stuck) — the global
+      // cap counts agents but is blind to how much RAM a container will spike to. Probed
+      // lazily (only when something is eligible); disabled when the floor is 0.
+      hasMemoryHeadroom: () => this.hasMemoryHeadroom(),
       repo: this.deps.targetRepo,
     };
     const plan = await admit(issues, world);
+
+    // No silent cap (issue #27): when the box-wide memory floor holds new launches, log
+    // the withheld count + floor so the pause is visible in the daemon log — an operator
+    // seeing zero pickups can tell "held for RAM" apart from "nothing eligible". A wait,
+    // not a stuck: these issues keep `ready-for-agent` and re-admit once memory frees.
+    const withheldForMemory = plan.excluded.filter((e) => e.reason === "no-memory");
+    if (withheldForMemory.length > 0) {
+      this.deps.logger.warn("admission.no-memory", {
+        withheld: withheldForMemory.length,
+        issues: withheldForMemory.map((e) => e.issue.number),
+        minFreeMemoryMB: this.deps.minFreeMemoryMB,
+      });
+    }
 
     // Persist the backlog/health snapshot every tick — even at the cap, where no
     // open slots make `picked` empty — so live views stay current (issue #20).
@@ -1201,6 +1243,39 @@ export class Reconciler {
       return true;
     }
     return !("wait" in resolveRoute(routing(), this.deps.targetRepo, "impl", routeWorld));
+  }
+
+  /**
+   * Open build slots for this target this tick: the global free budget (ADR-0020),
+   * capped by this target's own agent ceiling (issue #27) so a memory-heavy repo can be
+   * bounded well below the global cap while light targets keep the higher one. The
+   * per-target remaining is `maxAgentsThisTarget − this target's in-flight build runs`
+   * (floored at 0); absent → only the global budget applies. `admit` slices the ordered
+   * queue to this, so the count is authoritative for both launches and the read model.
+   */
+  private availableSlots(): number {
+    const global = this.deps.budget.available();
+    const perTarget = this.deps.maxAgentsThisTarget;
+    if (perTarget === undefined) {
+      return global;
+    }
+    return Math.max(0, Math.min(global, perTarget - this.inFlight.size));
+  }
+
+  /**
+   * Whether the box has enough free RAM to launch another agent container this tick — the
+   * per-tick verdict admission folds in as the `no-memory` wait (issue #27). Reads the live
+   * free-memory probe against `scheduler.minFreeMemoryMB`; a floor of 0 (or an unset probe)
+   * disables the gate → always-headroom, exactly the pre-#27 behaviour. Called lazily by
+   * `admit` (only when something is eligible), so a quiet tick never reads free memory.
+   */
+  private hasMemoryHeadroom(): boolean {
+    const floorMB = this.deps.minFreeMemoryMB ?? 0;
+    if (floorMB <= 0) {
+      return true;
+    }
+    const freeBytes = (this.deps.freeMemoryBytes ?? osFreemem)();
+    return freeBytes >= floorMB * 1024 * 1024;
   }
 
   /** Resolve every distinct `## Blocked by` dependency once for the completeness pass. */

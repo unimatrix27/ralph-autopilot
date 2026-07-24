@@ -48,6 +48,9 @@ function wire(opts: {
   cap?: number;
   priorityLabels?: string[];
   maxClaimFailures?: number;
+  maxAgentsThisTarget?: number;
+  minFreeMemoryMB?: number;
+  freeMemoryBytes?: () => number;
 }) {
   const worktrees = new FakeWorktreeManager();
   const executor = new Executor({
@@ -67,6 +70,9 @@ function wire(opts: {
     logger: silent,
     budget: budgetFor(() => reconciler.activeCount(), cap),
     cap,
+    maxAgentsThisTarget: opts.maxAgentsThisTarget,
+    minFreeMemoryMB: opts.minFreeMemoryMB,
+    freeMemoryBytes: opts.freeMemoryBytes,
     priorityLabels: opts.priorityLabels ?? [],
     maxClaimFailures: opts.maxClaimFailures,
     targetRepo: "owner/repo",
@@ -405,6 +411,66 @@ describe("Reconciler", () => {
     await reconciler.tick();
     expect(reconciler.activeCount()).toBe(3);
     expect(runner.peak).toBe(3);
+  });
+
+  it("caps THIS target below the global budget (per-target maxConcurrentAgents, #27)", async () => {
+    // A memory-heavy target: the global cap is 5, but this repo may only run 2 agents at
+    // once so it cannot consume every slot and OOM the box.
+    for (let n = 1; n <= 5; n++) {
+      github.seed({ number: n, title: `issue ${n}`, createdAt: `2026-01-0${n}T00:00:00Z` });
+    }
+    const runner = new ControlledAgentRunner();
+    const { reconciler } = wire({ github, store, runner, cap: 5, maxAgentsThisTarget: 2 });
+
+    await reconciler.tick();
+    expect(reconciler.activeCount()).toBe(2); // per-target cap, not the global 5
+    expect(runner.started).toEqual([1, 2]);
+
+    // A slot frees → the per-target cap refills it (still ≤ 2), FIFO.
+    runner.complete(1);
+    await reconciler.activePromiseFor(1);
+    await reconciler.tick();
+    expect(reconciler.activeCount()).toBe(2);
+    expect(runner.started).toEqual([1, 2, 3]);
+    expect(runner.peak).toBe(2); // per-target ceiling never exceeded
+  });
+
+  it("holds ALL launches while free RAM is under the floor (no-memory wait, #27)", async () => {
+    github.seed({ number: 2, title: "heavy" });
+    const runner = new ControlledAgentRunner();
+    // Floor 20 GiB; the box reports only 10 GiB free → below floor → hold.
+    const { reconciler } = wire({
+      github,
+      store,
+      runner,
+      minFreeMemoryMB: 20_480,
+      freeMemoryBytes: () => 10 * 1024 * 1024 * 1024,
+    });
+
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    // A wait, not a stuck: nothing launched, the issue keeps ready-for-agent (re-checked
+    // next tick once a finished run frees memory), and it takes no human-attention label.
+    expect(reconciler.activeCount()).toBe(0);
+    expect(store.getRunByIssue(2)).toBeUndefined();
+    expect(github.issues.get(2)!.labels).toContain(LABEL_READY);
+  });
+
+  it("admits once free RAM recovers above the floor (#27)", async () => {
+    github.seed({ number: 2, title: "heavy" });
+    const runner = new ControlledAgentRunner();
+    const { reconciler } = wire({
+      github,
+      store,
+      runner,
+      minFreeMemoryMB: 20_480,
+      freeMemoryBytes: () => 40 * 1024 * 1024 * 1024, // 40 GiB free → above floor
+    });
+
+    await reconciler.tick();
+    expect(reconciler.activeCount()).toBe(1);
+    expect(runner.started).toEqual([2]);
   });
 
   it("surfaces a persistently-failing claim as daemon-anomaly and stops the silent retry (#28, AC3)", async () => {

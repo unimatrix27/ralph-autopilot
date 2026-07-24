@@ -34,6 +34,12 @@ targets:
     #   ciTimeoutMinutes: 45
     # agent:
     #   model: opus
+    # Cap THIS target's own concurrent build agents below the global budget (issue #27).
+    # Use it for a memory-heavy repo (e.g. a .NET suite spiking to ~10 GB per container)
+    # so it cannot consume every global slot and OOM the box, while the light targets keep
+    # the higher global cap. Effective slots = min(global free budget, this cap − in-flight).
+    # Omit → only the global cap applies.
+    # maxConcurrentAgents: 2
     # Every target runs in a fresh, ephemeral per-target Docker container (ADR-0038 / #227) — it
     # must be onboarded + smoke-tested first (see docs/runbooks/container-onboarding.md). There is
     # no in-process alternative and no `executionMode` knob.
@@ -49,6 +55,15 @@ scheduler:
   # Maximum number of agents running concurrently ACROSS ALL TARGETS. Purely the
   # operator's plan budget — the repos compete for this one shared pool.
   maxConcurrentAgents: 5
+  # Box-wide free-RAM FLOOR (MiB): admit no new agent while the box has less free RAM
+  # than this (issue #27). Agent containers are memory-heavy — a .NET integration suite
+  # spikes to ~10 GB — so enough concurrent ones can exhaust the box and trigger a kernel
+  # OOM kill of the daemon (exit 137), which crash-orphans every in-flight run to a false
+  # `agent-stuck`. maxConcurrentAgents counts agents but is blind to RAM; this is the
+  # box-wide backstop it cannot express (in-flight work is never interrupted — only new
+  # pickups are held, a wait not a stuck). 0 (default) disables it. Set it to leave room
+  # for the heaviest container the box runs, e.g. 20480 reserves 20 GiB on a 60 GB box.
+  minFreeMemoryMB: 0
   # Seconds between reconcile ticks (desired-state vs actual-state diff).
   reconcileIntervalSeconds: 30
   # Labels used as FIFO tie-breakers when filling slots, highest priority first.

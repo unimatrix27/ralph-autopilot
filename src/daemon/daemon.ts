@@ -571,6 +571,12 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
         logger,
         budget,
         cap,
+        // Per-target build-agent ceiling (issue #27): bounds a memory-heavy repo below the
+        // global cap so it cannot consume every slot and OOM the box. Undefined → global only.
+        maxAgentsThisTarget: target.maxConcurrentAgents,
+        // Box-wide free-RAM floor + probe (issue #27): the OOM backstop the global cap can't
+        // express. `os.freemem()` in production; 0 floor (default) leaves the gate inert.
+        minFreeMemoryMB: config.scheduler.minFreeMemoryMB,
         priorityLabels: target.priorityLabels,
         maxClaimFailures: config.scheduler.maxClaimFailures,
         maxRunLifetimeMs: config.scheduler.maxRunLifetimeSeconds * 1000,

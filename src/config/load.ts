@@ -61,6 +61,9 @@ export function resolveTargets(config: RalphConfig): TargetConfig[] {
       // wiring can build a backend from `target.providers` (issue #131).
       providers: config.providers,
       priorityLabels: target.priorityLabels ?? config.scheduler.priorityLabels,
+      // Per-target build-agent cap (issue #27): undefined → only the global cap applies.
+      // Kept verbatim; the reconciler folds it into its open-slot computation.
+      maxConcurrentAgents: target.maxConcurrentAgents,
       // Deprecated, accepted-but-ignored execution-mode key (ADR-0038 / #227): carried through
       // verbatim (undefined on a clean config) only so the composition root can log a one-line
       // deprecation when an operator's config still sets it. Every target runs in a container.
