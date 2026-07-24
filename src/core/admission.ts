@@ -64,12 +64,14 @@ export const SPAN_CLOSED_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>(
 /**
  * Why an issue was dropped from a launch plan. The pure gate reasons
  * (`not-open` … `blocked`) plus the runtime exclusions `admit` owns:
- * `in-flight` (already executing), `held` (an active run row holds it), and
+ * `in-flight` (already executing), `held` (an active run row holds it),
  * `no-provider` (otherwise-[[eligible]] but no allowed provider has a headroom
- * account this tick — a **wait, not a stuck**: it keeps `ready-for-agent`, takes
- * no human-attention label, and is re-resolved next tick; ADR-0037).
+ * account this tick), and `no-memory` (the box is below its free-RAM floor, so
+ * launching another agent container risks an OOM kill — issue #27). The last two
+ * are both a **wait, not a stuck**: the issue keeps `ready-for-agent`, takes no
+ * human-attention label, and is re-resolved next tick (ADR-0037).
  */
-export type ExclusionReason = GateReason | "in-flight" | "held" | "no-provider";
+export type ExclusionReason = GateReason | "in-flight" | "held" | "no-provider" | "no-memory";
 
 /**
  * An issue `admit` dropped, with the reason it was not launchable. A
@@ -131,6 +133,21 @@ export interface World {
    * never probes the meter. The reconciler backs it with `resolveRoute(…, "impl", …)`.
    */
   hasImplProviderHeadroom: () => boolean;
+  /**
+   * Whether the box has enough free RAM to launch another agent container this tick
+   * (CONTEXT: no-memory, issue #27). Agent containers are memory-heavy — a `.NET`
+   * integration suite spikes to ~10 GB — so six concurrent ones exhausted a 60 GB box
+   * and the kernel OOM-killed the daemon (exit 137), crash-orphaning every in-flight
+   * run to a false `agent-stuck`. `maxConcurrentAgents` counts agents but is blind to
+   * RAM. When this returns `false` the otherwise-eligible queue does not launch this
+   * tick: each issue is excluded `no-memory` — a **wait, not a stuck** (no escalation,
+   * no human-attention label) — and the next tick re-checks once memory frees (a
+   * finished run releases its container). A thunk so `admit` probes free memory only
+   * when something is eligible; a quiet tick never reads it. The reconciler backs it
+   * with a `freemem()` probe against `scheduler.minFreeMemoryMB`; absent / floor `0`
+   * → always-headroom (the gate is off, preserving the pre-#27 behaviour).
+   */
+  hasMemoryHeadroom: () => boolean;
   /**
    * The `owner/repo` slug this reconciler works. Scopes the `## Blocked by` parse
    * (issue #8): URL / `owner/repo#n` references to this repo gate as local issue
@@ -221,19 +238,30 @@ export async function admit(issues: Issue[], world: World): Promise<LaunchPlan> 
   // exposes the whole eligible queue, the launcher takes its first `openSlots`.
   const ordered = [...eligible].sort((a, b) => compare(a.issue, b.issue, world.priorityLabels));
 
-  // No allowed provider has a headroom account → a wait, not a stuck (CONTEXT:
-  // no-provider, ADR-0037). Route resolution for a fresh impl launch is
-  // issue-independent, so when it yields no route the whole otherwise-eligible queue
-  // waits together: launch nothing, and exclude each issue with reason `no-provider`
-  // (it keeps `ready-for-agent`, takes no human-attention label — never escalated).
-  // The next tick re-resolves and admits them automatically once a pool regains
-  // headroom. Checked only when something is eligible (lazy `&&`) so a quiet tick
-  // never probes the meter; the per-provider-pool generalisation of ADR-0028's pause.
-  if (ordered.length > 0 && !world.hasImplProviderHeadroom()) {
-    for (const candidate of ordered) {
-      excluded.push({ issue: candidate.issue, reason: "no-provider" });
+  // Two per-tick, issue-independent "wait, not stuck" gates, each of which holds the
+  // WHOLE otherwise-eligible queue when it fails (launch nothing, exclude every issue
+  // with the reason; it keeps `ready-for-agent`, takes no human-attention label — never
+  // escalated). The next tick re-resolves and admits automatically once the pool regains
+  // headroom / the box frees RAM. Probed lazily — only when something is eligible — so a
+  // quiet tick never touches the meter or reads free memory:
+  //   - `no-provider`: no allowed provider has a headroom account (CONTEXT: no-provider,
+  //     ADR-0037; the per-provider-pool generalisation of ADR-0028's pause);
+  //   - `no-memory`: the box is below its free-RAM floor, so launching another
+  //     memory-heavy agent container risks the OOM that crash-orphaned in-flight runs
+  //     (issue #27) — a box-wide backstop `maxConcurrentAgents` cannot express.
+  // Provider first (cheapest, and a gated pool launches nothing regardless), then memory.
+  if (ordered.length > 0) {
+    const wait: "no-provider" | "no-memory" | null = !world.hasImplProviderHeadroom()
+      ? "no-provider"
+      : !world.hasMemoryHeadroom()
+        ? "no-memory"
+        : null;
+    if (wait !== null) {
+      for (const candidate of ordered) {
+        excluded.push({ issue: candidate.issue, reason: wait });
+      }
+      return { picked: [], eligible: [], excluded };
     }
-    return { picked: [], eligible: [], excluded };
   }
 
   const slots = Math.max(0, world.openSlots);

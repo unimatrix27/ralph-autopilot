@@ -291,6 +291,7 @@ describe("snapshotToBacklog", () => {
       openSlots: 5,
       priorityLabels: ["priority:p0", "priority:p1"],
       hasImplProviderHeadroom: () => true,
+      hasMemoryHeadroom: () => true,
       repo: "owner/repo",
     };
 

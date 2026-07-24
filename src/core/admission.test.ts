@@ -38,6 +38,7 @@ function world(overrides: Partial<World> = {}): World {
     openSlots: 10,
     priorityLabels: [],
     hasImplProviderHeadroom: () => true,
+    hasMemoryHeadroom: () => true,
     repo: "owner/repo",
     ...overrides,
   };
@@ -407,5 +408,72 @@ describe("admit — the no-provider wait (ADR-0037 P2.3)", () => {
     const plan = await admit([iss], world({ openSlots: 10, hasImplProviderHeadroom: () => false }));
     expect(plan.picked).toEqual([]);
     expect(plan.excluded).toEqual([{ issue: iss, reason: "no-provider" }]);
+  });
+});
+
+describe("admit — the no-memory wait (box OOM backstop, #27)", () => {
+  const at = (n: number, createdAt: string): Issue =>
+    issue({ number: n, labels: ["ready-for-agent", "afk", "mode:tdd"], createdAt });
+
+  it("holds the whole eligible queue with reason no-memory when the box is below its RAM floor", async () => {
+    const a = at(1, "2026-01-01T00:00:00Z");
+    const b = at(2, "2026-02-01T00:00:00Z");
+    // Provider has headroom, but free RAM is below the floor — a wait, not a stuck:
+    // nothing launches (launching more containers would risk the OOM), each issue keeps
+    // ready-for-agent and is excluded no-memory, re-checked next tick.
+    const plan = await admit([a, b], world({ hasMemoryHeadroom: () => false }));
+    expect(plan.picked).toEqual([]);
+    expect(plan.eligible).toEqual([]);
+    expect(plan.excluded).toEqual([
+      { issue: a, reason: "no-memory" },
+      { issue: b, reason: "no-memory" },
+    ]);
+  });
+
+  it("admits again once memory frees (a finished run releases its container)", async () => {
+    const iss = at(1, "2026-01-01T00:00:00Z");
+    const plan = await admit([iss], world({ hasMemoryHeadroom: () => true }));
+    expect(plan.picked).toEqual([{ issue: iss, mode: "tdd" }]);
+    expect(plan.excluded).toEqual([]);
+  });
+
+  it("no-provider takes precedence over no-memory and short-circuits the memory probe", async () => {
+    let memoryProbes = 0;
+    const iss = at(1, "2026-01-01T00:00:00Z");
+    const plan = await admit(
+      [iss],
+      world({
+        hasImplProviderHeadroom: () => false,
+        hasMemoryHeadroom: () => {
+          memoryProbes += 1;
+          return false;
+        },
+      }),
+    );
+    // A gated pool launches nothing regardless, so the reason is no-provider and the
+    // (more expensive) free-memory read is never taken.
+    expect(plan.excluded).toEqual([{ issue: iss, reason: "no-provider" }]);
+    expect(memoryProbes).toBe(0);
+  });
+
+  it("never reports no-memory for a gate-failing issue — it carries its real gate reason", async () => {
+    const unmoded = issue({ labels: ["ready-for-agent", "afk"] });
+    const plan = await admit([unmoded], world({ hasMemoryHeadroom: () => false }));
+    expect(plan.excluded).toEqual([{ issue: unmoded, reason: "no-mode" }]);
+  });
+
+  it("does not read free memory when nothing is eligible (lazy)", async () => {
+    let probes = 0;
+    const closed = issue({ state: "CLOSED" });
+    await admit(
+      [closed],
+      world({
+        hasMemoryHeadroom: () => {
+          probes += 1;
+          return false;
+        },
+      }),
+    );
+    expect(probes).toBe(0);
   });
 });

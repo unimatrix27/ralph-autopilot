@@ -229,6 +229,7 @@ describe("projectBacklog", () => {
       openSlots: 5,
       priorityLabels: [],
       hasImplProviderHeadroom: () => true,
+      hasMemoryHeadroom: () => true,
       repo: "owner/repo",
     };
 
