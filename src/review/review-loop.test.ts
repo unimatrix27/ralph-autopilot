@@ -112,6 +112,7 @@ describe("ReviewLoop", () => {
       worktrees,
       baseBranch: BASE,
       merge: { ...mergeConfig, ...opts.merge },
+      sleep: async () => {},
     });
     return { loop, reviewAgent, fixAgent };
   }
@@ -133,6 +134,7 @@ describe("ReviewLoop", () => {
       worktrees,
       baseBranch: BASE,
       merge: mergeConfig,
+      sleep: async () => {},
     });
   }
 
@@ -439,6 +441,52 @@ describe("ReviewLoop", () => {
       { worktreePath: ctx.worktreePath, branch: BRANCH, baseBranch: BASE, trustedRemoteHead: null },
     ]);
     expect(github.merges).toHaveLength(1);
+  });
+
+  it("waits for a re-queued required check after the pre-merge rebase, then merges (merge-race #25)", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean] });
+    // The pre-merge rebase force-pushes a moved head (a pure fast-forward replay: net
+    // diff unchanged → no re-review), which re-queues the required check. GitHub reports
+    // the PR BLOCKED until it re-passes, then CLEAN — the exact merge-race window.
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: true });
+    worktrees.scriptBranchDiffHash("h1", "h1");
+    github.setMergeStatusSequence(ctx.prNumber, [
+      { state: "BLOCKED" },
+      { state: "BLOCKED" },
+      { state: "CLEAN" },
+    ]);
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "merged" });
+    // It polled mergeStateStatus and waited out the BLOCKED window: it did NOT park on
+    // the first not-mergeable read, and did NOT fire the merge until CLEAN.
+    expect(github.mergeStatusReads.filter((n) => n === ctx.prNumber).length).toBeGreaterThanOrEqual(3);
+    expect(github.merges).toHaveLength(1);
+    // No false human-attention terminal — the good PR merged rather than false-stuck.
+    expect(github.addedLabels.some((l) => l.label === LABEL_REVIEW_MAXED)).toBe(false);
+    expect(store.getRunByIssue(3)!.status).toBe("merged");
+  });
+
+  it("parks review-maxed (PR preserved) when the head never becomes mergeable (#25)", async () => {
+    const ctx = setup();
+    // A tight CI budget (1 poll) so the bounded merge-readiness poll exhausts at once.
+    const { loop } = wire({ review: [clean], merge: { ciTimeoutMinutes: 1, pollIntervalSeconds: 60 } });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: true });
+    worktrees.scriptBranchDiffHash("h1", "h1");
+    // The required check never re-passes: mergeStateStatus stays BLOCKED indefinitely.
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED" });
+
+    const outcome = await loop.run(ctx);
+
+    // Healable (review-maxed), NOT agent-stuck: the merge was never fired, the PR never
+    // closed — the reviewed work is preserved on origin for a human to heal.
+    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    expect(github.closedPulls).toHaveLength(0);
+    expect((await github.findPullRequestForBranch(BRANCH))!.state).toBe("OPEN");
+    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
   });
 
   it("a fix agent can escalate instead of applying a risky structural change", async () => {

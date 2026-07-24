@@ -23,6 +23,8 @@ import type {
   LabelPatch,
   LabelCreateOptions,
   MergeOptions,
+  MergeStateStatus,
+  MergeStatusSnapshot,
   PrComment,
   PullRequest,
   PullRequestState,
@@ -126,6 +128,37 @@ export function classifyChecks(
   return failures.length > 0
     ? { verdict: "red", failures }
     : { verdict: "green", failures: [] };
+}
+
+/** The `mergeStateStatus` values GitHub reports, upper-cased; anything else → UNKNOWN. */
+const MERGE_STATE_STATUSES = new Set<MergeStateStatus>([
+  "CLEAN",
+  "UNSTABLE",
+  "HAS_HOOKS",
+  "BLOCKED",
+  "BEHIND",
+  "DIRTY",
+  "DRAFT",
+  "UNKNOWN",
+]);
+
+/**
+ * Parse the `mergeStateStatus` out of a `gh pr view --json mergeStateStatus` payload
+ * (pure, so it is unit tested directly). An empty read, unparseable JSON, a missing
+ * field, or an unrecognised value all map to `UNKNOWN` — "GitHub has not settled" —
+ * so the merge-readiness poll keeps waiting rather than treating a blank as mergeable.
+ */
+export function parseMergeStateStatus(out: string): MergeStateStatus {
+  if (out.trim().length === 0) {
+    return "UNKNOWN";
+  }
+  let raw: string;
+  try {
+    raw = String((JSON.parse(out) as { mergeStateStatus?: unknown }).mergeStateStatus ?? "").toUpperCase();
+  } catch {
+    return "UNKNOWN";
+  }
+  return MERGE_STATE_STATUSES.has(raw as MergeStateStatus) ? (raw as MergeStateStatus) : "UNKNOWN";
 }
 
 /** Whether a gh error is "the label does not exist in the repo" (vs a real fault). */
@@ -668,6 +701,25 @@ export class GhCliClient implements GitHubClient {
     }
     const { verdict, failures } = classifyChecks(rows);
     return { state: verdict, failures };
+  }
+
+  async readMergeStatus(prNumber: number): Promise<MergeStatusSnapshot> {
+    // `gh pr view --json mergeStateStatus` returns GitHub's GraphQL mergeStateStatus:
+    // the branch-protection-aware mergeability view. Unlike `gh pr checks` (raw check
+    // runs, which can briefly report no/stale runs after a force-push), this reflects a
+    // required check GitHub has re-queued as EXPECTED on the new head — so the merge
+    // poll waits it out instead of racing the merge (#25). Read tolerantly: an empty /
+    // unparseable payload maps to UNKNOWN ("keep waiting"), never a false-mergeable.
+    const out = await this.ghAllowFail([
+      "pr",
+      "view",
+      String(prNumber),
+      "--repo",
+      this.repo,
+      "--json",
+      "mergeStateStatus",
+    ]);
+    return { state: parseMergeStateStatus(out) };
   }
 
   async mergePullRequest(prNumber: number, opts: MergeOptions): Promise<void> {

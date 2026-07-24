@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { classifyChecks, commentIdFromUrl, GhCliClient, isGitHubRateLimitError, type RawCheck } from "./gh-cli";
+import {
+  classifyChecks,
+  commentIdFromUrl,
+  GhCliClient,
+  isGitHubRateLimitError,
+  parseMergeStateStatus,
+  type RawCheck,
+} from "./gh-cli";
 import { Logger } from "../log/logger";
 
 /**
@@ -170,6 +177,54 @@ describe("GhCliClient.readChecks (off-slot CI poller, ADR-0022 stage 1)", () => 
     // gh exits non-zero while checks fail/pend, but still prints the JSON rows.
     const { client } = makeClient(JSON.stringify([{ name: "deploy", bucket: "fail" }]), { fail: true });
     expect(await client.readChecks(7)).toEqual({ state: "red", failures: ["deploy"] });
+  });
+});
+
+/**
+ * `parseMergeStateStatus` is the pure core of `readMergeStatus` (#25): it lifts the
+ * authoritative `mergeStateStatus` out of `gh pr view --json mergeStateStatus`, mapping
+ * every unrecognised / blank / unparseable read to `UNKNOWN` so the merge-readiness poll
+ * keeps waiting rather than treating a blank as mergeable.
+ */
+describe("parseMergeStateStatus (merge-race gate, #25)", () => {
+  it("lifts each recognised mergeStateStatus verbatim (case-normalised)", () => {
+    for (const s of ["CLEAN", "UNSTABLE", "HAS_HOOKS", "BLOCKED", "BEHIND", "DIRTY", "DRAFT", "UNKNOWN"] as const) {
+      expect(parseMergeStateStatus(JSON.stringify({ mergeStateStatus: s }))).toBe(s);
+    }
+    expect(parseMergeStateStatus(JSON.stringify({ mergeStateStatus: "clean" }))).toBe("CLEAN");
+  });
+
+  it("maps a blank, unparseable, missing, or unrecognised value to UNKNOWN (keep waiting)", () => {
+    expect(parseMergeStateStatus("")).toBe("UNKNOWN");
+    expect(parseMergeStateStatus("   ")).toBe("UNKNOWN");
+    expect(parseMergeStateStatus("not json")).toBe("UNKNOWN");
+    expect(parseMergeStateStatus(JSON.stringify({}))).toBe("UNKNOWN");
+    expect(parseMergeStateStatus(JSON.stringify({ mergeStateStatus: "WAT" }))).toBe("UNKNOWN");
+  });
+});
+
+describe("GhCliClient.readMergeStatus (merge-race gate, #25)", () => {
+  it("reads mergeStateStatus once and tolerates a non-zero gh exit", async () => {
+    const argv: string[][] = [];
+    const exec = async (args: string[]): Promise<string> => {
+      argv.push(args);
+      // gh can exit non-zero yet still print the JSON we want to stdout.
+      throw Object.assign(new Error("gh exited 1"), {
+        stdout: JSON.stringify({ mergeStateStatus: "BLOCKED" }),
+      });
+    };
+    const client = new GhCliClient("owner/repo", { logger: new Logger({ write: () => {} }), exec });
+
+    expect(await client.readMergeStatus(42)).toEqual({ state: "BLOCKED" });
+    expect(argv[0]).toEqual([
+      "pr",
+      "view",
+      "42",
+      "--repo",
+      "owner/repo",
+      "--json",
+      "mergeStateStatus",
+    ]);
   });
 });
 

@@ -40,12 +40,14 @@
  * `ralph-question`, swaps to `awaiting-answer`, and stops (resume-not-restart).
  */
 
+import { setTimeout as sleep } from "node:timers/promises";
 import type {
   CheckState,
   ChecksResult,
   ChecksSnapshot,
   GitHubClient,
   MergeMethod,
+  MergeStateStatus,
   PrComment,
 } from "../github/types";
 import type { Issue } from "../github/types";
@@ -265,7 +267,22 @@ export interface ReviewLoopDeps {
   baseBranch: string;
   /** Harness-owned merge configuration (CI gate + rebase-aware merge). */
   merge: MergeConfig;
+  /**
+   * Sleeps `ms` between merge-readiness polls ({@link ReviewLoop.awaitMergeable}).
+   * Defaults to a real timer; injected as a no-op in tests so a scripted BLOCKED→CLEAN
+   * merge-state sequence is polled without actually waiting.
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * `mergeStateStatus` values that permit an immediate merge — branch protection is
+ * satisfied. `CLEAN` (all required checks passed, branch current), `UNSTABLE` (only
+ * NON-required checks pending/failing — `gh pr merge` still succeeds), and `HAS_HOOKS`
+ * (pre-receive hooks pass). Every other state (`BLOCKED`/`BEHIND`/`DIRTY`/`DRAFT`/
+ * `UNKNOWN`) means "not yet" — the merge poll waits it out.
+ */
+const MERGEABLE_STATES = new Set<MergeStateStatus>(["CLEAN", "UNSTABLE", "HAS_HOOKS"]);
 
 export class ReviewLoop {
   constructor(private readonly deps: ReviewLoopDeps) {}
@@ -1118,9 +1135,64 @@ export class ReviewLoop {
     }
   }
 
+  /**
+   * Wait for GitHub to report the (rebased) head mergeable before firing the merge
+   * (issue #25). The pre-merge rebase force-pushes a new head, which re-queues any
+   * REQUIRED status check (e.g. a required "CI Gate"): GitHub re-marks it EXPECTED on
+   * the new commit and sets `mergeStateStatus` to BLOCKED until it re-passes — even
+   * though the CI gate above already saw green and `gh pr checks` may briefly report
+   * no/stale runs in that window. Firing `gh pr merge` into that window is rejected by
+   * branch protection ("Required status check … is expected"), which propagates to the
+   * failure guard and false-terminalizes a good PR to `agent-stuck` with the PR
+   * auto-closed. So poll the AUTHORITATIVE `mergeStateStatus` until it is mergeable;
+   * only if it never clears within the CI budget park `review-maxed` (PR preserved,
+   * healable) instead of racing the merge. Bounded by read count (not wall-clock) so it
+   * terminates deterministically under a no-op sleep in tests and stays bounded in
+   * production. Skipped when CI gating is off (no required checks to wait on — the
+   * dogfood repo merges directly as before). Returns a terminal outcome if the head
+   * never became mergeable, else `null` (proceed to merge).
+   */
+  private async awaitMergeable(ctx: ReviewLoopContext): Promise<ReviewLoopOutcome | null> {
+    if (!this.deps.merge.waitForChecks) {
+      return null;
+    }
+    const naps = this.deps.sleep ?? ((ms: number) => sleep(ms));
+    const pollSeconds = Math.max(1, this.deps.merge.pollIntervalSeconds);
+    const maxPolls = Math.max(1, Math.ceil((this.deps.merge.ciTimeoutMinutes * 60) / pollSeconds));
+    let last: MergeStateStatus = "UNKNOWN";
+    for (let poll = 0; poll < maxPolls; poll++) {
+      const snapshot = await this.deps.github.readMergeStatus(ctx.prNumber);
+      last = snapshot.state;
+      ctx.logger.info("review.merge-status", { state: snapshot.state, poll });
+      this.deps.store.appendLog({
+        runId: ctx.runId,
+        issueNumber: ctx.issue.number,
+        level: MERGEABLE_STATES.has(snapshot.state) ? "info" : "warn",
+        event: "merge-status",
+        data: { state: snapshot.state, poll },
+      });
+      if (MERGEABLE_STATES.has(snapshot.state)) {
+        return null;
+      }
+      if (poll < maxPolls - 1) {
+        await naps(pollSeconds * 1000);
+      }
+    }
+    ctx.logger.warn("review.merge-blocked", { state: last, polls: maxPolls });
+    return this.reviewMaxed(ctx, CI_PHASE, mergeBlockedWorklist(last), maxPolls);
+  }
+
   /** Merge the PR directly (a deterministic harness action), then mark the run merged. */
   private async merge(ctx: ReviewLoopContext): Promise<ReviewLoopOutcome> {
     const { store, github } = this.deps;
+    // Wait for branch protection to report the rebased head mergeable before firing the
+    // merge — a required check re-queued by the pre-merge force-push must re-pass first
+    // (#25). A head that never clears parks healable rather than racing the merge into a
+    // rejection that would false-terminalize the run to agent-stuck.
+    const blocked = await this.awaitMergeable(ctx);
+    if (blocked) {
+      return blocked;
+    }
     await github.mergePullRequest(ctx.prNumber, {
       method: this.deps.merge.method,
       deleteBranch: this.deps.merge.deleteBranch,
@@ -1278,6 +1350,33 @@ function ciWorklist(checks: ChecksResult): Worklist {
       title: `CI check failing: ${name}`,
       source: "review" as const,
     })),
+  };
+}
+
+/**
+ * The heal-card worklist for a PR that never reached a mergeable `mergeStateStatus`
+ * within the CI budget after the pre-merge rebase (issue #25). Usually a required
+ * status check re-queued by the rebase force-push that never went green (BLOCKED), or a
+ * conflict/behind state that did not resolve. Honest by construction — it names the
+ * stuck merge-state so the operator inspects the required checks / rebase, not a
+ * phantom code defect. The reviewed work is intact on the PR; resume-from-WIP retries
+ * the rebase-aware merge once the check clears.
+ */
+function mergeBlockedWorklist(state: MergeStateStatus): Worklist {
+  return {
+    items: [
+      {
+        severity: "P0",
+        title: `The PR never reached a mergeable state (GitHub mergeStateStatus: ${state})`,
+        detail:
+          `After the pre-merge rebase, GitHub branch protection kept the PR non-mergeable ` +
+          `(mergeStateStatus=${state}) past the CI budget — most often a REQUIRED status check ` +
+          `re-queued by the rebase force-push that never went green, or a merge-conflict / behind ` +
+          `state that did not resolve. The reviewed work is intact on the PR. Inspect the required ` +
+          `checks (and rebase state) on the PR, then re-enable the run to retry the rebase-aware merge.`,
+        source: "review",
+      },
+    ],
   };
 }
 

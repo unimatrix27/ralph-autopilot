@@ -15,6 +15,7 @@ import type {
   LabelPatch,
   MergeMethod,
   MergeOptions,
+  MergeStatusSnapshot,
   PrComment,
   PullRequest,
 } from "../github/types";
@@ -63,6 +64,12 @@ export class FakeGitHub implements GitHubClient {
   private readonly readSnapshotState = new Map<number, ChecksSnapshot>();
   /** Scripted {@link readChecks} snapshot sequences per PR, consumed in order (last repeats). */
   private readonly readSnapshotQueue = new Map<number, ChecksSnapshot[]>();
+  /** The current merge-state snapshot per PR (defaults to `CLEAN` — nothing blocks a merge). */
+  private readonly mergeStatusState = new Map<number, MergeStatusSnapshot>();
+  /** Scripted {@link readMergeStatus} sequences per PR, consumed in order (last repeats). */
+  private readonly mergeStatusQueue = new Map<number, MergeStatusSnapshot[]>();
+  /** PR numbers, in order, that {@link readMergeStatus} was read for (one per merge poll). */
+  readonly mergeStatusReads: number[] = [];
   private nextPrNumber = 1001;
   private nextCommentId = 5001;
 
@@ -227,6 +234,17 @@ export class FakeGitHub implements GitHubClient {
       : { state: result.state, failures: result.failures };
   }
 
+  async readMergeStatus(prNumber: number): Promise<MergeStatusSnapshot> {
+    this.mergeStatusReads.push(prNumber);
+    const queued = this.mergeStatusQueue.get(prNumber);
+    if (queued && queued.length > 0) {
+      return queued.length > 1 ? queued.shift()! : queued[0]!;
+    }
+    // Default mergeable: a PR with no scripted merge-state has nothing blocking it, so
+    // the rebase-aware merge poll clears on the first read (as it did before #25).
+    return this.mergeStatusState.get(prNumber) ?? { state: "CLEAN" };
+  }
+
   async mergePullRequest(prNumber: number, opts: MergeOptions): Promise<void> {
     this.merges.push({ prNumber, method: opts.method, deleteBranch: opts.deleteBranch });
     this.landMerge(prNumber);
@@ -317,6 +335,21 @@ export class FakeGitHub implements GitHubClient {
    */
   setReadChecksSequence(prNumber: number, snapshots: ChecksSnapshot[]): void {
     this.readSnapshotQueue.set(prNumber, [...snapshots]);
+  }
+
+  /** Test helper: set the merge-state {@link readMergeStatus} returns for a PR. */
+  setMergeStatus(prNumber: number, snapshot: MergeStatusSnapshot): void {
+    this.mergeStatusState.set(prNumber, snapshot);
+  }
+
+  /**
+   * Test helper: script a sequence of merge-state snapshots for a PR — each
+   * {@link readMergeStatus} call returns the next, the last repeating. Models a
+   * required check re-queued by the pre-merge force-push (BLOCKED) then re-passing
+   * (CLEAN), so the merge poll must wait rather than park on the first not-mergeable.
+   */
+  setMergeStatusSequence(prNumber: number, snapshots: MergeStatusSnapshot[]): void {
+    this.mergeStatusQueue.set(prNumber, [...snapshots]);
   }
 
   /** Mark a PR merged and close the issue its body says it `Closes`. */
