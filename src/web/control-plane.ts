@@ -186,6 +186,13 @@ export function createWebPorts(deps: {
   /** The daemon's reconcile interval (s) — the honest "acts next tick (~Ns)" figure the UI states. */
   reconcileIntervalSeconds: number;
   /**
+   * The LIVE global concurrency cap (`scheduler.maxConcurrentAgents`) for the health header
+   * (issue #34): reported directly rather than derived from persisted per-repo snapshots, whose
+   * idle-target rows can carry a stale cap after the operator lowers it. Optional — absent (tests
+   * that do not assert the header cap) → the header falls back to the persisted per-repo max.
+   */
+  maxConcurrentAgents?: number;
+  /**
    * Tier-2 daemon control (issue #118): the orchestrator-implemented port the `/api/daemon/*`
    * routes call. Production passes the orchestrator; tests that do not care about control
    * behavior pass an explicit fake. Threaded straight through — the web layer adds no control
@@ -232,7 +239,11 @@ export function createWebPorts(deps: {
     overview: (query) => {
       // A larger outcome window than the legacy default so the recent-activity feed and
       // the funnel's recent-merge throughput are meaningful.
-      const snapshot = buildSnapshot(deps.store, { now: deps.now, outcomeLimit: 50 });
+      const snapshot = buildSnapshot(deps.store, {
+        now: deps.now,
+        outcomeLimit: 50,
+        cap: deps.maxConcurrentAgents,
+      });
       return snapshotToOverview(snapshot, {
         now: deps.now,
         repo: query.repo,
@@ -258,7 +269,7 @@ export function createWebPorts(deps: {
       // clock-freeze is needed — the daemon section is a pass-through and the UI counts live
       // against its own render clock. `buildHealthUsage` reads only the snapshot's daemon +
       // anomaly sections, never recentOutcomes, so the default outcome window suffices.
-      const snapshot = buildSnapshot(deps.store, { now: deps.now });
+      const snapshot = buildSnapshot(deps.store, { now: deps.now, cap: deps.maxConcurrentAgents });
       // The anomaly reason is logged once at the edge, so read it unbounded (not via the
       // snapshot's capped recent-outcomes) — see Store.latestAnomalies.
       return buildHealthUsage(snapshot, deps.store.latestAnomalies(), usage(), {
@@ -466,6 +477,8 @@ export async function startWebControlPlane(
     admitBelowPercent: config.usageLimit.admitBelowPercent,
     githubFor,
     reconcileIntervalSeconds: config.scheduler.reconcileIntervalSeconds,
+    // The LIVE cap (issue #34): the health header reports this, not the persisted per-repo max.
+    maxConcurrentAgents: config.scheduler.maxConcurrentAgents,
     control: deps.control,
     routing: deps.routing,
     readAccountIdentity: deps.readAccountIdentity,
