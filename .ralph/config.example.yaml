@@ -394,6 +394,16 @@ merge:
   pollIntervalSeconds: 30
   # Delete the head branch after a successful merge.
   deleteBranch: true
+  # Max wall-clock MINUTES one integration keeps re-rebasing against an advancing base before it
+  # parks a heal-card (issue #31 — the strict-up-to-date treadmill). The daemon holds the single
+  # per-repo merge lease for a whole integration, so no *daemon* PR can move the base under it; a
+  # mid-integration BEHIND is always an off-daemon merge (a human / dependabot). Waiting never
+  # clears BEHIND — only a re-rebase does (each round re-runs the required check) — so the daemon
+  # re-rebases until it merges or this budget elapses. Default 1440 (24h): keep chasing a normally
+  # churning base rather than hand a green, reviewed PR back to a human; only a base that stays hot
+  # for a full day parks. Set 0 to never re-rebase on BEHIND (park on the first — the pre-#31
+  # behaviour). Note: a long budget can hold the per-repo merge queue behind one PR for that long.
+  behindRebaseBudgetMinutes: 1440
 
 # Daemon self-update (issue #30, ADR-0018). When enabled the daemon polls its OWN
 # repo for new commits on `branch`, gracefully drains in-flight work, then exits

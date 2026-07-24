@@ -299,6 +299,18 @@ const mergeGlobalSchema = z
     pollIntervalSeconds: z.number().int().positive().default(30),
     /** Delete the head branch after a successful merge. */
     deleteBranch: z.boolean().default(true),
+    /**
+     * Max wall-clock **minutes** one integration keeps re-rebasing against an advancing base
+     * before it parks a heal-card (issue #31). On a repo that requires branches be up to date
+     * (strict status checks), an off-daemon merge that lands while this PR's required check
+     * re-runs leaves it `BEHIND`; waiting never clears BEHIND — only a re-rebase does. The
+     * integration holds the single merge lease and re-rebases (each round re-runs the required
+     * check) until it merges or this budget elapses. Default 1440 (24h): keep chasing a
+     * normally-churning base rather than hand a green, reviewed PR to a human; only a
+     * pathologically hot base for a full day parks. `0` = never re-rebase on BEHIND (park on
+     * the first, the pre-#31 behaviour).
+     */
+    behindRebaseBudgetMinutes: z.number().int().nonnegative().default(1440),
   })
   .strict();
 
@@ -309,6 +321,7 @@ const mergeOverrideSchema = z
     ciTimeoutMinutes: z.number().int().positive().optional(),
     pollIntervalSeconds: z.number().int().positive().optional(),
     deleteBranch: z.boolean().optional(),
+    behindRebaseBudgetMinutes: z.number().int().nonnegative().optional(),
   })
   .strict();
 

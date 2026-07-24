@@ -28,6 +28,7 @@ const mergeConfig: MergeConfig = {
   ciTimeoutMinutes: 30,
   pollIntervalSeconds: 30,
   deleteBranch: true,
+  behindRebaseBudgetMinutes: 1440,
 };
 
 const silent = createLogger({ write: () => {} });
@@ -98,6 +99,8 @@ describe("ReviewLoop", () => {
     maxFixAttempts?: number;
     maxContainerRetries?: number;
     merge?: Partial<MergeConfig>;
+    /** Injected clock for the BEHIND re-rebase budget (#31); defaults to a real timer. */
+    now?: () => number;
   }): { loop: ReviewLoop; reviewAgent: ScriptedReviewAgent; fixAgent: ScriptedFixAgent } {
     const reviewAgent = new ScriptedReviewAgent(opts.review);
     const fixAgent = new ScriptedFixAgent(opts.fix ?? []);
@@ -113,6 +116,7 @@ describe("ReviewLoop", () => {
       baseBranch: BASE,
       merge: { ...mergeConfig, ...opts.merge },
       sleep: async () => {},
+      ...(opts.now ? { now: opts.now } : {}),
     });
     return { loop, reviewAgent, fixAgent };
   }
@@ -1363,6 +1367,69 @@ describe("ReviewLoop", () => {
     expect(outcome).toEqual({ kind: "merged" });
     // One rebase from review (pre-review) and one from integration (pre-merge).
     expect(worktrees.rebased).toHaveLength(2);
+  });
+
+  it("re-rebases on BEHIND under the merge lease, then merges (treadmill #31)", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean] });
+    // Two pre-merge rebases: the first leaves the branch current, but an off-daemon merge lands
+    // before the merge fires (mergeStateStatus BEHIND); waiting can't clear BEHIND, so the loop
+    // re-rebases and re-polls — now CLEAN — and merges. A pure ff replay both rounds (moved:false):
+    // no re-review, no CI re-gate.
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatusSequence(ctx.prNumber, [{ state: "BEHIND" }, { state: "CLEAN" }]);
+
+    const outcome = await loop.runIntegration(ctx);
+
+    expect(outcome).toEqual({ kind: "merged" });
+    expect(github.merges).toHaveLength(1);
+    // It re-rebased on BEHIND (two rebases) rather than waiting the CI budget out then parking.
+    expect(worktrees.rebased).toHaveLength(2);
+    expect(github.mergeStatusReads.filter((n) => n === ctx.prNumber).length).toBe(2);
+    // No false human-attention terminal — the good PR merged.
+    expect(github.addedLabels.some((l) => l.label === LABEL_REVIEW_MAXED)).toBe(false);
+    expect(store.getRunByIssue(3)!.status).toBe("merged");
+  });
+
+  it("parks an honest hot-base heal-card when the BEHIND budget elapses (#31)", async () => {
+    const ctx = setup();
+    // A clock that advances 40s per read; a 1-minute budget → the base is still BEHIND after one
+    // re-rebase round (loop), and past the budget on the next (park). Deterministic, no real time.
+    const clockReads = [0, 40_000, 80_000];
+    const now = (): number => (clockReads.length > 1 ? clockReads.shift()! : (clockReads[0] ?? 120_000));
+    const { loop } = wire({ review: [clean], merge: { behindRebaseBudgetMinutes: 1 }, now });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // The base keeps advancing: mergeStateStatus is BEHIND on every read.
+    github.setMergeStatus(ctx.prNumber, { state: "BEHIND" });
+
+    const outcome = await loop.runIntegration(ctx);
+
+    // Healable (review-maxed), NOT agent-stuck: the merge never fired, the PR is preserved.
+    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    expect((await github.findPullRequestForBranch(BRANCH))!.state).toBe("OPEN");
+    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    // It re-rebased (didn't park on the first BEHIND) before the budget elapsed.
+    expect(worktrees.rebased).toHaveLength(2);
+    // A heal-card was opened, and the posted card body names the hot base (an off-daemon merge
+    // kept landing), not a phantom code defect.
+    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    const bodies = [...github.comments.values()].flat().map((c) => c.body);
+    expect(bodies.some((b) => b.includes("base kept advancing"))).toBe(true);
+  });
+
+  it("a per-run kill (abort) stops the BEHIND loop instead of re-rebasing a torn-down run (#31)", async () => {
+    const ctx = setup();
+    ctx.abortSignal = AbortSignal.abort(); // orphan sweep / operator kill fired before integration
+    const { loop } = wire({ review: [clean] });
+    // Were the abort ignored, a permanently-BEHIND base would re-rebase up to the budget.
+    github.setMergeStatus(ctx.prNumber, { state: "BEHIND" });
+
+    // The loop throws (as an aborted container op would) so the failure guard terminalizes it,
+    // rather than swallowing the kill and looping.
+    await expect(loop.runIntegration(ctx)).rejects.toThrow();
+    expect(github.merges).toHaveLength(0);
+    expect(worktrees.rebased).toHaveLength(0);
   });
 
   // ---- Heal re-entry into runReview (issue #9) --------------------------

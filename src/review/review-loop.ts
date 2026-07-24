@@ -100,6 +100,12 @@ export interface MergeConfig {
   ciTimeoutMinutes: number;
   pollIntervalSeconds: number;
   deleteBranch: boolean;
+  /**
+   * Wall-clock **minutes** one integration keeps re-rebasing against an advancing base before it
+   * parks a heal-card (issue #31 — the strict-up-to-date treadmill). `0` never re-rebases on
+   * `BEHIND` (park on the first, the pre-#31 behaviour). See `config.merge.behindRebaseBudgetMinutes`.
+   */
+  behindRebaseBudgetMinutes: number;
 }
 
 export interface ReviewLoopContext {
@@ -150,6 +156,19 @@ export type ReviewLoopOutcome =
 type SyncResult =
   | { kind: "terminal"; outcome: ReviewLoopOutcome }
   | { kind: "synced"; moved: boolean };
+
+/**
+ * The verdict of {@link ReviewLoop.awaitMergeable}: whether branch protection now permits the
+ * merge, needs the branch brought current with base again, or has parked. `resync` is the
+ * strict-up-to-date treadmill (#31): `BEHIND` (base advanced under the rebased head) or `DIRTY`
+ * (base advanced into a textual conflict) — neither clears by waiting, only by re-rebasing, which
+ * {@link ReviewLoop.runIntegration} does under the held merge lease. `stuck` is a required check
+ * that never greened within the CI budget (or a `DRAFT`) → a healable `review-maxed` park (#25).
+ */
+type MergeReadiness =
+  | { kind: "mergeable" }
+  | { kind: "resync"; state: MergeStateStatus }
+  | { kind: "stuck"; outcome: ReviewLoopOutcome };
 
 /** The terminal outcome of a single phase. */
 type PhaseOutcome =
@@ -273,6 +292,12 @@ export interface ReviewLoopDeps {
    * merge-state sequence is polled without actually waiting.
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Monotonic wall-clock (epoch ms) used to bound the BEHIND re-rebase budget
+   * ({@link ReviewLoop.runIntegration}, issue #31). Defaults to `Date.now`; injected in tests so a
+   * hot-base treadmill terminates deterministically without real time passing.
+   */
+  now?: () => number;
 }
 
 /**
@@ -433,42 +458,70 @@ export class ReviewLoop {
    * head always makes terminal progress, so the queue cannot livelock.
    */
   async runIntegration(ctx: ReviewLoopContext): Promise<ReviewLoopOutcome> {
-    // Capture the branch's net diff vs base BEFORE the rebase, so a moved rebase can be
+    // Capture the branch's net diff vs base BEFORE the first rebase, so a moved rebase can be
     // classified as a pure fast-forward replay (diff unchanged → skip re-review) vs a
-    // semantics-changing one (issue #65). branchDiffHash re-fetches origin/<base>, so
-    // this compares against current base regardless of when it runs.
+    // semantics-changing one (issue #65). This is the REVIEWED baseline: it stays fixed across
+    // re-rebase rounds so re-review fires whenever the effective merged diff drifts from what
+    // review saw, no matter how many times the base advanced. branchDiffHash re-fetches
+    // origin/<base>, so it compares against current base regardless of when it runs.
     const beforeDiff = await this.deps.worktrees.branchDiffHash(ctx.worktreePath, this.deps.baseBranch);
 
-    const sync = await this.syncWithBase(ctx, { reawaitCi: true });
-    if (sync.kind === "terminal") return sync.outcome;
+    // The strict-up-to-date treadmill (#31). The daemon holds the single per-repo merge lease for
+    // this whole method, so no *daemon* PR can advance the base under us — a mid-integration
+    // `BEHIND` is always an OFF-daemon merge (a human / dependabot). Waiting never clears BEHIND;
+    // only a re-rebase does. So on BEHIND (or a DIRTY conflict base moved into) we loop back through
+    // syncWithBase (re-rebase → re-run the required check) and re-poll, bounded by a wall-clock
+    // budget so a pathologically hot base still terminates in an honest heal-card instead of an
+    // endless rebase→CI loop. Each round re-runs CI (the force-push re-queues the required check),
+    // so the budget — not a round count — is the honest bound as the base's churn rate varies.
+    const now = this.deps.now ?? ((): number => Date.now());
+    const deadline = now() + Math.max(0, this.deps.merge.behindRebaseBudgetMinutes) * 60_000;
+    for (let round = 0; ; round++) {
+      // A per-run kill (orphan sweep / operator, issue #118) must stop the loop the same way an
+      // aborted container op does — throw so the failure guard terminalizes it — rather than keep
+      // re-rebasing a run that is being torn down.
+      ctx.abortSignal?.throwIfAborted();
 
-    if (sync.moved) {
-      // Classify the moved rebase: compare the net diff vs base AFTER the rebase (and
-      // any CI re-gate fix push) against the before-capture. Unchanged → pure
-      // fast-forward replay → skip re-review; changed or unavailable → conservative
-      // re-review (issue #65).
-      const afterDiff = await this.deps.worktrees.branchDiffHash(ctx.worktreePath, this.deps.baseBranch);
-      const netDiffChanged = beforeDiff === null || afterDiff === null || beforeDiff !== afterDiff;
-      ctx.logger.info("review.net-diff", {
-        changed: netDiffChanged,
-        available: beforeDiff !== null && afterDiff !== null,
-      });
+      const sync = await this.syncWithBase(ctx, { reawaitCi: true });
+      if (sync.kind === "terminal") return sync.outcome;
 
-      // A pure fast-forward replay (moved but net diff unchanged) skips re-review — CI
-      // was already re-gated in syncWithBase. Only a move that changed the merged result
-      // (or one whose diff could not be compared) is re-reviewed.
-      if (netDiffChanged) {
-        // Re-review P1+P2 through the shared helper (the same sequence its docstring
-        // claims for the integration re-review) rather than re-spelling it here.
-        const reviewed = await this.runReviewPhases(ctx, 1);
-        if (reviewed.kind !== "awaiting-merge") return reviewed;
-        // Re-review may have pushed fixes — re-gate CI before landing.
-        const gate = await this.settle(ctx, CI_PHASE, await this.ciGate(ctx));
-        if (gate) return gate;
+      if (sync.moved) {
+        // Classify the moved rebase: compare the net diff vs base AFTER the rebase (and any CI
+        // re-gate fix push) against the reviewed baseline. Unchanged → pure fast-forward replay →
+        // skip re-review; changed or unavailable → conservative re-review (issue #65).
+        const afterDiff = await this.deps.worktrees.branchDiffHash(ctx.worktreePath, this.deps.baseBranch);
+        const netDiffChanged = beforeDiff === null || afterDiff === null || beforeDiff !== afterDiff;
+        ctx.logger.info("review.net-diff", {
+          changed: netDiffChanged,
+          available: beforeDiff !== null && afterDiff !== null,
+        });
+
+        // A pure fast-forward replay (moved but net diff unchanged) skips re-review — CI was
+        // already re-gated in syncWithBase. Only a move that changed the merged result (or one
+        // whose diff could not be compared) is re-reviewed.
+        if (netDiffChanged) {
+          // Re-review P1+P2 through the shared helper (the same sequence its docstring claims for
+          // the integration re-review) rather than re-spelling it here.
+          const reviewed = await this.runReviewPhases(ctx, 1);
+          if (reviewed.kind !== "awaiting-merge") return reviewed;
+          // Re-review may have pushed fixes — re-gate CI before landing.
+          const gate = await this.settle(ctx, CI_PHASE, await this.ciGate(ctx));
+          if (gate) return gate;
+        }
       }
-    }
 
-    return this.merge(ctx);
+      const readiness = await this.awaitMergeable(ctx);
+      if (readiness.kind === "mergeable") return this.merge(ctx);
+      if (readiness.kind === "stuck") return readiness.outcome;
+
+      // readiness.kind === "resync": the base advanced (BEHIND/DIRTY) under the held lease. Re-rebase
+      // and re-poll while the wall-clock budget lasts; on exhaustion park an honest hot-base heal-card.
+      if (now() >= deadline) {
+        ctx.logger.warn("review.merge-behind-maxed", { rounds: round + 1, state: readiness.state });
+        return this.reviewMaxed(ctx, CI_PHASE, mergeBehindWorklist(readiness.state, round + 1), round + 1);
+      }
+      ctx.logger.info("review.merge-resync", { round: round + 1, state: readiness.state });
+    }
   }
 
   /**
@@ -1152,15 +1205,16 @@ export class ReviewLoop {
    * dogfood repo merges directly as before). Returns a terminal outcome if the head
    * never became mergeable, else `null` (proceed to merge).
    */
-  private async awaitMergeable(ctx: ReviewLoopContext): Promise<ReviewLoopOutcome | null> {
+  private async awaitMergeable(ctx: ReviewLoopContext): Promise<MergeReadiness> {
     if (!this.deps.merge.waitForChecks) {
-      return null;
+      return { kind: "mergeable" };
     }
     const naps = this.deps.sleep ?? ((ms: number) => sleep(ms));
     const pollSeconds = Math.max(1, this.deps.merge.pollIntervalSeconds);
     const maxPolls = Math.max(1, Math.ceil((this.deps.merge.ciTimeoutMinutes * 60) / pollSeconds));
     let last: MergeStateStatus = "UNKNOWN";
     for (let poll = 0; poll < maxPolls; poll++) {
+      ctx.abortSignal?.throwIfAborted();
       const snapshot = await this.deps.github.readMergeStatus(ctx.prNumber);
       last = snapshot.state;
       ctx.logger.info("review.merge-status", { state: snapshot.state, poll });
@@ -1172,27 +1226,34 @@ export class ReviewLoop {
         data: { state: snapshot.state, poll },
       });
       if (MERGEABLE_STATES.has(snapshot.state)) {
-        return null;
+        return { kind: "mergeable" };
+      }
+      // The strict-up-to-date treadmill (#31): the base advanced under the rebased head (BEHIND)
+      // or into a textual conflict (DIRTY). Neither self-clears by waiting — hand back to the
+      // integration loop to re-rebase under the held merge lease, immediately, instead of burning
+      // the CI budget on a state that cannot change without a re-rebase. (A stale post-force-push
+      // BEHIND self-corrects cheaply: the next syncWithBase rebase is a no-op when base did not
+      // actually move, so no wasted CI cycle.)
+      if (snapshot.state === "BEHIND" || snapshot.state === "DIRTY") {
+        return { kind: "resync", state: snapshot.state };
       }
       if (poll < maxPolls - 1) {
         await naps(pollSeconds * 1000);
       }
     }
+    // BLOCKED/DRAFT/UNKNOWN past the CI budget: a required check that never greened (or a draft) —
+    // park healable (#25), PR preserved, rather than racing the merge into a branch-protection reject.
     ctx.logger.warn("review.merge-blocked", { state: last, polls: maxPolls });
-    return this.reviewMaxed(ctx, CI_PHASE, mergeBlockedWorklist(last), maxPolls);
+    return { kind: "stuck", outcome: await this.reviewMaxed(ctx, CI_PHASE, mergeBlockedWorklist(last), maxPolls) };
   }
 
-  /** Merge the PR directly (a deterministic harness action), then mark the run merged. */
+  /**
+   * Merge the PR directly (a deterministic harness action), then mark the run merged. The caller
+   * ({@link runIntegration}) has already confirmed branch protection reports the rebased head
+   * mergeable ({@link awaitMergeable}), so this only fires the merge and records the terminal.
+   */
   private async merge(ctx: ReviewLoopContext): Promise<ReviewLoopOutcome> {
     const { store, github } = this.deps;
-    // Wait for branch protection to report the rebased head mergeable before firing the
-    // merge — a required check re-queued by the pre-merge force-push must re-pass first
-    // (#25). A head that never clears parks healable rather than racing the merge into a
-    // rejection that would false-terminalize the run to agent-stuck.
-    const blocked = await this.awaitMergeable(ctx);
-    if (blocked) {
-      return blocked;
-    }
     await github.mergePullRequest(ctx.prNumber, {
       method: this.deps.merge.method,
       deleteBranch: this.deps.merge.deleteBranch,
@@ -1374,6 +1435,32 @@ function mergeBlockedWorklist(state: MergeStateStatus): Worklist {
           `re-queued by the rebase force-push that never went green, or a merge-conflict / behind ` +
           `state that did not resolve. The reviewed work is intact on the PR. Inspect the required ` +
           `checks (and rebase state) on the PR, then re-enable the run to retry the rebase-aware merge.`,
+        source: "review",
+      },
+    ],
+  };
+}
+
+/**
+ * The heal-card worklist for the BEHIND re-rebase budget elapsing (issue #31 — the strict
+ * up-to-date treadmill). Honest by construction: it names the hot base (an off-daemon merge kept
+ * landing while this PR's required check re-ran, so the daemon re-rebased `rounds` times without
+ * ever catching a stable base) rather than a phantom code defect. The reviewed work is intact on
+ * the PR; resume-from-WIP retries the rebase-aware merge once the base quiets.
+ */
+function mergeBehindWorklist(state: MergeStateStatus, rounds: number): Worklist {
+  return {
+    items: [
+      {
+        severity: "P0",
+        title: `The base kept advancing under the PR for ${rounds} rebase round(s) (mergeStateStatus: ${state})`,
+        detail:
+          `This repo requires branches be up to date before merging (strict status checks). An ` +
+          `off-daemon merge (a human / dependabot) landed each time this PR's required check re-ran ` +
+          `after the daemon rebased, leaving it ${state} again — the daemon re-rebased ${rounds} time(s) ` +
+          `over the whole behindRebaseBudgetMinutes budget without catching a stable base. The reviewed ` +
+          `work is intact on the PR. Wait for the base to quiet (or pause the racing source), then ` +
+          `re-enable the run to retry the rebase-aware merge.`,
         source: "review",
       },
     ],
