@@ -99,6 +99,42 @@ describe("Executor", () => {
     expect(worktrees.attached[0]!.branch).toBe("ralph/2-core-loop");
     expect(worktrees.created).toHaveLength(0); // never the wipe path
     expect(claimed.branch).toBe("ralph/2-core-loop");
+    // #32: the attached open PR is carried on the claim so `execute` re-reviews it.
+    expect(claimed.existingPrNumber).toBe(99);
+  });
+
+  // #32: a re-admitted `agent-stuck` issue that still owns an open PR must RE-REVIEW that PR,
+  // not run a fresh impl over the already-committed branch (which self-stops `futility`).
+  it("re-reviews an existing open PR instead of running a futile fresh impl (#32)", async () => {
+    github.seed({ number: 2, title: "Core loop" });
+    const pr = github.openPullRequest("ralph/2-core-loop", "Closes #2\nexisting reviewed work");
+    let reviewedPr: number | undefined;
+    let implRuns = 0;
+    const reviewLoop = {
+      async runReview(ctx: { prNumber: number }) {
+        reviewedPr = ctx.prNumber;
+        return { kind: "awaiting-merge" as const };
+      },
+    };
+    // A spy impl runner that records whether the (futile) fresh impl ran — it must not.
+    const spyRunner = {
+      async run() {
+        implRuns += 1;
+        return { ok: true, escalated: false, stuck: null };
+      },
+    };
+    const ex = new Executor({ store, github, worktrees, agentRunner: spyRunner as never, logger: silent, reviewLoop: reviewLoop as never });
+
+    const picked = { issue: github.issues.get(2)!, mode: "tdd" as const };
+    const claimed = await ex.claim(picked);
+    expect(claimed.existingPrNumber).toBe(pr.number);
+    await ex.execute(claimed, picked);
+
+    // The existing PR was re-reviewed; the fresh impl session never ran.
+    expect(reviewedPr).toBe(pr.number);
+    expect(implRuns).toBe(0);
+    // Ends parked for integration, not agent-stuck (no futility bounce).
+    expect(github.addedLabels.some((l) => l.label === LABEL_AGENT_STUCK)).toBe(false);
   });
 
   it("creates a fresh worktree when no open PR exists (true fresh start)", async () => {
