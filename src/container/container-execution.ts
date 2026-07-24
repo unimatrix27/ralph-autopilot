@@ -63,6 +63,14 @@ export interface DockerRunner {
 export interface ContainerSweeper {
   /** Stop every running ralph-managed container whose branch is not in `liveBranches`; returns the killed names. */
   sweepOrphans(liveBranches: ReadonlySet<string>): Promise<string[]>;
+  /**
+   * The branches of every ralph-managed container currently running for this repo — enumerated from
+   * Docker itself, so it reflects reality across a daemon restart (issue #29). The startup orphan
+   * reconcile consults it before discarding a `running` row with no PR: a daemon crash/OOM can leave
+   * the run's container still executing (it opens its own PR), and discarding it would false-stick a
+   * live run and kill a healthy container. A run whose container is alive is left running, not stuck.
+   */
+  runningBranches(): Promise<Set<string>>;
 }
 
 /** Construction deps for {@link ContainerExecution}. */

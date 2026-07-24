@@ -497,6 +497,18 @@ export class Reconciler {
   private async reconcileOrphanRunningRow(run: Run): Promise<void> {
     const target = await this.resolveRunTarget(run);
     if (!target.live) {
+      // A daemon crash/OOM restart can leave the run's container still executing (it commits,
+      // pushes, and opens its OWN PR — issue #29). Discarding it here would false-stick a live run
+      // to `agent-stuck` and a later sweep would kill the healthy container. So before discarding a
+      // no-PR orphan, check the container: if the issue is still OPEN and a container is alive for
+      // this branch, the run is genuinely in flight — leave the row `running` and let it finish
+      // (its PR lands, re-driven on a later reconcile). A genuinely dead run (no live container) or
+      // a resolved issue still discards, exactly as before. The liveness probe fails toward discard
+      // so a probe fault never wedges cleanup; a wedged survivor is caught by the lifetime backstop.
+      if (target.issue?.state === "OPEN" && run.branch && (await this.hasLiveContainer(run.branch))) {
+        this.deps.logger.info("orphan.container-alive", { issue: run.issueNumber, branch: run.branch });
+        return;
+      }
       await this.discardOrphanSafely(run, target.issue);
       return;
     }
@@ -518,6 +530,26 @@ export class Reconciler {
       await this.deps.executor.discardOrphan(run, issue);
     } catch (err) {
       this.deps.logger.error("executor.discard-orphan-failed", { issue: run.issueNumber, error: String(err) });
+    }
+  }
+
+  /**
+   * Whether a ralph-managed container is currently running for `branch` (issue #29) — the liveness
+   * check the orphan reconcile consults before discarding a no-PR `running` row so it never
+   * false-sticks a run whose container survived a daemon crash. In-process / no-container mode has
+   * no container to be alive (→ `false`, discard as before). A failed probe fails toward `false`
+   * (discard) so a docker hiccup never blocks orphan cleanup — the prior behaviour, never a wedge.
+   */
+  private async hasLiveContainer(branch: string): Promise<boolean> {
+    const { containers } = this.deps;
+    if (!containers) {
+      return false;
+    }
+    try {
+      return (await containers.runningBranches()).has(branch);
+    } catch (err) {
+      this.deps.logger.warn("orphan.container-liveness-failed", { branch, error: String(err) });
+      return false;
     }
   }
 

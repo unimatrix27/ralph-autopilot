@@ -236,6 +236,42 @@ describe("orphan / liveness sweeper (AC2)", () => {
     expect(labelsOf(github, 6)).toContain("agent-stuck");
   });
 
+  it("leaves a no-PR `running` orphan whose container is still alive — no false-stuck (#29)", async () => {
+    // A daemon crash/OOM restart: the `running` row is not in flight and has no PR yet, BUT its
+    // container survived and is still executing (it will open its own PR). Discarding it would
+    // false-stick a live run and a later sweep would kill the healthy container.
+    const branch = branchName(6, "survivor");
+    github.seed({ number: 6, title: "survivor", labels: ["afk", "mode:tdd"] });
+    store.upsertRun({ issueNumber: 6, mode: "tdd", branch, worktreePath: "/fake-wt/6-survivor" });
+    // Docker still reports a running container for this branch.
+    const containers = new FakeContainerSweeper(new Set([branch]));
+
+    const { reconciler } = wire({ github, store, containers });
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    // Left running (not stuck), and its container was NOT killed by the orphan-container sweep.
+    expect(store.getRunByIssue(6)!.status).toBe("running");
+    expect(labelsOf(github, 6)).not.toContain("agent-stuck");
+    expect(containers.killed).toEqual([]);
+  });
+
+  it("still discards a no-PR `running` orphan whose container is gone (#29)", async () => {
+    // The other side of #29: no live container for the branch → a genuine crash orphan → discard
+    // to agent-stuck exactly as before. A present-but-empty container port must not spare it.
+    const branch = branchName(6, "dead");
+    github.seed({ number: 6, title: "dead", labels: ["afk", "mode:tdd"] });
+    store.upsertRun({ issueNumber: 6, mode: "tdd", branch, worktreePath: "/fake-wt/6-dead" });
+    const containers = new FakeContainerSweeper(new Set()); // no running containers
+
+    const { reconciler } = wire({ github, store, containers });
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    expect(store.getRunByIssue(6)!.status).toBe("agent-stuck");
+    expect(labelsOf(github, 6)).toContain("agent-stuck");
+  });
+
   it("terminates + prunes a non-terminal run whose issue was closed under it", async () => {
     const branch = branchName(8, "closed under");
     const issue = github.seed({ number: 8, title: "closed under", labels: ["afk", "mode:tdd"] });

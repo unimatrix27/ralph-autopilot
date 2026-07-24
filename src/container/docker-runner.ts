@@ -494,6 +494,18 @@ export class DockerCliRunner implements DockerRunner, ContainerSweeper {
     return orphans;
   }
 
+  /**
+   * The branches of every ralph-managed container currently running for this repo (issue #29),
+   * enumerated from Docker itself (`docker ps` scoped to {@link REPO_LABEL_KEY}) — so it survives a
+   * daemon restart, exactly like {@link sweepOrphans}. The startup orphan reconcile consults it to
+   * avoid discarding a run whose container outlived a daemon crash. A container with no branch label
+   * cannot back a live run, so it is omitted.
+   */
+  async runningBranches(): Promise<Set<string>> {
+    const running = parsePsContainers(await this.capture(buildPsArgs(this.config.targetRepo)));
+    return new Set(running.map((c) => c.branch).filter((b): b is string => !!b));
+  }
+
   /** Run the graceful-then-hard `docker stop -t <timeout> <name>`, swallowing spawn failures. */
   private async stopContainer(name: string): Promise<void> {
     await new Promise<void>((resolve) => {

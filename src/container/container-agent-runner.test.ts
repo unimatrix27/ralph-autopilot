@@ -325,6 +325,33 @@ describe("ContainerAgentRunner — Option X routing (ADR-0038 / issue #185)", ()
     const result = await runner.run({ issue, mode: "tdd", worktreePath: "x", branch: "ralph/185-impl", runId: seeded.id, logger: silent });
 
     expect(result.ok).toBe(false);
+    // No usage signal → a genuine failure stays not-limited (the executor terminalizes it).
+    expect(result.limited).toBeFalsy();
+  });
+
+  it("defers (limited) a failed impl run that saw a usage/rate-limit — not agent-stuck (#29)", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    const seeded = store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    // The in-container session relays a usage cap (the primitive fires onRateLimit with the
+    // synthesized `rejected` signal before throwing UsageLimitError), then the run terminates
+    // failed. The daemon adapter must read that as a transient usage limit → `limited` (defer),
+    // NOT a fault → agent-stuck (the impl analogue of the review/fix resumable path).
+    const usageLimitedSession: SessionHost = {
+      run: async (input) => {
+        input.onRateLimit?.({ status: "rejected", rateLimitType: "5h" });
+        return { subtype: "error", isError: true, text: "", turns: 1 };
+      },
+    };
+
+    const runner = new ContainerAgentRunner({
+      docker: dockerRunning(usageLimitedSession),
+      store,
+      config: config(),
+      baseBranch: "main",
+    });
+    const result = await runner.run({ issue, mode: "tdd", worktreePath: "x", branch: "ralph/185-impl", runId: seeded.id, logger: silent });
+
+    expect(result).toEqual({ ok: false, escalated: false, stuck: null, limited: true });
   });
 });
 
