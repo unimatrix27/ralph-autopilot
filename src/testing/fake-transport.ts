@@ -76,17 +76,22 @@ export class FakeContainerSweeper implements ContainerSweeper {
   /** Container names this sweep killed, across all calls, in order. */
   readonly killed: string[] = [];
 
-  constructor(private readonly runningBranches: Set<string> = new Set()) {}
+  constructor(private readonly liveBranchesSet: Set<string> = new Set()) {}
 
   async sweepOrphans(liveBranches: ReadonlySet<string>): Promise<string[]> {
     const orphans: string[] = [];
-    for (const branch of this.runningBranches) {
+    for (const branch of this.liveBranchesSet) {
       if (!liveBranches.has(branch)) {
         orphans.push(containerNameForBranch(branch));
-        this.runningBranches.delete(branch);
+        this.liveBranchesSet.delete(branch);
       }
     }
     this.killed.push(...orphans);
     return orphans;
+  }
+
+  /** The branches of the containers this fake pretends are running (issue #29). */
+  async runningBranches(): Promise<Set<string>> {
+    return new Set(this.liveBranchesSet);
   }
 }

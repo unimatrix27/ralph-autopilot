@@ -23,6 +23,7 @@ import { ContainerExecution, type DockerRunner } from "./container-execution";
 import type { ResultFrame } from "./protocol";
 import { createTelemetrySink, type TranscriptRunRecorder } from "./record-telemetry";
 import { foldRateLimitTelemetry, type RecordRateLimitSignal } from "./record-rate-limit";
+import { isUsageLimitError } from "../core/usage";
 import type { AgentRunContext, AgentRunResult, AgentRunner } from "../executor/agent";
 import type { StuckReport } from "../executor/stuck-tool";
 import { buildImplPrompt, buildResumePrompt } from "../executor/prompts";
@@ -174,12 +175,21 @@ export class ContainerAgentRunner implements AgentRunner {
       ctx.runId != null
         ? createTelemetrySink(this.deps.store, { issueNumber: issue.number, runId: String(ctx.runId) })
         : null;
+    // Whether the in-container session saw a provider rate-limit / usage-window signal during this
+    // run (issue #29). The container's SDK is the first to see the 429, relaying it as a telemetry
+    // frame; if the run then terminates `failed`, that failure was the usage limit — NOT a fault —
+    // so we defer (`limited`) rather than false-terminalize to agent-stuck (the impl analogue of the
+    // review/fix path that already leaves a UsageLimitError resumable; the original #2995 trigger).
+    let sawRateLimit = false;
     const execution = new ContainerExecution({
       docker: this.deps.docker,
-      // A `rate-limit` body folds into the dispatched account's meter (#228); everything else is a
-      // transcript/lifecycle frame for the run's transcript store. Both best-effort (ADR-0030/0038).
+      // A `rate-limit` body folds into the dispatched account's meter (#228) and marks the run
+      // usage-limited; everything else is a transcript/lifecycle frame for the run's transcript
+      // store. Both best-effort (ADR-0030/0038).
       onTelemetry: (frame, dispatch) => {
-        if (!foldRateLimitTelemetry(frame, dispatch, this.deps.recordRateLimit)) {
+        if (foldRateLimitTelemetry(frame, dispatch, this.deps.recordRateLimit)) {
+          sawRateLimit = true;
+        } else {
           sink?.record(frame);
         }
       },
@@ -190,7 +200,7 @@ export class ContainerAgentRunner implements AgentRunner {
       drainSignal: this.deps.drainSignal,
     });
     await sink?.flush();
-    return this.mapResult(result, ctx);
+    return this.mapResult(result, ctx, sawRateLimit);
   }
 
   /**
@@ -204,9 +214,14 @@ export class ContainerAgentRunner implements AgentRunner {
    *     (#9); the executor pauses the run. If the relayed payload is missing (a dropped frame),
    *     the escalation is still on GitHub — the completeness pass reconciles it;
    *   - `stuck` — the agent self-stopped; relay the report so the executor labels `agent-stuck`;
-   *   - `failed` — a non-success terminal with no work product.
+   *   - `failed` — a non-success terminal with no work product; when a usage/rate limit aborted
+   *     the session (`sawRateLimit`, or the detail names it) it is deferred (`limited`), not a fault.
    */
-  private async mapResult(result: ResultFrame, ctx: AgentRunContext): Promise<AgentRunResult> {
+  private async mapResult(
+    result: ResultFrame,
+    ctx: AgentRunContext,
+    sawRateLimit: boolean,
+  ): Promise<AgentRunResult> {
     switch (result.outcome) {
       case "pr-opened":
         return { ok: true, escalated: false, stuck: null };
@@ -226,6 +241,17 @@ export class ContainerAgentRunner implements AgentRunner {
         return { ok: false, escalated: false, stuck };
       }
       case "failed":
+        // A usage/rate limit that aborted the session mid-run is NOT a fault and NOT `agent-stuck`
+        // (issue #29). The in-container SDK saw the 429 and relayed it (`sawRateLimit`), or the
+        // failure detail names it — either way return `limited` so the executor defers (restore
+        // `ready-for-agent`, drop the run) and admission re-resolves once the cooldown the meter
+        // tripped expires, exactly like the review/fix path leaves a UsageLimitError resumable. A
+        // container impl run has no resumable WIP (fresh container per run), so this defer→fresh
+        // re-run IS its "resume". Without a usage signal, a genuine failure still terminalizes.
+        if (sawRateLimit || isUsageLimitError(result.detail ?? "")) {
+          ctx.logger.warn("container.impl-usage-limited", { issue: ctx.issue.number, detail: result.detail });
+          return { ok: false, escalated: false, stuck: null, limited: true };
+        }
         return { ok: false, escalated: false, stuck: null };
       case "reviewed":
       case "fixed":
