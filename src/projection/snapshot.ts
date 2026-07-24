@@ -155,6 +155,14 @@ export interface SnapshotOptions {
   now?: () => Date;
   /** How many recent outcomes to surface (default 10). */
   outcomeLimit?: number;
+  /**
+   * The LIVE global concurrency cap (`scheduler.maxConcurrentAgents`) for the health header
+   * (issue #34). Passed so the header reports the current cap rather than `max(persisted
+   * per-repo snapshot caps)` — an idle target's stale snapshot keeps the cap it was persisted
+   * with, so after the operator lowers the cap (e.g. the OOM stopgap 10→3) the `Math.max` reads
+   * the old 10 from the idle repo's snapshot. Absent (tests) → fall back to the persisted max.
+   */
+  cap?: number;
 }
 
 /**
@@ -261,7 +269,7 @@ export function buildSnapshot(store: Store, options: SnapshotOptions = {}): Runt
     awaitingCi: toQueue("awaiting-ci"),
     awaitingMerge: toQueue("awaiting-merge"),
     recentOutcomes,
-    daemon: aggregateDaemonHealth(persisted, nowMs),
+    daemon: aggregateDaemonHealth(persisted, nowMs, options.cap),
   };
 }
 
@@ -270,9 +278,15 @@ export function buildSnapshot(store: Store, options: SnapshotOptions = {}): Runt
  * the earliest daemon start (longest uptime), the freshest tick, the next-tick due
  * instant, stale if ANY repo is stale, and the first error any repo surfaced — all
  * instants absolute (ISO-8601). `targetRepo` lists the repos. `null` before any repo's
- * first tick. `nowMs` is read only for the stale check and the overdue clamp.
+ * first tick. `nowMs` is read only for the stale check and the overdue clamp. `liveCap`
+ * is the current config cap (issue #34): reported directly when given, so an idle repo's
+ * stale persisted cap can't outvote it via `Math.max`; absent → the persisted max (tests).
  */
-function aggregateDaemonHealth(snapshots: DaemonSnapshotLike[], nowMs: number): DaemonHealthView | null {
+function aggregateDaemonHealth(
+  snapshots: DaemonSnapshotLike[],
+  nowMs: number,
+  liveCap?: number,
+): DaemonHealthView | null {
   if (snapshots.length === 0) {
     return null;
   }
@@ -283,7 +297,7 @@ function aggregateDaemonHealth(snapshots: DaemonSnapshotLike[], nowMs: number): 
   const repos = snapshots.map((s) => s.targetRepo).join(", ");
   return {
     targetRepo: snapshots.length > 1 ? `${snapshots.length} targets: ${repos}` : repos,
-    cap: Math.max(...snapshots.map((s) => s.cap)),
+    cap: liveCap ?? Math.max(...snapshots.map((s) => s.cap)),
     startedAt: new Date(earliestStart).toISOString(),
     lastTickAt: new Date(lastTickMs).toISOString(),
     // The next tick is due one interval after the last; clamp to `now` when overdue so it

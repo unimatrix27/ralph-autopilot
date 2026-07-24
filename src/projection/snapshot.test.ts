@@ -258,6 +258,31 @@ describe("buildSnapshot", () => {
     ]);
   });
 
+  it("reports the LIVE cap in the header, not a stale idle-repo snapshot's cap (#34)", () => {
+    const repoA = store.forRepo("owner/a");
+    const repoB = store.forRepo("owner/b");
+    const base = {
+      generatedAt: FIXED,
+      reconcileIntervalSeconds: 30,
+      daemonStartedAt: FIXED,
+      lastError: null,
+      eligible: [],
+      blocked: [],
+      paused: [],
+      manualHolds: [],
+      modingCandidates: [],
+    };
+    // An idle repo persisted its snapshot before the operator lowered the cap (OOM stopgap 10→3);
+    // the active repo re-ticked at the new cap. `Math.max` would read the stale 10.
+    repoA.saveBacklogSnapshot({ ...base, targetRepo: "owner/a", cap: 10 });
+    repoB.saveBacklogSnapshot({ ...base, targetRepo: "owner/b", cap: 3 });
+
+    // With the live cap threaded in, the header reports it — never the stale max.
+    expect(buildSnapshot(store, { cap: 3 }).daemon!.cap).toBe(3);
+    // Without it (tests that don't assert the header), the old persisted-max behaviour holds.
+    expect(buildSnapshot(store).daemon!.cap).toBe(10);
+  });
+
   it("derives daemon health: absolute tick instants, start anchor, and freshness", () => {
     repoStore.saveBacklogSnapshot({
       generatedAt: FIXED, // last tick at 12:00:00
