@@ -21,6 +21,8 @@ import {
   type ReviewFixSessionInput,
   type RunnerEscalation,
   type RunnerEscalationInput,
+  type RunnerFinalizer,
+  type RunnerFinalizeInput,
   type SessionHost,
   type SessionHostInput,
   type WorkspaceCloner,
@@ -84,6 +86,16 @@ class FakeEscalation implements RunnerEscalation {
   }
 }
 
+/** A {@link RunnerFinalizer} that records every salvage call and returns a fixed PR number (or null). */
+class FakeFinalizer implements RunnerFinalizer {
+  readonly calls: RunnerFinalizeInput[] = [];
+  constructor(private readonly result: number | null = 314) {}
+  async finalizeNoPr(input: RunnerFinalizeInput): Promise<number | null> {
+    this.calls.push(input);
+    return this.result;
+  }
+}
+
 /** Drain the daemon side until the runner's terminal result frame, mirroring ContainerExecution. */
 async function collectUntilResult(transport: Transport): Promise<Frame[]> {
   const frames: Frame[] = [];
@@ -105,6 +117,91 @@ describe("in-container runner (ADR-0038 / issue #185)", () => {
 
     expect(session.inputs).toHaveLength(1);
     expect(frames).toContainEqual({ kind: "telemetry", body: { type: "lifecycle", name: "started" } });
+    expect(frames.at(-1)).toEqual({ kind: "result", outcome: "pr-opened", detail: expect.any(String) });
+  });
+
+  it("runs the no-PR salvage on a clean session, against the run's own workspace (issue #3061)", async () => {
+    const { daemon, runner } = connectedTransports();
+    const session = new FakeSession();
+    const finalizer = new FakeFinalizer(910);
+    const collected = collectUntilResult(daemon);
+
+    await runContainerRunner(
+      { cloner: new FakeCloner("/ws/3061"), session, transport: runner, finalizer },
+      dispatch,
+    );
+    const frames = await collected;
+
+    // The salvage ran once, keyed to this run's assignment + cloned workspace.
+    expect(finalizer.calls).toEqual([{ assignment, workspacePath: "/ws/3061" }]);
+    // The terminal stays pr-opened — the daemon reads the (now-salvaged) PR back through reconcile.
+    expect(frames.at(-1)).toEqual({ kind: "result", outcome: "pr-opened", detail: expect.any(String) });
+  });
+
+  it("does NOT run the salvage on an escalated terminal (escalate already pushed WIP)", async () => {
+    const { daemon, runner } = connectedTransports();
+    const session = new FakeSession();
+    session.onRun = async (input) => {
+      await input.onEscalate?.(question());
+    };
+    const finalizer = new FakeFinalizer();
+    const collected = collectUntilResult(daemon);
+
+    await runContainerRunner(
+      { cloner: new FakeCloner(), session, transport: runner, escalation: new FakeEscalation(), finalizer },
+      dispatch,
+    );
+    await collected;
+
+    expect(finalizer.calls).toHaveLength(0);
+  });
+
+  it("does NOT run the salvage on a stuck terminal (an honest non-completion)", async () => {
+    const { daemon, runner } = connectedTransports();
+    const session = new FakeSession();
+    session.onRun = (input) => {
+      input.onStuck?.({ category: "futility", reason: "cannot be done as scoped" });
+    };
+    const finalizer = new FakeFinalizer();
+    const collected = collectUntilResult(daemon);
+
+    await runContainerRunner({ cloner: new FakeCloner(), session, transport: runner, finalizer }, dispatch);
+    await collected;
+
+    expect(finalizer.calls).toHaveLength(0);
+  });
+
+  it("does NOT run the salvage on an errored session (partial work is not a forgotten PR)", async () => {
+    const { daemon, runner } = connectedTransports();
+    const session = new FakeSession();
+    session.result = { subtype: "error_during_execution", isError: true, text: "boom", turns: 1 };
+    const finalizer = new FakeFinalizer();
+    const collected = collectUntilResult(daemon);
+
+    await runContainerRunner({ cloner: new FakeCloner(), session, transport: runner, finalizer }, dispatch);
+    const frames = await collected;
+
+    expect(finalizer.calls).toHaveLength(0);
+    expect(frames.at(-1)).toEqual({ kind: "result", outcome: "failed", detail: expect.any(String) });
+  });
+
+  it("a salvage that throws never breaks the run — best-effort, the daemon's no-PR card is the fallback", async () => {
+    const { daemon, runner } = connectedTransports();
+    const session = new FakeSession();
+    const throwingFinalizer: RunnerFinalizer = {
+      finalizeNoPr: async () => {
+        throw new Error("gh pr create failed");
+      },
+    };
+    const collected = collectUntilResult(daemon);
+
+    await expect(
+      runContainerRunner(
+        { cloner: new FakeCloner(), session, transport: runner, finalizer: throwingFinalizer },
+        dispatch,
+      ),
+    ).resolves.toBeUndefined();
+    const frames = await collected;
     expect(frames.at(-1)).toEqual({ kind: "result", outcome: "pr-opened", detail: expect.any(String) });
   });
 

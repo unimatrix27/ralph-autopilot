@@ -29,6 +29,7 @@ import {
   createImplSessionHost,
   createReviewSessionHost,
   createRunnerEscalation,
+  createRunnerFinalizer,
   readContainerRoute,
 } from "../container/in-container-session";
 import type { ContainerDispatch } from "../container/assignment";
@@ -97,6 +98,9 @@ async function main(): Promise<void> {
       // `escalate` lands runner-direct (#187): push WIP + post the ralph-question straight to
       // GitHub via the container's own mounted git/gh, so the question survives a dead pipe.
       escalation: createRunnerEscalation({ repo, token }),
+      // Salvage a clean impl session that opened no PR (issue #3061): commit + push + open the PR
+      // runner-direct so the agent's work lands instead of being discarded as a false agent-stuck.
+      finalizer: createRunnerFinalizer({ repo }),
     },
     dispatch,
   );

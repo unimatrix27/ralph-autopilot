@@ -107,6 +107,33 @@ export interface RunnerEscalation {
   publish(input: RunnerEscalationInput): Promise<{ commentId: number; prNumber?: number }>;
 }
 
+/** What the runner-direct no-PR salvage needs to land a clean session's work (issue #3061). */
+export interface RunnerFinalizeInput {
+  /** The run's marching orders — supplies the issue, branch, and base. */
+  assignment: Assignment;
+  /** The cloned workspace the work lives in — committed, uncommitted, or nothing. */
+  workspacePath: string;
+}
+
+/**
+ * Salvages a **clean** impl session that produced work but opened no PR — the
+ * backgrounded-build-then-stop trap (issue #3061): the agent ends its single-shot
+ * session (often after backgrounding a long verify build and expecting a wake-up that
+ * never comes) with its edits uncommitted/unpushed. Rather than let that clean session
+ * yield no PR — which the daemon can only terminalize as a finished-without-a-PR
+ * `agent-stuck` with the work lost — this commits any uncommitted changes, pushes the
+ * branch, and opens the PR **runner-direct** (git/gh in the container clone, exactly like
+ * {@link RunnerEscalation}), so the work actually lands for review.
+ *
+ * Returns the opened PR number, or `null` when there is nothing to salvage: a PR already
+ * exists (the agent opened one — the happy path), or the workspace has no net diff vs base
+ * (the agent genuinely did nothing — a true no-op the daemon's no-PR terminal handles).
+ * The production impl shells git + gh; faked in the unit suite.
+ */
+export interface RunnerFinalizer {
+  finalizeNoPr(input: RunnerFinalizeInput): Promise<number | null>;
+}
+
 /** What a review or fix session is handed inside the container (ADR-0038 / issue #189). */
 export interface ReviewFixSessionInput {
   /** The run's marching orders — the pre-built review/fix prompt, branch, base, mode. */
@@ -160,6 +187,12 @@ export interface ContainerRunnerDeps {
    * session is hosted without an `escalate` tool (the agent cannot escalate from this run).
    */
   escalation?: RunnerEscalation;
+  /**
+   * Salvages a clean impl session that opened no PR (issue #3061) — commits + pushes + opens
+   * the PR runner-direct so the agent's work is not discarded as a false `agent-stuck`. Absent
+   * → no salvage (the daemon still posts a finished-without-a-PR card; work is only lost).
+   */
+  finalizer?: RunnerFinalizer;
   /** Hosts a review pass for a `kind: "review"` assignment (#189). Required for such a run. */
   reviewSession?: ReviewSessionHost;
   /** Hosts a fix attempt for a `kind: "fix"` assignment (#189). Required for such a run. */
@@ -306,6 +339,22 @@ async function runImplSession(
       stuck = report;
     },
   });
+  // Salvage a clean session that produced work but never opened a PR (issue #3061): the agent
+  // ended — often after backgrounding a long verify build and expecting a wake-up that never
+  // comes in a single-shot session — with its edits uncommitted/unpushed. Commit + push + open
+  // the PR runner-direct so the work lands, instead of the daemon discarding it as a
+  // finished-without-a-PR `agent-stuck`. Only on a CLEAN terminal: an escalate/stuck/errored
+  // session is not a "finished, forgot the PR" case (escalate already pushed WIP; stuck/error
+  // are honest non-completions). Best-effort — a failure here (nothing to salvage, or a
+  // push/create error) leaves the daemon's no-PR card as the fallback and never aborts the run.
+  if (deps.finalizer && !escalation && !stuck && !result.isError) {
+    try {
+      await deps.finalizer.finalizeNoPr({ assignment, workspacePath });
+    } catch {
+      // Swallow: the daemon reads the branch's PR back and, finding none, posts the
+      // finished-without-a-PR card — the host-side no-silent-loss fallback stays intact.
+    }
+  }
   return terminalResult(assignment, result, escalation, stuck);
 }
 
