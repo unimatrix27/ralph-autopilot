@@ -34,7 +34,7 @@ import { createRunTranscriptSink } from "./transcript-sink";
 import { RunAbortRegistry } from "./run-abort-registry";
 import type { WorktreeManager } from "./worktree";
 import type { ReviewLoop, ReviewLoopContext, ReviewLoopOutcome } from "../review/review-loop";
-import { recordAgentStuck } from "./stuck";
+import { recordAgentStuck, recordFinishedWithoutPr } from "./stuck";
 
 /** An issue the gate admitted, with its resolved mode. */
 export interface PickedIssue {
@@ -900,8 +900,8 @@ export class Executor {
     // `agent-stuck` and page a human for nothing (issue 2071). Leave the row
     // `running` and return: the next tick's orphan sweep (`reconcileOrphanRunningRow`)
     // re-reads the PR once GitHub is reachable and re-drives the review, exactly
-    // like a crash survivor. A definitive null (read succeeded, no PR) still falls
-    // through to the `no-pr` discard path below.
+    // like a crash survivor. A definitive null (read succeeded, no PR) is terminalized
+    // inline as a finished-without-a-PR stuck below.
     let pr: PullRequest | null;
     try {
       pr = await github.findPullRequestForBranch(branch);
@@ -911,7 +911,13 @@ export class Executor {
     }
     const prNumber = pr?.number ?? params.prNumber ?? null;
     if (prNumber === null) {
+      // The session finished cleanly (not error/escalate/stuck) yet opened no PR —
+      // the agent ended with its work uncommitted/unpushed (the classic backgrounded-
+      // build-then-stop trap). Terminalize inline with a self-explaining stuck-card so
+      // the terminal is immediate and readable on the issue, rather than leaving the
+      // row `running` for the generic next-tick orphan sweep to bare-label as a crash.
       log.warn("agent.no-pr", { ok: result.ok });
+      await recordFinishedWithoutPr(store, github, { issueNumber: issue.number, runId });
       return { runId, branch, worktreePath, prNumber: null };
     }
 

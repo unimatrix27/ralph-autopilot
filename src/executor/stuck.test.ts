@@ -21,7 +21,13 @@ import {
 import { listOpenQuestions } from "../hitl/queue";
 import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "../hitl/labels";
 import type { StuckCategory, StuckReport } from "./stuck-tool";
-import { buildStuckCardQuestion, recordAgentStuck } from "./stuck";
+import {
+  buildNoPrCardQuestion,
+  buildStuckCardQuestion,
+  isStuckCardQuestion,
+  recordAgentStuck,
+  recordFinishedWithoutPr,
+} from "./stuck";
 
 const ALL_CATEGORIES: StuckCategory[] = ["fix-iterations", "no-green-build", "futility", "wall-clock"];
 
@@ -163,5 +169,72 @@ describe("recordAgentStuck stuck-card comment (#85)", () => {
     // The bounded-out terminal also closed the run span on the issue stream (issue #80):
     // recordAgentStuck appends RunEnded{stuck}, asserted here through the real path.
     expect((await store.aggregateIssue(7)).state.ended).toBe(true);
+  });
+});
+
+describe("buildNoPrCardQuestion (finished-without-a-PR terminal)", () => {
+  it("renders a valid, heal-shaped, stuck-card-featured question", () => {
+    const q = buildNoPrCardQuestion();
+    // Round-trips through the strict escalation/ralph-question schema.
+    expect(() => escalationQuestionSchema.parse(q)).not.toThrow();
+    // Carries the STUCK_CARD_FEATURE marker so the heal path (#86) treats an answered
+    // card exactly like any other stuck-heal (re-admit a fresh run).
+    expect(isStuckCardQuestion(q)).toBe(true);
+    // Self-explaining: names the no-PR outcome and the backgrounded-build cause.
+    expect(q.headline.toLowerCase()).toContain("without opening a pr");
+    expect(q.stakes.toLowerCase()).toContain("no pull request");
+    expect(q.whereWeStand.toLowerCase()).toContain("background");
+    // Heal-style options: re-enable / heal-with-guidance / close.
+    expect(q.options?.some((o) => /re-enable|ready-for-agent/i.test(o))).toBe(true);
+    expect(q.options?.some((o) => /close/i.test(o))).toBe(true);
+  });
+});
+
+describe("recordFinishedWithoutPr (clean session, no PR)", () => {
+  let store: Store;
+  let github: FakeGitHub;
+
+  beforeEach(() => {
+    store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    github = new FakeGitHub();
+  });
+  afterEach(() => store.close());
+
+  it("posts a self-explaining stuck-card, marks the run agent-stuck, and closes the span", async () => {
+    github.seed({ number: 7, title: "Flaky thing", labels: ["afk", "mode:tdd"] });
+    const run = store.upsertRun({
+      issueNumber: 7,
+      mode: "tdd",
+      status: "running",
+      branch: "ralph/7-flaky",
+      worktreePath: "/wt/7",
+    });
+
+    await recordFinishedWithoutPr(store, github, { issueNumber: 7, runId: run.id });
+
+    // Exactly one structured comment, parseable as a healable stuck-card.
+    const comments = github.comments.get(7) ?? [];
+    expect(comments).toHaveLength(1);
+    const body = comments[0]!.body;
+    expect(body).toContain("```" + RALPH_QUESTION_FENCE);
+    const question = parseRalphQuestionComment(body);
+    expect(question).not.toBeNull();
+    expect(isStuckCardQuestion(question!)).toBe(true);
+    expect(body.toLowerCase()).toContain("no pull request");
+
+    // Terminal on the run status (the reconciler diff projects the label from it —
+    // no imperative addLabel), and the span is closed (RunEnded{stuck}).
+    expect(store.getRunByIssue(7)!.status).toBe("agent-stuck");
+    expect(github.addedLabels.some((l) => l.label === LABEL_AGENT_STUCK)).toBe(false);
+    expect((await store.aggregateIssue(7)).state.ended).toBe(true);
+
+    // Once `agent-stuck` is applied, the card is surfaced in the GitHub-only heal queue.
+    await github.addLabel(7, LABEL_AGENT_STUCK);
+    const surfaced = await listOpenQuestions(github);
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]!.issue.number).toBe(7);
+
+    // Recorded in the run log for live views.
+    expect(store.tailLog(run.id).some((e) => e.event === "agent-no-pr")).toBe(true);
   });
 });

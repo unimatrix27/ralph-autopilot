@@ -92,7 +92,7 @@ function wireOrchestrator(specs: RepoSpec[], cap: number, selfUpdate?: SelfUpdat
     );
   }
   const orchestrator = new Orchestrator({ reconcilers, store, logger: silent, selfUpdate, runAbort: abortRegistry });
-  return { orchestrator, store, scopes, abortRegistry };
+  return { orchestrator, store, scopes, abortRegistry, reconcilers };
 }
 
 /** Poll `predicate` until true or the budget runs out. */
@@ -408,7 +408,7 @@ describe("Orchestrator multi-repo (ADR-0020)", () => {
     }
     const runnerA = new ControlledAgentRunner();
     const runnerB = new ControlledAgentRunner();
-    const { orchestrator, store } = wireOrchestrator(
+    const { orchestrator, store, reconcilers } = wireOrchestrator(
       [
         { repo: "a/x", github: githubA, runner: runnerA },
         { repo: "b/y", github: githubB, runner: runnerB },
@@ -423,10 +423,15 @@ describe("Orchestrator multi-repo (ADR-0020)", () => {
     expect(runnerA.started).toEqual([1, 2, 3]);
     expect(runnerB.started).toEqual([]);
 
-    // A slot freed in repo A is reusable by repo B on the next tick.
+    // A slot freed in repo A is reusable by repo B on the next tick. A slot frees the
+    // instant its executor *settles* (occupySlot's finally), which is after the session's
+    // terminal tail runs — here a clean no-PR finish terminalizes inline (stuck-card +
+    // store writes) before releasing — so await repo A's in-flight settling first, exactly
+    // as the drain path does, then tick.
     runnerA.complete(1);
     runnerA.complete(2);
     runnerA.complete(3);
+    await Promise.all(reconcilers.map((r) => r.awaitInFlight()));
     await orchestrator.tick();
     expect(runnerB.started).toEqual([1, 2, 3]);
     store.close();

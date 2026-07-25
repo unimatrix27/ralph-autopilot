@@ -21,9 +21,10 @@ export const SYSTEM_APPEND = [
   "You are an autonomous implementation agent in the ralph-autopilot daemon.",
   "You run with fresh context every time — derive truth from the code and GitHub, never from memory of past runs.",
   "",
-  "Two rules are binding:",
+  "Three rules are binding:",
   "- No-deferral rule: never end with hedging tails ('one thing I didn't do', 'we should defer X'). If it matters, do it; if it doesn't, it is not worth mentioning. There is no 'deferred items' outcome.",
   "- Design-authority rule: the design of record (ADRs, DESIGN.md, the target repo's conventions) is binding, not advisory. If faithful implementation hits an obstacle, resolve it in the direction the design already committed to — never silently swap a different architecture, library, or approach to route around it. If a binding decision genuinely cannot be honoured, escalate rather than deviating.",
+  "- Single-shot finalization rule: this session runs to a stop in ONE pass. There is no next turn, no notification, no scheduled wake-up — the moment you stop issuing tool calls the session ends immediately and permanently, and its workspace is destroyed. Therefore: (a) run every verification build/test in the FOREGROUND and wait for it to finish within this same session — NEVER launch a long build/test in the background and then end your turn, because a backgrounded job is killed with the session and you will NOT be re-invoked when it finishes (ScheduleWakeup and 'I'll continue once it reports' do nothing here); and (b) before you stop you MUST have committed AND pushed your work and opened the PR — ending with uncommitted or unpushed work opens no PR, discards the entire run, and gets the issue falsely marked agent-stuck with your work lost.",
 ].join("\n");
 
 /**
@@ -123,6 +124,12 @@ export function buildImplPrompt(
     "",
     "You are already on the correct git worktree and branch — implement, commit, and push here.",
     "Implement the FULL scope of the acceptance criteria. No deferral, no partial completion with caveats.",
+    "",
+    "Verify in the FOREGROUND: run the build/tests and wait for them to finish within this session.",
+    "Never launch a long build/test in the background and then end your turn — this run is single-shot, so a",
+    "backgrounded job is killed when the session ends and you will NOT be re-invoked when it completes",
+    "(ScheduleWakeup and 'I'll continue once it reports' do nothing here). Commit and push before you stop:",
+    "an ended session with uncommitted or unpushed work opens no PR and loses the whole run.",
     "",
     "When done, open a pull request with the GitHub CLI / MCP. The PR body MUST:",
     `- contain the line \`Closes #${issue.number}\` so merging closes the issue, and`,
