@@ -287,6 +287,8 @@ export type {
   ContainerRunnerDeps,
   RunnerEscalation,
   RunnerEscalationInput,
+  RunnerFinalizer,
+  RunnerFinalizeInput,
   SessionHost,
   SessionHostInput,
   WorkspaceCloner,
@@ -358,8 +360,9 @@ export {
   createReviewSessionHost,
   createFixSessionHost,
   createRunnerEscalation,
+  createRunnerFinalizer,
 } from "./container/in-container-session";
-export type { GitClonerConfig, RunGit, RunGh, RunnerEscalationConfig } from "./container/in-container-session";
+export type { GitClonerConfig, RunGit, RunGh, RunnerEscalationConfig, RunnerFinalizerConfig } from "./container/in-container-session";
 // The `ralph onboard` skill cores: detect the toolchain, scaffold the .ralph/ contract, run the
 // smoke-test acceptance gate (ADR-0038, #192). The skill drives these via the `ralph-onboard` bin.
 export { detectToolchain, fsRepoFacts } from "./onboard/detect";

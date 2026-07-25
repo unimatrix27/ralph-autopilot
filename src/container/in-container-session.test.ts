@@ -12,14 +12,17 @@ import {
   createGitCloner,
   createImplSessionHost,
   createReviewSessionHost,
+  createRunnerFinalizer,
   readContainerRoute,
   resolveZaiEndpoint,
   structuredBackendForRoute,
   withModelOverride,
   withProfileOverride,
   type EnvReader,
+  type RunGh,
   type RunGit,
 } from "./in-container-session";
+import { buildLaunchMarker } from "../github/marker";
 import type { Assignment } from "./assignment";
 import { MODEL_ENV_VAR, PROVIDER_ENV_VAR, ZAI_TOKEN_ENV_NAME_VAR } from "./docker-runner";
 import { parseConfig, resolveTargets } from "../config/load";
@@ -403,5 +406,118 @@ describe("withProfileOverride (issue #278)", () => {
     const c = config();
     expect(withProfileOverride(c, undefined)).toBe(c);
     expect(withProfileOverride(c, {})).toBe(c);
+  });
+});
+
+describe("createRunnerFinalizer — salvage a clean session that opened no PR (issue #3061)", () => {
+  const assignment: Assignment = {
+    issueNumber: 3061,
+    mode: "tdd",
+    branch: "ralph/3061-fix",
+    base: "main",
+    prompt: "implement issue #3061",
+  };
+
+  /**
+   * A scripted git + gh runner: each returns per-command output (matched on the subcommand /
+   * an arg substring) and records every invocation so a test can assert what ran.
+   */
+  function scripted(script: { git?: (args: string[]) => string; gh?: (args: string[]) => string }) {
+    const gitCalls: string[][] = [];
+    const ghCalls: string[][] = [];
+    const runGit: RunGit = (args) => {
+      gitCalls.push(args);
+      return script.git?.(args) ?? "";
+    };
+    const runGh: RunGh = (args) => {
+      ghCalls.push(args);
+      return script.gh?.(args) ?? "";
+    };
+    return { gitCalls, ghCalls, runGit, runGh };
+  }
+
+  const ranGit = (calls: string[][], sub: string): boolean => calls.some((a) => a[0] === sub);
+
+  it("no-ops when the agent already opened a PR (nothing to salvage)", async () => {
+    const { gitCalls, ghCalls, runGit, runGh } = scripted({
+      gh: (a) => (a[0] === "pr" && a[1] === "list" ? "42" : ""),
+    });
+    const pr = await createRunnerFinalizer({ repo: "acme/widgets", runGit, runGh }).finalizeNoPr({
+      assignment,
+      workspacePath: "/ws",
+    });
+    expect(pr).toBeNull();
+    // No mutation: no commit, no push, no PR create.
+    expect(ranGit(gitCalls, "commit")).toBe(false);
+    expect(ranGit(gitCalls, "push")).toBe(false);
+    expect(ghCalls.some((a) => a[0] === "pr" && a[1] === "create")).toBe(false);
+  });
+
+  it("commits uncommitted work, pushes, and opens a PR carrying Closes + the launch marker", async () => {
+    let prCreateBody = "";
+    const { gitCalls, ghCalls, runGit, runGh } = scripted({
+      git: (a) => {
+        if (a[0] === "status") return " M src/Fix.cs\n"; // dirty tree
+        if (a[0] === "diff") return "src/Fix.cs\n"; // net diff vs base
+        return "";
+      },
+      gh: (a) => {
+        if (a[0] === "pr" && a[1] === "list") return ""; // no existing PR
+        if (a[0] === "pr" && a[1] === "create") {
+          prCreateBody = a[a.indexOf("--body") + 1] ?? "";
+          return "https://github.com/acme/widgets/pull/99\n";
+        }
+        return "";
+      },
+    });
+    const pr = await createRunnerFinalizer({ repo: "acme/widgets", runGit, runGh }).finalizeNoPr({
+      assignment,
+      workspacePath: "/ws",
+    });
+    expect(pr).toBe(99);
+    // It committed the outstanding edits, then pushed the branch.
+    expect(ranGit(gitCalls, "add")).toBe(true);
+    expect(ranGit(gitCalls, "commit")).toBe(true);
+    expect(ranGit(gitCalls, "push")).toBe(true);
+    // The PR body carries the Closes line + the exact launch marker the review loop keys on.
+    expect(prCreateBody).toContain("Closes #3061");
+    expect(prCreateBody).toContain(buildLaunchMarker({ issueNumber: 3061, branch: "ralph/3061-fix" }));
+  });
+
+  it("pushes + opens a PR without committing when the tree is clean but has commits ahead of base", async () => {
+    const { gitCalls, runGit, runGh } = scripted({
+      git: (a) => {
+        if (a[0] === "status") return ""; // clean tree
+        if (a[0] === "diff") return "src/a.ts\n"; // but real net diff (committed work)
+        return "";
+      },
+      gh: (a) =>
+        a[0] === "pr" && a[1] === "list" ? "" : a[0] === "pr" && a[1] === "create" ? "https://github.com/acme/widgets/pull/7\n" : "",
+    });
+    const pr = await createRunnerFinalizer({ repo: "acme/widgets", runGit, runGh }).finalizeNoPr({
+      assignment,
+      workspacePath: "/ws",
+    });
+    expect(pr).toBe(7);
+    expect(ranGit(gitCalls, "commit")).toBe(false); // nothing to commit
+    expect(ranGit(gitCalls, "push")).toBe(true);
+  });
+
+  it("refuses to open an empty PR when the branch has no net diff vs base (the agent did nothing)", async () => {
+    const { gitCalls, ghCalls, runGit, runGh } = scripted({
+      git: (a) => {
+        if (a[0] === "status") return ""; // clean
+        if (a[0] === "diff") return ""; // no net diff → nothing to salvage
+        return "";
+      },
+      gh: (a) => (a[0] === "pr" && a[1] === "list" ? "" : ""),
+    });
+    const pr = await createRunnerFinalizer({ repo: "acme/widgets", runGit, runGh }).finalizeNoPr({
+      assignment,
+      workspacePath: "/ws",
+    });
+    expect(pr).toBeNull();
+    expect(ranGit(gitCalls, "push")).toBe(false);
+    expect(ghCalls.some((a) => a[0] === "pr" && a[1] === "create")).toBe(false);
   });
 });

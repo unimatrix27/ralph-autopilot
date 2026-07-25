@@ -28,6 +28,7 @@ import type { SessionBackend } from "../providers/backend";
 import type { RateLimitSignal } from "../core/usage";
 import type { TranscriptSink } from "../executor/transcript-sink";
 import { buildEscalationDraftPr, formatRalphQuestion, type EscalationQuestion } from "../review/escalation";
+import { buildLaunchMarker } from "../github/marker";
 import { REVIEW_SYSTEM_APPEND } from "../review/prompts";
 import { fixOutcomeSchema } from "../review/structured";
 import { parseWorklist } from "../review/worklist";
@@ -35,7 +36,7 @@ import type { FixOutcome } from "../review/agents";
 import type { ProviderName, TargetConfig } from "../config/schema";
 import type { Assignment, SessionProfile } from "./assignment";
 import { CONTAINER_CODEX_HOME, MODEL_ENV_VAR, PROVIDER_ENV_VAR, ZAI_TOKEN_ENV_NAME_VAR } from "./docker-runner";
-import type { FixSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
+import type { FixSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerFinalizeInput, RunnerFinalizer, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
 
 /**
  * Run a git subcommand in `cwd`, returning stdout (throws with stderr on a non-zero exit).
@@ -579,4 +580,104 @@ function ensureDraftPr(
     // pipe-relayed prNumber is optional, so a missing draft PR is non-fatal.
     return undefined;
   }
+}
+
+/** What {@link createRunnerFinalizer} needs to salvage a no-PR clean session from the container. */
+export interface RunnerFinalizerConfig {
+  /** The `owner/repo` the container works. */
+  repo: string;
+  /** GitHub host (default `github.com`); overridable for GHE. */
+  host?: string;
+  /** Override the git runner (tests). */
+  runGit?: RunGit;
+  /** Override the `gh` runner (tests); returns the command's stdout. */
+  runGh?: RunGh;
+}
+
+/**
+ * A {@link RunnerFinalizer} that salvages a clean impl session which opened no PR (issue #3061),
+ * **runner-direct** from inside the container. Auth rides the same channels the escalation path
+ * uses — the cloned origin remote already carries the token (so `git push` needs no re-auth) and
+ * `gh` reads `GH_TOKEN` from the container env — so this config needs no token of its own.
+ *
+ * The salvage is deliberately conservative, gated in this order:
+ *   1. If a PR already exists for the branch, the agent opened one — nothing to salvage (`null`).
+ *   2. Commit any uncommitted changes (the classic case: edits applied via the SDK but the
+ *      session ended before `git commit`).
+ *   3. Refuse to open an empty PR: if the branch has **no net diff vs base** (the agent did
+ *      nothing, or reverted its own work), return `null` — the #241 data-loss guard's spirit,
+ *      and the true no-op the daemon's finished-without-a-PR card is meant to surface.
+ *   4. Push the branch and open the PR carrying `Closes #<n>` + the launch marker the review
+ *      loop keys on, so the daemon picks it up through its normal reconcile.
+ *
+ * Shells `git`/`gh`, so it is smoke-tested in a real container; the runner's decision to call it
+ * (clean terminal only) is unit-tested against a fake in `runner.test.ts`.
+ */
+export function createRunnerFinalizer(config: RunnerFinalizerConfig): RunnerFinalizer {
+  const runGit = config.runGit ?? realGit;
+  const runGh = config.runGh ?? realGh;
+  const host = config.host ?? "github.com";
+  return {
+    async finalizeNoPr(input: RunnerFinalizeInput): Promise<number | null> {
+      const { assignment, workspacePath } = input;
+      // 1. The agent already opened a PR → the happy path, nothing to salvage.
+      const existing = runGh([
+        "pr",
+        "list",
+        "--repo",
+        config.repo,
+        "--head",
+        assignment.branch,
+        "--state",
+        "open",
+        "--json",
+        "number",
+        "--jq",
+        ".[0].number // empty",
+      ]).trim();
+      if (existing !== "") {
+        return null;
+      }
+      // 2. Commit anything uncommitted — the #3061 case: edits applied, session ended pre-commit.
+      if (runGit(["status", "--porcelain"], workspacePath).trim() !== "") {
+        runGit(["add", "-A"], workspacePath);
+        runGit(["commit", "-m", `#${assignment.issueNumber}: implementation (recovered by runner)`], workspacePath);
+      }
+      // 3. Refuse an empty PR (#241's spirit): a `--single-branch` clone has no `origin/<base>`
+      //    tracking ref, and base may have moved, so fetch it explicitly, then require a net diff.
+      runGit(["fetch", "origin", `${assignment.base}:refs/remotes/origin/${assignment.base}`], workspacePath);
+      if (runGit(["diff", "--name-only", `origin/${assignment.base}...HEAD`], workspacePath).trim() === "") {
+        return null;
+      }
+      // 4. Push + open the PR runner-direct, carrying the Closes line and the launch marker the
+      //    review loop keys on so the daemon adopts it through its normal reconcile.
+      runGit(["push", "--set-upstream", "origin", assignment.branch], workspacePath);
+      const marker = buildLaunchMarker({ issueNumber: assignment.issueNumber, branch: assignment.branch });
+      const body = [
+        `Closes #${assignment.issueNumber}`,
+        "",
+        "_Recovered by the runner: the implementation session ended before opening a PR, so its" +
+          " committed work is published here for the normal review + merge flow (issue #3061)._",
+        "",
+        marker,
+      ].join("\n");
+      const out = runGh([
+        "pr",
+        "create",
+        "--repo",
+        config.repo,
+        "--head",
+        assignment.branch,
+        "--base",
+        assignment.base,
+        "--title",
+        `#${assignment.issueNumber}: implementation (recovered)`,
+        "--body",
+        body,
+      ]);
+      const match = out.trim().match(new RegExp(`${host.replace(/\./g, "\\.")}/.+/pull/(\\d+)`));
+      // The PR landed even if the URL did not parse; the daemon reads it back either way.
+      return match ? Number(match[1]) : null;
+    },
+  };
 }
