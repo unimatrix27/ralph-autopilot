@@ -73,6 +73,12 @@ describe("buildImplPrompt — mode routing (AC4)", () => {
       expect(prompt).toContain("ScheduleWakeup");
       // Commit + push before stopping, or the run is lost with no PR.
       expect(lower).toContain("commit and push before you stop");
+      // The auto-background trap (the second #3061 failure): the harness backgrounds long
+      // commands unasked, and Monitor/wakeup events never fire — poll the output file instead,
+      // and if the broad suite can't finish in-session, PR anyway (CI is the authoritative gate).
+      expect(lower).toContain("poll");
+      expect(lower).toContain("monitor");
+      expect(lower).toContain("ci gate");
     }
   });
 });
@@ -86,6 +92,19 @@ describe("SYSTEM_APPEND — binding rules", () => {
     // Names the exact consequence so the model weights it: uncommitted work → lost run.
     expect(lower).toContain("committed and pushed");
     expect(lower).toContain("agent-stuck");
+  });
+
+  it("adds the auto-background trap rule (distrust Monitor/wakeup promises; poll; PR anyway)", () => {
+    const lower = SYSTEM_APPEND.toLowerCase();
+    // The harness backgrounds long commands unasked…
+    expect(lower).toContain("against your will");
+    // …its notification promises are lies in this session…
+    expect(SYSTEM_APPEND).toContain("Monitor");
+    expect(lower).toContain("never arrive");
+    // …so poll the output file in the foreground…
+    expect(lower).toContain("poll");
+    // …and if the broad suite can't finish, PR anyway — CI is the authoritative gate.
+    expect(lower).toContain("ci gate");
   });
 });
 
