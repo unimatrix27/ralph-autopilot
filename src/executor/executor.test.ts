@@ -346,6 +346,41 @@ describe("Executor", () => {
     expect(stuckEvent?.data).toMatchObject({ category: "wall-clock" });
   });
 
+  it("terminalizes a clean session that opened no PR as an explained agent-stuck (no orphan-sweep bare label)", async () => {
+    github.seed({ number: 6, title: "Hardening" });
+    // The impl session finishes cleanly (ok, not escalate/stuck/error) but opens no PR —
+    // the backgrounded-build-then-stop trap: work uncommitted/unpushed, nothing landed.
+    const noPr = { async run() {
+      return { ok: true, escalated: false, stuck: null };
+    } };
+    let reviewRan = false;
+    const reviewLoop = { async run() {
+      reviewRan = true;
+      return { kind: "merged" as const };
+    } };
+    const ex = new Executor({ store, github, worktrees, agentRunner: noPr as never, logger: silent, reviewLoop: reviewLoop as never });
+
+    const result = await ex.run({ issue: github.issues.get(6)!, mode: "tdd" });
+
+    // No PR, no review, worktree cleaned.
+    expect(result.prNumber).toBeNull();
+    expect(reviewRan).toBe(false);
+    expect(await github.findPullRequestForBranch("ralph/6-hardening")).toBeNull();
+    expect(worktrees.removed).toContain(result.worktreePath);
+
+    // Terminalized INLINE (status agent-stuck, span ended) — not left `running` for the
+    // next-tick generic orphan sweep. The reconciler diff projects the label from the status.
+    const run = store.getRunByIssue(6)!;
+    expect(run.status).toBe("agent-stuck");
+    expect(github.addedLabels.some((l) => l.label === LABEL_AGENT_STUCK)).toBe(false);
+
+    // The terminal is self-explaining on the issue: a healable no-PR stuck-card comment.
+    const body = (github.comments.get(6) ?? [])[0]?.body ?? "";
+    expect(body.toLowerCase()).toContain("no pull request");
+    // Logged for live views.
+    expect(store.tailLog(run.id).some((e) => e.event === "agent-no-pr")).toBe(true);
+  });
+
   it("does not run the review loop on a stuck terminal", async () => {
     github.seed({ number: 6, title: "Hardening" });
     const stuck = new StuckAgentRunner({ category: "futility", reason: "cannot be done as scoped" });

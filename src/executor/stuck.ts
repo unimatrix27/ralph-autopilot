@@ -110,6 +110,76 @@ export async function recordAgentStuck(
 }
 
 /**
+ * Render the stuck-card for a session that ended **cleanly but opened no PR** (the
+ * no-PR terminal). The impl agent returned a non-error, non-escalate, non-stuck
+ * result — yet no pull request exists on its branch and its workspace is gone, so
+ * nothing was implemented. The dominant cause is a single-shot session that launched
+ * a long build/test in the background and ended before it finished (and before
+ * committing): the run is never re-invoked when the backgrounded job completes, so
+ * the work is lost. This is distinct from a crash-orphan (the session finished; it
+ * just produced nothing), so it earns its own self-explaining card rather than the
+ * bare, next-tick `agent-stuck` the generic orphan sweep would apply. It reuses
+ * {@link STUCK_CARD_FEATURE} so the heal path (#86) treats an answered card exactly
+ * like any other stuck-heal — the operator's answer re-admits a fresh run.
+ */
+export function buildNoPrCardQuestion(): EscalationQuestion {
+  return {
+    headline: "Agent finished without opening a PR",
+    feature: STUCK_CARD_FEATURE,
+    whereWeStand: [
+      "The implementation session ended cleanly — no escalate, no self-stop, no error — but opened no",
+      "pull request, and its workspace has been discarded, so nothing was implemented or merged.",
+      "",
+      "The usual cause: the session launched a long build/test in the background and then ended before it",
+      "finished (and before committing). A single-shot run is not re-invoked when a backgrounded job",
+      "completes, so the work is lost. The impl prompt's foreground/commit-before-stop contract targets",
+      "exactly this; a re-admitted run should not repeat it.",
+    ].join("\n"),
+    decision: "How should this run be resolved?",
+    options: [
+      "Re-enable the run (re-label `ready-for-agent`) to retry from a clean start",
+      "Provide guidance and re-enable the run (heal) so the retry has it injected",
+      "Close the issue",
+    ],
+    stakes:
+      "No pull request was opened — nothing landed. The issue is parked on `agent-stuck` for a human, " +
+      "and the daemon will not pick it up again on its own.",
+    recommendation:
+      "This is usually transient — re-label `ready-for-agent` to retry. If it recurs on the same issue, " +
+      "read the run's transcript for what the session did before it stopped.",
+  };
+}
+
+/**
+ * Record a **finished-without-a-PR** terminal against GitHub and the store — the
+ * clean-session-no-PR counterpart of {@link recordAgentStuck}. Posts the
+ * self-explaining {@link buildNoPrCardQuestion} card, then marks the run
+ * `agent-stuck` (the `RunStuck` status the reconciler diff projects the label from,
+ * ADR-0027) and closes the run span. Terminalizing inline here — rather than leaving
+ * the row `running` for the next-tick orphan sweep — makes the terminal immediate and
+ * self-explaining, and keeps the orphan sweep for genuine crashes (a `running` row
+ * with no live agent), not clean finishes. No PR is recorded; the caller tears the
+ * worktree down in its `finally`.
+ */
+export async function recordFinishedWithoutPr(
+  store: ScopedStore,
+  github: GitHubClient,
+  input: { issueNumber: number; runId: number },
+): Promise<void> {
+  const { issueNumber, runId } = input;
+  await github.postComment(issueNumber, formatRalphQuestion(buildNoPrCardQuestion()));
+  await store.recordRunStuck({ runId, issueNumber, reason: "" });
+  await store.recordRunEnded({ runId, issueNumber, outcome: "stuck" });
+  store.appendLog({
+    runId,
+    issueNumber,
+    level: "warn",
+    event: "agent-no-pr",
+    data: {},
+  });
+}
+
+/**
  * Whether a parsed `ralph-question` is a stuck-card (versus an escalate or
  * review-maxed heal-card) — it carries {@link STUCK_CARD_FEATURE}. Used by the heal
  * re-admission path (#86) to tell an answered stuck-card (re-admit a fresh run with

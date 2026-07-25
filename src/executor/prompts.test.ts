@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseConfig, resolveTargets } from "../config/load";
 import type { Issue } from "../github/types";
-import { buildImplPrompt } from "./prompts";
+import { buildImplPrompt, SYSTEM_APPEND } from "./prompts";
 import { buildStuckCardQuestion } from "./stuck";
 import type { StuckHealGuidance } from "../hitl/heal-readmit";
 
@@ -60,6 +60,32 @@ describe("buildImplPrompt — mode routing (AC4)", () => {
       expect(prompt.toLowerCase()).toContain("escalate");
       expect(prompt.toLowerCase()).toContain("stuck");
     }
+  });
+
+  it("every impl prompt carries the single-shot finalization contract: foreground verify + commit-before-stop", () => {
+    for (const mode of ["tdd", "infra", "ui"] as const) {
+      const prompt = buildImplPrompt(issue, mode, "ralph/6-x", config);
+      const lower = prompt.toLowerCase();
+      // Run verification in the foreground; never background a long command and end.
+      expect(lower).toContain("foreground");
+      expect(lower).toContain("background");
+      // The trap named explicitly: no re-invocation on completion; ScheduleWakeup is inert.
+      expect(prompt).toContain("ScheduleWakeup");
+      // Commit + push before stopping, or the run is lost with no PR.
+      expect(lower).toContain("commit and push before you stop");
+    }
+  });
+});
+
+describe("SYSTEM_APPEND — binding rules", () => {
+  it("adds the single-shot finalization rule (foreground verify, commit/push before ending)", () => {
+    const lower = SYSTEM_APPEND.toLowerCase();
+    expect(lower).toContain("single-shot");
+    expect(lower).toContain("foreground");
+    expect(SYSTEM_APPEND).toContain("ScheduleWakeup");
+    // Names the exact consequence so the model weights it: uncommitted work → lost run.
+    expect(lower).toContain("committed and pushed");
+    expect(lower).toContain("agent-stuck");
   });
 });
 
