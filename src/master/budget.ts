@@ -124,6 +124,45 @@ export function resumeAttempt(history: MasterHistory): MasterInterventionRecord 
 }
 
 /**
+ * The verdict for **re-adopting an already-open attempt** — a daemon that died mid-session, or a
+ * human answer resuming a checkpointed master.
+ *
+ * Re-adopting spends no fresh budget (that is the whole point), but it must inherit the *same*
+ * constraints a fresh attempt at that number would have carried. Getting this wrong is a real
+ * loop: attempt 1 tries `retry-pipeline` on signature X, the pipeline fails with the same X,
+ * attempt 2 starts, the daemon crashes, and the re-adopted attempt 2 — told the signature is
+ * fresh — proposes `retry-pipeline` again. So the verdict is computed by evaluating the ordinary
+ * rule against the history **with this attempt removed**, then pinning the attempt number back.
+ *
+ * `humanResumed` additionally forbids `ask-human`: an answered question that could ask again is
+ * the one loop a human in the middle would otherwise make unbounded.
+ */
+export function readoptedAttemptBudget(
+  history: MasterHistory,
+  open: MasterInterventionRecord,
+  humanResumed: boolean,
+): MasterBudgetVerdict {
+  const without: MasterHistory = {
+    ...history,
+    interventions: history.interventions.filter((i) => i !== open),
+  };
+  const base = evaluateMasterBudget({ history: without, phase: open.phase, signature: open.signature });
+  const inherited = base.allowed ? base.forbiddenResolutions : [...AUTONOMOUS_RESOLUTIONS];
+  const forbiddenResolutions = humanResumed ? [...new Set([...inherited, "ask-human" as const])] : inherited;
+  return {
+    // An attempt that is already open is never refused — refusing it would strand the run in
+    // `master-triage` with no session and no terminal. Its *resolutions* are constrained instead.
+    allowed: true,
+    attempt: open.attempt,
+    spent: open.attempt - 1,
+    remaining: Math.max(0, MAX_MASTER_INTERVENTIONS_PER_PHASE - open.attempt),
+    repeatedSignature: base.allowed ? base.repeatedSignature : true,
+    forbiddenResolutions,
+    finalAttempt: open.attempt >= MAX_MASTER_INTERVENTIONS_PER_PHASE,
+  };
+}
+
+/**
  * Whether a chosen resolution is permissible under a verdict. The engine calls this on the
  * master's answer: a forbidden repeat is coerced to final adjudication rather than executed,
  * so "repeated signatures cannot repeat an identical resolution even when head SHA changed"

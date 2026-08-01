@@ -31,7 +31,12 @@ import { appendDecision, readDecisionLedger } from "../ledger/ledger";
 import { syncDecisionIndex } from "../ledger/index-comment";
 import type { DecisionRecord } from "../ledger/decision";
 import { formatRalphQuestion, type EscalationQuestion } from "../review/escalation";
-import { evaluateMasterBudget, resolutionAllowed, type MasterBudgetVerdict } from "./budget";
+import {
+  evaluateMasterBudget,
+  readoptedAttemptBudget,
+  resolutionAllowed,
+  type MasterBudgetVerdict,
+} from "./budget";
 import {
   assembleMasterContext,
   hasActiveDecisionFor,
@@ -279,19 +284,11 @@ export class MasterEngine {
     // A crash between `MasterInterventionStarted` and its outcome re-adopts THAT attempt.
     const phase = open?.phase ?? request.phase;
     const signature = open?.signature ?? request.signature;
+    // Re-adopting an open attempt spends no fresh budget but inherits every constraint a fresh
+    // attempt at that number would carry — including a repeated signature the crash interrupted
+    // (see `readoptedAttemptBudget`). A human-resumed attempt additionally may not ask again.
     const budget: MasterBudgetVerdict = open
-      ? {
-          allowed: true,
-          attempt: open.attempt,
-          spent: open.attempt - 1,
-          remaining: 0,
-          repeatedSignature: false,
-          // A human-resumed master may not ask again: ask → answer → ask is the one loop a
-          // human in the middle would otherwise make unbounded. It must conclude, redispatch,
-          // retry, or stop.
-          forbiddenResolutions: resumedAttempt ? ["ask-human"] : [],
-          finalAttempt: true,
-        }
+      ? readoptedAttemptBudget(history, open, resumedAttempt !== null)
       : evaluateMasterBudget({ history, phase, signature });
 
     if (!budget.allowed) {

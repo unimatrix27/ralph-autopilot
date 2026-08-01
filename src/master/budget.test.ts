@@ -3,6 +3,7 @@ import type { RecordedStreamEvent } from "../store/event-log";
 import {
   evaluateMasterBudget,
   MAX_MASTER_INTERVENTIONS_PER_PHASE,
+  readoptedAttemptBudget,
   resolutionAllowed,
   resumeAttempt,
 } from "./budget";
@@ -134,5 +135,66 @@ describe("master loop budget (ADR-0041)", () => {
     ]);
     const verdict = evaluateMasterBudget({ history, phase: "impl", signature: "s1" });
     expect(verdict.allowed && verdict.forbiddenResolutions).toEqual([]);
+  });
+
+  it("a crash-resumed attempt inherits the repeated-signature constraint it was interrupted mid-way through", () => {
+    // Attempt 1 tried `retry-pipeline` on signature s1; the pipeline failed with the SAME
+    // signature; attempt 2 started and the daemon died before it decided. Re-adopting attempt 2
+    // must NOT be told the signature is fresh — that is exactly how the loop this budget exists
+    // to prevent gets back in.
+    const history = foldMasterHistory([
+      started(),
+      requested("s1"),
+      ...intervention(1, "s1", "retry-pipeline"),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 2, phase: "impl", signature: "s1" }),
+    ]);
+    const open = resumeAttempt(history)!;
+    const verdict = readoptedAttemptBudget(history, open, false);
+
+    expect(verdict).toMatchObject({ allowed: true, attempt: 2, repeatedSignature: true, finalAttempt: true });
+    expect(verdict.allowed && verdict.forbiddenResolutions).toEqual(["retry-pipeline"]);
+    expect(resolutionAllowed(verdict, "retry-pipeline")).toBe(false);
+    expect(resolutionAllowed(verdict, "ask-human")).toBe(true);
+  });
+
+  it("a crash-resumed attempt on a FRESH signature stays unconstrained", () => {
+    const history = foldMasterHistory([
+      started(),
+      ...intervention(1, "s1", "retry-pipeline"),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 2, phase: "impl", signature: "different" }),
+    ]);
+    const verdict = readoptedAttemptBudget(history, resumeAttempt(history)!, false);
+    expect(verdict).toMatchObject({ repeatedSignature: false });
+    expect(verdict.allowed && verdict.forbiddenResolutions).toEqual([]);
+  });
+
+  it("a HUMAN-resumed attempt may not ask again, on top of whatever it already inherited", () => {
+    const history = foldMasterHistory([
+      started(),
+      ...intervention(1, "s1", "retry-pipeline"),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 2, phase: "impl", signature: "s1" }),
+      ev("MasterHumanQuestionRequested", { runId: "r1", attempt: 2, phase: "impl", headline: "h" }),
+    ]);
+    const open = history.interventions.find((i) => i.attempt === 2)!;
+    const verdict = readoptedAttemptBudget(history, open, true);
+    expect(verdict.allowed && verdict.forbiddenResolutions.sort()).toEqual(["ask-human", "retry-pipeline"]);
+    expect(resolutionAllowed(verdict, "terminal-stuck")).toBe(true);
+  });
+
+  it("never refuses an already-open attempt — it constrains its resolutions instead", () => {
+    // Pathological: two completed attempts AND an open third (a state the engine cannot
+    // produce, but the fold must survive). Refusing would strand the run with no session and
+    // no terminal, so the attempt runs under final-adjudication-only constraints.
+    const history = foldMasterHistory([
+      started(),
+      ...intervention(1, "s1", "retry-pipeline"),
+      ...intervention(2, "s1", "redispatch-tier-1"),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 3, phase: "impl", signature: "s1" }),
+    ]);
+    const verdict = readoptedAttemptBudget(history, resumeAttempt(history)!, false);
+    expect(verdict.allowed).toBe(true);
+    expect(resolutionAllowed(verdict, "retry-pipeline")).toBe(false);
+    expect(resolutionAllowed(verdict, "ask-human")).toBe(true);
+    expect(resolutionAllowed(verdict, "terminal-stuck")).toBe(true);
   });
 });

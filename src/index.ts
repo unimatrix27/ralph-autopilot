@@ -977,6 +977,7 @@ export {
   evaluateMasterBudget,
   FINAL_ADJUDICATION_RESOLUTIONS,
   MAX_MASTER_INTERVENTIONS_PER_PHASE,
+  readoptedAttemptBudget,
   resolutionAllowed,
   resumeAttempt,
 } from "./master/budget";
