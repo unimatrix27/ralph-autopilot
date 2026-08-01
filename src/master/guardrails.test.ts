@@ -4,6 +4,8 @@ import {
   MASTER_WITHHELD_CAPABILITIES,
   type MasterGuardrailContext,
 } from "./guardrails";
+import { createMasterSessionHost } from "../container/in-container-session";
+import { parseConfig, resolveTargets } from "../config/load";
 
 const ctx: MasterGuardrailContext = { branch: "ralph/42-master" };
 const inspect = (cmd: string) => inspectMasterCommand(cmd, ctx);
@@ -118,5 +120,74 @@ describe("master harness invariants (ADR-0041)", () => {
 
   it("never hands the master the daemon-held merge/close capabilities", () => {
     expect(MASTER_WITHHELD_CAPABILITIES).toEqual(["mergePullRequest", "closeIssue", "closePullRequest"]);
+  });
+});
+
+describe("the master session actually carries the guardrails (not just the pure function)", () => {
+  it("wires the master hook ON TOP of the always-on git guardrails, keyed to the issue branch", async () => {
+    const config = resolveTargets(
+      parseConfig({ targets: [{ repo: "acme/widgets", commands: { build: "b", test: "t" } }] }),
+    )[0]!;
+    let seenOptions: { hooks?: { PreToolUse?: unknown[] } } | undefined;
+    const queryFn = ((input: { options: unknown }) => {
+      seenOptions = input.options as typeof seenOptions;
+      return (async function* () {
+        yield {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          num_turns: 1,
+          result: JSON.stringify({
+            outcome: {
+              resolution: "terminal-stuck",
+              conclusion: "c",
+              rationale: "r",
+              reason: "why",
+            },
+            decisions: [],
+          }),
+        };
+      })();
+    }) as never;
+
+    const host = createMasterSessionHost(config, { provider: "claude" }, { queryFn });
+    const result = await host.adjudicate({
+      assignment: {
+        kind: "master",
+        issueNumber: 42,
+        mode: "tdd",
+        branch: "ralph/42-master",
+        base: "main",
+        prompt: "adjudicate",
+      },
+      workspacePath: "/w",
+      transcriptSink: { capture: () => {}, flush: async () => {} },
+    });
+
+    expect(result.outcome.resolution).toBe("terminal-stuck");
+    // Two PreToolUse hooks: the shared git guardrails FIRST, then the master invariants.
+    const hooks = seenOptions?.hooks?.PreToolUse ?? [];
+    expect(hooks).toHaveLength(2);
+
+    // Drive the second hook directly: it must deny a merge, and allow a push of THIS branch.
+    const masterHook = hooks[1] as { hooks: Array<(i: unknown) => Promise<Record<string, unknown>>> };
+    const fire = (command: string) =>
+      masterHook.hooks[0]!({
+        hook_event_name: "PreToolUse",
+        tool_name: "Bash",
+        tool_input: { command },
+      });
+
+    const denied = (await fire("gh pr merge 12 --squash")) as {
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+    };
+    expect(denied.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(denied.hookSpecificOutput?.permissionDecisionReason).toContain("no-merge-or-close");
+
+    expect(await fire("git push origin ralph/42-master")).toEqual({});
+    const wrongBranch = (await fire("git push origin ralph/41-other")) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    expect(wrongBranch.hookSpecificOutput?.permissionDecision).toBe("deny");
   });
 });

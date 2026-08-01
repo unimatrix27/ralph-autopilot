@@ -38,6 +38,7 @@ import type { Assignment, SessionProfile } from "./assignment";
 import { CONTAINER_CODEX_HOME, MODEL_ENV_VAR, PROVIDER_ENV_VAR, ZAI_TOKEN_ENV_NAME_VAR } from "./docker-runner";
 import { MASTER_SYSTEM_APPEND } from "../master/prompt";
 import { parseMasterSessionResult } from "../master/outcome";
+import { createMasterGuardrailsHook } from "../master/guardrails";
 import type { FixSessionHost, MasterSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerFinalizeInput, RunnerFinalizer, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
 
 /**
@@ -414,6 +415,11 @@ export function createMasterSessionHost(
           prompt: input.assignment.prompt,
           worktreePath: input.workspacePath,
           systemAppend: MASTER_SYSTEM_APPEND,
+          // The harness invariants, layered ON TOP of the always-on git guardrails: no merge
+          // or close, no CI bypass, no branch but this issue's, no host/supervisor control
+          // (ADR-0041). Advisory like every PreToolUse hook — the real boundary is that the
+          // daemon simply never hands a master session `mergePullRequest` / `closeIssue`.
+          extraHooks: [createMasterGuardrailsHook({ branch: input.assignment.branch })],
         },
         (text) => parseMasterSessionResult(extractJsonObject(text)),
       );
