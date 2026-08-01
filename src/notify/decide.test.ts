@@ -199,3 +199,61 @@ describe("decideNotifications — severity + title shape", () => {
     });
   }
 });
+
+describe("decideNotifications — triage cutover (ADR-0042)", () => {
+  // ADR-0042 deliverable: "Notifications fire for awaiting-answer, a terminal MasterStuck, or a
+  // genuine operator-owned anomaly; never merely because triage began." Every harness-origin
+  // failure now commits its source fact in the SAME batch as the MasterTriageRequested that
+  // supersedes it — so the whole batch must be silent. Without these assertions the suite would
+  // stay green even if the masterTriageIssues guard were deleted (each source fact still notifies
+  // on its own), so this is the only regression protection for the cutover's core guarantee.
+
+  /** A MasterTriageRequested for STREAM's issue; `decide` reads only its type + stream id. */
+  function triageRequested(source: string, globalPosition: number): RecordedLogEvent {
+    return event(
+      STREAM,
+      "MasterTriageRequested",
+      { runId: "1", source, phase: "review-1", lane: "review", signature: "sig", headline: "queued for triage" },
+      globalPosition,
+    );
+  }
+
+  it("silences a ReviewMaxed superseded by a MasterTriageRequested in the same batch", () => {
+    const out = decideNotifications([
+      event(STREAM, "ReviewMaxed", { runId: "1", phase: 1 }, 1),
+      triageRequested("review-maxed", 2),
+    ]);
+    expect(out).toHaveLength(0);
+  });
+
+  it("silences a RunStuck superseded by a MasterTriageRequested in the same batch", () => {
+    const out = decideNotifications([
+      event(STREAM, "RunStuck", { runId: "1", reason: "fix-iterations exhausted" }, 1),
+      triageRequested("stuck", 2),
+    ]);
+    expect(out).toHaveLength(0);
+  });
+
+  it("silences an AnomalyDetected superseded by a MasterTriageRequested in the same batch", () => {
+    const out = decideNotifications([
+      event(STREAM, "AnomalyDetected", { reason: "island: open with no mode" }, 1),
+      triageRequested("anomaly", 2),
+    ]);
+    expect(out).toHaveLength(0);
+  });
+
+  it("never notifies on a lone MasterTriageRequested (a daemon-owned queue state)", () => {
+    expect(decideNotifications([triageRequested("review-maxed", 1)])).toHaveLength(0);
+  });
+
+  it("pages a stuck notification for a MasterStuck (the one terminal agent-stuck path)", () => {
+    // The sole post-cutover route to a terminal agent-stuck page: a completed master
+    // adjudication concluded nothing further helps. That IS operator attention.
+    const [n] = decideNotifications([
+      event(STREAM, "MasterStuck", { runId: "1", attempt: 2, reason: "nothing further helps" }),
+    ]);
+    expect(n).toMatchObject({ kind: "stuck", repo: "owner/repo", issueNumber: 42 });
+    expect(n!.severity).toBe("high");
+    expect(n!.message).toContain("nothing further helps");
+  });
+});
