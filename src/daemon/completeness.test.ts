@@ -36,6 +36,7 @@ const LABEL_SETS: Record<string, string[]> = {
   reviewMaxed: ["review-maxed", "afk", "mode:tdd"],
   awaitingCi: ["awaiting-ci", "afk", "mode:tdd"],
   awaitingMerge: ["awaiting-merge", "afk", "mode:tdd"],
+  masterTriage: ["master-triage", "afk", "mode:tdd", "complexity:1"],
   agentStuck: ["agent-stuck", "afk", "mode:tdd"],
   logIssue: ["ready-for-agent", "afk", "mode:tdd", "[log] milestone"],
   needsTriage: ["needs-triage"],
@@ -49,6 +50,7 @@ const RUN_STATUSES: Array<RunStatus | null> = [
   "review-maxed",
   "awaiting-ci",
   "awaiting-merge",
+  "master-triage",
   "agent-stuck",
   "merged",
   "closed",
@@ -115,8 +117,8 @@ describe("classifyIssueState — totality over the full matrix (AC3)", () => {
         expect(result.reason.length).toBeGreaterThan(0);
       }
     }
-    // 13 label sets × 9 statuses × 3 issue states × 2 in-flight × 2 resumable × 2 wedged × 2 answered.
-    expect(count).toBe(13 * 9 * 3 * 2 * 2 * 2 * 2);
+    // 14 label sets × 10 statuses × 3 issue states × 2 in-flight × 2 resumable × 2 wedged × 2 answered.
+    expect(count).toBe(14 * 10 * 3 * 2 * 2 * 2 * 2);
   });
 
   it("never lets a non-terminal run on a CLOSED or gone issue pass as a live state", () => {
@@ -373,6 +375,21 @@ describe("classifyIssueState — healthy states are not false-flagged (AC1)", ()
   it("an awaiting-merge run whose issue closed under it is a non-terminal-on-closed anomaly", () => {
     expect(
       classifyIssueState({ ...base, issueState: "CLOSED", labels: [], runStatus: "awaiting-merge" }),
+    ).toEqual({ kind: "anomaly", reason: "non-terminal-run-on-closed-issue" });
+  });
+
+  it("a master-triage run on an OPEN issue is IN-FLIGHT, never awaiting-human (ADR-0041)", () => {
+    // The master queue services it every tick, before fresh admission, on the ordinary cap.
+    // Classifying it as awaiting-human would page an operator for work the daemon is doing —
+    // the exact inversion this slice exists to remove.
+    expect(
+      classifyIssueState({ ...base, labels: LABEL_SETS.masterTriage, runStatus: "master-triage" }),
+    ).toEqual({ kind: "in-flight" });
+  });
+
+  it("a master-triage run whose issue closed under it is a non-terminal-on-closed anomaly", () => {
+    expect(
+      classifyIssueState({ ...base, issueState: "CLOSED", labels: [], runStatus: "master-triage" }),
     ).toEqual({ kind: "anomaly", reason: "non-terminal-run-on-closed-issue" });
   });
 

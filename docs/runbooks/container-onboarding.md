@@ -90,6 +90,15 @@ real-environment check the unit suite deliberately does not do ("no real images/
 ADR-0038). It is also the first stage gate for the flip — a target is **container-eligible only
 after a passing smoke-test** ([`container-flip.md`](container-flip.md)).
 
+The smoke-test also checks the image's **runner capability label**
+(`io.ralph.runner-capabilities`), which the target inherits from `ralph/agent-base`. It must
+include `master-escalation` (ADR-0041): under a master-capable daemon a worker `escalate` must be
+*relayed*, not published as a human question, and a runner that does not know that would page an
+operator for a decision the master was supposed to make. The daemon refuses such a dispatch
+pre-dispatch, so the failure belongs here — at onboarding — not mid-run. If it fails, rebuild the
+L0 base and bump the target's `FROM` pin
+([`container-image-refresh.md`](container-image-refresh.md)).
+
 > The `ralph onboard` Claude skill (legacy issue 192) automates §A/§B: detect the toolchain, scaffold the
 > `.ralph/` files from these templates, build the image, and run this smoke-test. The manual steps
 > above are the fallback and the source of truth for what the skill does.
@@ -98,5 +107,6 @@ after a passing smoke-test** ([`container-flip.md`](container-flip.md)).
 
 - The target carries a strict-zod-valid `.ralph/agent.yaml` + `.ralph/agent.Dockerfile` +
   `.ralph/.dockerignore`, committed to its own repo.
-- `./ops/smoke-test-agent-image.sh <target>` prints `SMOKE TEST PASSED` (clone → restore → test).
+- `./ops/smoke-test-agent-image.sh <target>` prints `SMOKE TEST PASSED` (capability label +
+  clone → restore → test).
 - The target is now **container-eligible** for the flip stage gate.
