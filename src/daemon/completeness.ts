@@ -87,6 +87,15 @@ export type AnomalyReason =
   | "answered-pause-stranded"
   /** A human-attention label with no run row to resume — rehydrate could not rebuild it. */
   | "paused-label-missing-run"
+  /**
+   * A queued master escalation the daemon **cannot route** (ADR-0041): the `agent.tiers["1"]`
+   * profile is missing, empty, or not tools-capable. Distinct from every other anomaly here
+   * because the fix is in `config.yaml`, not in the issue — and distinct from a `no-provider`
+   * *wait*, which resolves itself when a pool recovers. This one never resolves itself: without
+   * it the escalation would sit in a state the daemon reports as "in flight" forever, which is
+   * exactly the silent island the completeness invariant exists to make impossible.
+   */
+  | "master-route-unconfigured"
   /** A run status the code does not know (corrupt store / a future status) — fail visible. */
   | "unclassified";
 
@@ -143,6 +152,13 @@ export interface IssueSnapshot {
    * open, non-resumable runs); `false` everywhere else.
    */
   answered: boolean;
+  /**
+   * Whether a queued master escalation cannot be routed at all — the tier-1 profile is missing
+   * or not tools-capable (ADR-0041). Meaningful only for a `master-triage` run; the classifier
+   * ignores it otherwise. Resolved by the caller from the master engine's route check, so the
+   * classifier stays pure and config-free. `false` when master escalation is not wired.
+   */
+  masterUnroutable: boolean;
 }
 
 /**
@@ -257,9 +273,17 @@ export function classifyIssueState(s: IssueSnapshot): Classification {
       // here waits on an operator, and reporting it as attention would page a human for
       // work the daemon is actively doing. A closed issue under it is the same island as
       // any other non-terminal run — surfaced + swept.
-      return open
-        ? { kind: "in-flight" }
-        : { kind: "anomaly", reason: "non-terminal-run-on-closed-issue" };
+      //
+      // UNLESS the master cannot be routed at all: a missing / non-tools-capable tier-1
+      // profile is a configuration defect no tick will fix, so "the daemon is working on it"
+      // would be a lie that hides the escalation forever. That is the island, and it is
+      // surfaced with a reason naming the defect.
+      if (!open) {
+        return { kind: "anomaly", reason: "non-terminal-run-on-closed-issue" };
+      }
+      return s.masterUnroutable
+        ? { kind: "anomaly", reason: "master-route-unconfigured" }
+        : { kind: "in-flight" };
 
     case "awaiting-merge":
       // Queued for (or undergoing) the single-concurrency integration flow

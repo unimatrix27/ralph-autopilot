@@ -23,6 +23,7 @@ import { MasterEngine } from "./engine";
 import { MasterLease } from "./lease";
 import { foldMasterHistory } from "./history";
 import { formatMasterRequestComment } from "./request";
+import { formatRalphAnswer } from "../hitl/answer";
 import type { MasterSessionResult } from "./outcome";
 
 const silent = createLogger({ write: () => {} });
@@ -75,8 +76,10 @@ describe("master scheduling in the reconcile tick (ADR-0041)", () => {
   });
   afterEach(() => store.close());
 
-  function wire(opts: { cap?: number; sharedLease?: MasterLease } = {}) {
+  function wire(opts: { cap?: number; sharedLease?: MasterLease; tiers?: AgentSettings["tiers"] } = {}) {
     const cap = opts.cap ?? 5;
+    const routingFor = (): RoutingConfig =>
+      opts.tiers === undefined ? routing() : { agent: { ...agentSettings, tiers: opts.tiers }, providers };
     const worktrees = new FakeWorktreeManager();
     const runner = new PrOpeningAgentRunner(github);
     const executor = new Executor({ store, github, worktrees, agentRunner: runner, logger: silent });
@@ -89,7 +92,7 @@ describe("master scheduling in the reconcile tick (ADR-0041)", () => {
       logger: silent,
       targetRepo: REPO,
       baseBranch: "master",
-      routing,
+      routing: routingFor,
       routeWorld,
     });
     reconciler = new Reconciler({
@@ -276,6 +279,59 @@ describe("master scheduling in the reconcile tick (ADR-0041)", () => {
 
     expect(github.issues.get(3)!.labels).toContain(LABEL_MASTER_TRIAGE);
     expect(github.issues.get(3)!.labels).not.toContain("daemon-anomaly");
+  });
+
+  it("surfaces an unroutable tier 1 as a VISIBLE daemon-anomaly, not a silent in-flight", async () => {
+    await seedQueued(3, "queued master");
+    const { reconciler } = wire({ tiers: {} });
+
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+    // A second tick: the first dispatched (and refused); this one classifies the queued run.
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    expect(agent.sessions).toHaveLength(0);
+    expect(github.issues.get(3)!.labels).toContain("daemon-anomaly");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
+  });
+
+  it("routes an answered MASTER question back to the master, never to the worker", async () => {
+    await seedQueued(3, "queued master");
+    const question = {
+      headline: "Which contract is authoritative?",
+      feature: "Widget",
+      whereWeStand: "Two contracts disagree.",
+      decision: "Pick one.",
+      stakes: "Downstream consumers depend on it.",
+      recommendation: "Pick v2.",
+    };
+    agent.push({
+      outcome: {
+        resolution: "ask-human",
+        conclusion: "Only a human can pick.",
+        rationale: "Design authority is silent and the call is a product one.",
+        question,
+      },
+      decisions: [],
+    });
+    const { reconciler, runner } = wire();
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+    expect(store.getRunByIssue(3)!.status).toBe("awaiting-answer");
+
+    // The operator answers and re-arms, exactly as `ralph-answer` does.
+    await github.postComment(3, formatRalphAnswer({ kind: "free-text", text: "v2 is authoritative." }));
+    github.issues.get(3)!.labels.push("ready-for-agent");
+    agent.push(resolvedOutcome);
+
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    // The MASTER resumed (a second master session), and no worker impl run was launched.
+    expect(agent.sessions).toHaveLength(2);
+    expect(agent.sessions[1]!.prompt).toContain("v2 is authoritative.");
+    expect(runner.runs.map((r) => r.issue.number)).not.toContain(3);
   });
 
   describe("daemon restart", () => {

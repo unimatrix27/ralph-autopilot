@@ -755,6 +755,13 @@ export class Reconciler {
     if (!masterEngine || !masterLease) {
       return;
     }
+    // A configuration defect no tick can fix (missing / non-tools-capable tier 1) must not burn
+    // a slot on a dispatch that cannot succeed — and, crucially, must not hold the run in flight,
+    // which would mask it from the completeness pass as "the daemon is working on it". Leave it
+    // queued and un-dispatched; `surfaceAnomalies` labels it `daemon-anomaly` naming the defect.
+    if (this.masterRouteUnconfigured()) {
+      return;
+    }
     const selection = selectMasterTask({
       queued: store.listRunsByStatus("master-triage"),
       isBusy: (n) => this.inFlight.has(n) || this.mergeInFlight.has(n),
@@ -1294,6 +1301,9 @@ export class Reconciler {
         gateEligible: this.isGateEligible({ ...issue, labels: effectiveLabels }, depSatisfied),
         resumable: resumable.has(issue.number),
         answered: answeredParked.has(issue.number),
+        // A queued master escalation the tier-1 config cannot dispatch is a defect no tick
+        // fixes — surface it rather than letting it read as in-flight forever (ADR-0041).
+        masterUnroutable: run?.status === "master-triage" && this.masterRouteUnconfigured(),
       };
       await this.reconcileAnomalyLabel(issue.number, effectiveLabels, classifyIssueState(snapshot), run ?? null);
       // Self-heal the #132 wedge in the same pass that surfaces it: an answered pause
@@ -1346,6 +1356,9 @@ export class Reconciler {
         // A closed/gone issue is terminal under the run, never an answered-but-parked
         // wedge (#132 only strands an OPEN paused issue) — the open-issue loop owns that.
         answered: false,
+        // A closed/gone issue under a queued escalation is already the stronger anomaly
+        // (non-terminal-run-on-closed-issue); routing is moot.
+        masterUnroutable: false,
       };
       await this.reconcileAnomalyLabel(run.issueNumber, issue?.labels ?? [], classifyIssueState(snapshot), run);
     }
@@ -1620,6 +1633,16 @@ export class Reconciler {
       }
       this.launchResume(item);
     }
+  }
+
+  /**
+   * Whether master escalation is wired but cannot route at all — a missing or
+   * non-tools-capable `agent.tiers["1"]` profile (ADR-0041). Cheap and synchronous: the
+   * profile check reads the live routing, never the account pool, so a momentary headroom
+   * wait is deliberately NOT reported here (that is a wait, not a defect).
+   */
+  private masterRouteUnconfigured(): boolean {
+    return this.deps.masterEngine?.routeStatus().kind === "unconfigured";
   }
 
   /** Whether the paused run's outstanding question was asked by a master (ADR-0041). */

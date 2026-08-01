@@ -386,6 +386,16 @@ export class MasterEngine {
     return this.applyOutcome(run, issue, context, budget.attempt, phase, session.result);
   }
 
+  /**
+   * The master route's current status, exposed so the completeness pass can tell a queued
+   * escalation the daemon is *working on* apart from one it can never dispatch. A missing /
+   * non-tools-capable tier 1 is a configuration defect no tick fixes, so it must surface as a
+   * `daemon-anomaly` rather than reading as in-flight forever.
+   */
+  routeStatus(): MasterRouteResolution {
+    return this.resolveRoute();
+  }
+
   /** Resolve the master route (fail-closed) or report that routing is not wired at all. */
   private resolveRoute(): MasterRouteResolution {
     const { routing, routeWorld } = this.deps;
