@@ -9,11 +9,28 @@ import {
   RUNNER_CAPABILITY_ENV,
   RUNNER_CAPABILITY_LABEL,
   RunnerCompatibilityError,
+  type RunnerCapability,
   type RunnerCapabilityProbe,
 } from "./capabilities";
 
 const ROOT = join(__dirname, "..", "..");
 const probeOf = (caps: string[]): RunnerCapabilityProbe => ({ capabilities: async () => caps });
+
+/**
+ * Each declared capability must be BACKED by the wiring the shipped runner entrypoint
+ * (`src/bin/ralph-runner.ts`) constructs in its `runContainerRunner` deps literal — the session
+ * host(s) that actually implement it. A Dockerfile-label ↔ constant string-compare is not enough:
+ * `master-escalation` shipped declared-but-unwired because the entrypoint never built a master
+ * session host, so the pre-dispatch gate passed and every master run reported a generic `failed`.
+ * Typed `Record<RunnerCapability, …>`, so adding a capability to `RUNNER_CAPABILITIES` without an
+ * entry here fails to compile — the wiring contract cannot silently lapse for a new capability.
+ */
+const CAPABILITY_WIRING: Record<RunnerCapability, readonly string[]> = {
+  impl: ["session: createImplSessionHost"],
+  "review-fix": ["reviewSession: createReviewSessionHost", "fixSession: createFixSessionHost"],
+  "runner-direct-escalate": ["escalation: createRunnerEscalation"],
+  "master-escalation": ["masterSession: createMasterSessionHost"],
+};
 
 describe("runner capability contract (ADR-0041)", () => {
   it("round-trips a declaration through the label format", () => {
@@ -68,6 +85,21 @@ describe("runner capability contract (ADR-0041)", () => {
     const declared = formatRunnerCapabilities(CURRENT_RUNNER_CAPABILITIES);
     expect(dockerfile).toContain(`LABEL ${RUNNER_CAPABILITY_LABEL}="${declared}"`);
     expect(dockerfile).toContain(`ENV ${RUNNER_CAPABILITY_ENV}="${declared}"`);
+  });
+
+  it("every declared capability is actually wired by the shipped runner entrypoint", () => {
+    // The label-vs-constant check above proves the IMAGE declares the capability; this proves the
+    // ENTRYPOINT hosts it. Both must hold, or a capability the pre-dispatch gate green-lights is
+    // dead-on-arrival at runtime — precisely how `master-escalation` shipped declared-but-unwired.
+    const entrypoint = readFileSync(join(ROOT, "src", "bin", "ralph-runner.ts"), "utf8");
+    for (const cap of CURRENT_RUNNER_CAPABILITIES) {
+      for (const token of CAPABILITY_WIRING[cap]) {
+        expect(
+          entrypoint,
+          `capability '${cap}' is declared but its wiring '${token}' is missing from src/bin/ralph-runner.ts`,
+        ).toContain(token);
+      }
+    }
   });
 
   it("the onboarding smoke test gates on the capability label", () => {
