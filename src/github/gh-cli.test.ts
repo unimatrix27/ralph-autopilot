@@ -5,8 +5,12 @@ import {
   commentIdFromUrl,
   GhCliClient,
   isGitHubRateLimitError,
+  isPermissionError,
   parseMergeStateStatus,
+  parseMergeStatusSnapshot,
+  parseReviewThreadsPage,
   type RawCheck,
+  REVIEW_THREAD_MAX_PAGES,
 } from "./gh-cli";
 import { Logger } from "../log/logger";
 
@@ -1164,5 +1168,382 @@ describe("GhCliClient reports the true sub-issue count", () => {
     if (result.kind !== "node") throw new Error("expected a node");
     expect(result.childCount).toBe(120);
     expect(result.children).toHaveLength(1);
+  });
+});
+
+// ── hosted-review GraphQL adapter contract (issue #43) ────────────────────────
+//
+// The real adapter — `parseReviewThreadsPage`, the `readReviewThreads` pagination loop,
+// `replyToReviewThread`/`resolveReviewThread`, `parseMergeStatusSnapshot`, `isPermissionError`
+// — is the SOLE translation from GitHub's live GraphQL payload into the `ReviewThread` domain
+// type every fail-closed hosted-review decision depends on. The FakeGitHub-based suites
+// (hosted-review/hosted-gate.test.ts) never invoke this parser and cannot model real cursoring,
+// so a wire-format regression here (a bot misclassified as human, a dropped `reviewedSha`, a
+// mis-read `pageInfo` that stops paging early or overruns the cap) would silently defeat the gate
+// with no test failing. These contract tests drive it directly against recorded payloads.
+
+/** One `reviewThreads` GraphQL page, exactly as `gh api graphql` prints it to stdout. */
+function reviewThreadsPage(opts: {
+  headRefOid?: string | null;
+  hasNextPage?: boolean;
+  endCursor?: string | null;
+  nodes?: unknown[];
+}): string {
+  const pullRequest: Record<string, unknown> = {
+    reviewThreads: {
+      pageInfo: { hasNextPage: opts.hasNextPage ?? false, endCursor: opts.endCursor ?? null },
+      nodes: opts.nodes ?? [],
+    },
+  };
+  if (opts.headRefOid !== undefined) {
+    pullRequest.headRefOid = opts.headRefOid;
+  }
+  return JSON.stringify({ data: { repository: { pullRequest } } });
+}
+
+/** A minimal well-formed thread node with a single bot comment — for pagination-shape tests. */
+function threadNode(id: string): unknown {
+  return {
+    id,
+    isResolved: false,
+    isOutdated: false,
+    path: "src/x.ts",
+    line: 1,
+    diffSide: "RIGHT",
+    resolvedBy: null,
+    comments: {
+      nodes: [
+        {
+          id: `${id}_c`,
+          databaseId: 1,
+          body: "b",
+          createdAt: "2026-08-01T00:00:00Z",
+          commit: { oid: "sha" },
+          author: { login: "chatgpt-codex-connector", __typename: "Bot" },
+        },
+      ],
+    },
+  };
+}
+
+describe("parseReviewThreadsPage (the hosted-review wire → domain translation, #43)", () => {
+  it("translates a full GraphQL payload into the ReviewThread domain shape", () => {
+    const parsed = parseReviewThreadsPage(
+      reviewThreadsPage({
+        headRefOid: "headsha1",
+        hasNextPage: false,
+        endCursor: null,
+        nodes: [
+          {
+            id: "PRRT_bot",
+            isResolved: false,
+            isOutdated: false,
+            path: "src/app.ts",
+            line: 42,
+            diffSide: "RIGHT",
+            resolvedBy: null,
+            comments: {
+              nodes: [
+                {
+                  id: "PRRC_1",
+                  databaseId: 9001,
+                  body: "P1: unbounded loop.",
+                  createdAt: "2026-08-01T00:00:00Z",
+                  originalCommit: { oid: "origsha" },
+                  commit: { oid: "reviewedsha" },
+                  author: { login: "chatgpt-codex-connector", __typename: "Bot" },
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+    expect(parsed.headSha).toBe("headsha1");
+    expect(parsed.hasNextPage).toBe(false);
+    expect(parsed.endCursor).toBe(null);
+    expect(parsed.threads).toEqual([
+      {
+        id: "PRRT_bot",
+        isResolved: false,
+        isOutdated: false,
+        path: "src/app.ts",
+        line: 42,
+        side: "RIGHT",
+        // commit.oid wins over originalCommit.oid — the head the reviewer actually saw.
+        reviewedSha: "reviewedsha",
+        resolvedBy: null,
+        comments: [
+          {
+            id: "PRRC_1",
+            databaseId: 9001,
+            author: "chatgpt-codex-connector",
+            authorIsBot: true,
+            body: "P1: unbounded loop.",
+            createdAt: "2026-08-01T00:00:00Z",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("classifies the author: __typename Bot, a [bot]-suffixed App login, and a human", () => {
+    const [botByTypename, appByLogin, human] = parseReviewThreadsPage(
+      reviewThreadsPage({
+        nodes: [
+          {
+            id: "PRRT_a",
+            comments: { nodes: [{ id: "c_a", author: { login: "chatgpt-codex-connector", __typename: "Bot" } }] },
+          },
+          // A GitHub App comment can arrive as a User actor with a `[bot]` login suffix — still a bot.
+          { id: "PRRT_b", comments: { nodes: [{ id: "c_b", author: { login: "coderabbitai[bot]", __typename: "User" } }] } },
+          { id: "PRRT_c", comments: { nodes: [{ id: "c_c", author: { login: "octocat", __typename: "User" } }] } },
+        ],
+      }),
+    ).threads;
+    expect(botByTypename!.comments[0]!.authorIsBot).toBe(true);
+    expect(appByLogin!.comments[0]!.authorIsBot).toBe(true);
+    expect(human!.comments[0]!.authorIsBot).toBe(false);
+  });
+
+  it("anchors reviewedSha to the first commit.oid, else originalCommit.oid, else null", () => {
+    const [both, onlyOriginal, neither] = parseReviewThreadsPage(
+      reviewThreadsPage({
+        nodes: [
+          { id: "PRRT_1", comments: { nodes: [{ id: "c1", commit: { oid: "c1oid" }, originalCommit: { oid: "o1oid" } }] } },
+          { id: "PRRT_2", comments: { nodes: [{ id: "c2", originalCommit: { oid: "o2oid" } }] } },
+          { id: "PRRT_3", comments: { nodes: [{ id: "c3" }] } },
+        ],
+      }),
+    ).threads;
+    expect(both!.reviewedSha).toBe("c1oid");
+    expect(onlyOriginal!.reviewedSha).toBe("o2oid");
+    expect(neither!.reviewedSha).toBe(null);
+  });
+
+  it("lifts the resolved/outdated transition state and the resolver login", () => {
+    const [resolved, outdated] = parseReviewThreadsPage(
+      reviewThreadsPage({
+        nodes: [
+          {
+            id: "PRRT_r",
+            isResolved: true,
+            isOutdated: false,
+            resolvedBy: { login: "maintainer" },
+            comments: { nodes: [{ id: "cr", author: { login: "octocat", __typename: "User" } }] },
+          },
+          { id: "PRRT_o", isResolved: false, isOutdated: true, resolvedBy: null, comments: { nodes: [{ id: "co" }] } },
+        ],
+      }),
+    ).threads;
+    expect({ isResolved: resolved!.isResolved, resolvedBy: resolved!.resolvedBy }).toEqual({
+      isResolved: true,
+      resolvedBy: "maintainer",
+    });
+    expect({ isResolved: outdated!.isResolved, isOutdated: outdated!.isOutdated }).toEqual({
+      isResolved: false,
+      isOutdated: true,
+    });
+  });
+
+  it("lifts pageInfo for the cursor loop: hasNextPage + endCursor, defaulting to false/null", () => {
+    const more = parseReviewThreadsPage(reviewThreadsPage({ hasNextPage: true, endCursor: "CURSOR2" }));
+    expect({ hasNextPage: more.hasNextPage, endCursor: more.endCursor }).toEqual({ hasNextPage: true, endCursor: "CURSOR2" });
+    // A payload with no reviewThreads.pageInfo at all reads as "no more pages".
+    const none = parseReviewThreadsPage(JSON.stringify({ data: { repository: { pullRequest: { headRefOid: "h" } } } }));
+    expect({ hasNextPage: none.hasNextPage, endCursor: none.endCursor }).toEqual({ hasNextPage: false, endCursor: null });
+  });
+
+  it("is tolerant: blank / unparseable / missing PR / id-less nodes never throw or fabricate", () => {
+    const empty = { threads: [], headSha: null, hasNextPage: false, endCursor: null };
+    expect(parseReviewThreadsPage("")).toEqual(empty);
+    expect(parseReviewThreadsPage("   ")).toEqual(empty);
+    expect(parseReviewThreadsPage("not json")).toEqual(empty);
+    expect(parseReviewThreadsPage(JSON.stringify({ data: { repository: { pullRequest: null } } }))).toEqual(empty);
+    // A node with no string id is skipped; a comment with no string id is skipped but its thread survives.
+    const parsed = parseReviewThreadsPage(
+      reviewThreadsPage({
+        nodes: [
+          { isResolved: true, comments: { nodes: [] } },
+          { id: "PRRT_ok", comments: { nodes: [{ author: { login: "x" } }, { id: "c_ok", author: { login: "octocat" } }] } },
+        ],
+      }),
+    );
+    expect(parsed.threads.map((t) => t.id)).toEqual(["PRRT_ok"]);
+    expect(parsed.threads[0]!.comments.map((c) => c.id)).toEqual(["c_ok"]);
+    // A missing headRefOid reads as "unknown head", never a bogus value.
+    expect(parseReviewThreadsPage(reviewThreadsPage({})).headSha).toBe(null);
+  });
+});
+
+describe("GhCliClient.readReviewThreads pagination loop (#43)", () => {
+  /** A client whose `gh` returns each scripted page in turn (repeating the last), or throws an Error. */
+  function pagingClient(pages: Array<string | Error>, opts: { rateLimitRetries?: number } = {}) {
+    const calls: string[][] = [];
+    let i = 0;
+    const exec = async (args: string[]): Promise<string> => {
+      calls.push(args);
+      const next = pages[Math.min(i, pages.length - 1)];
+      i += 1;
+      if (next instanceof Error) throw next;
+      return next ?? "";
+    };
+    const client = new GhCliClient("owner/repo", {
+      logger: new Logger({ write: () => {} }),
+      exec,
+      rateLimitRetries: opts.rateLimitRetries ?? 0,
+    });
+    return { client, calls, count: () => i };
+  }
+
+  it("follows the cursor across pages and concatenates every thread once", async () => {
+    const { client, calls } = pagingClient([
+      reviewThreadsPage({ headRefOid: "head1", hasNextPage: true, endCursor: "CUR1", nodes: [threadNode("PRRT_1")] }),
+      reviewThreadsPage({ headRefOid: "head1", hasNextPage: false, endCursor: null, nodes: [threadNode("PRRT_2")] }),
+    ]);
+    const read = await client.readReviewThreads(50);
+    expect(read.kind).toBe("threads");
+    expect(read.kind === "threads" && read.threads.map((t) => t.id)).toEqual(["PRRT_1", "PRRT_2"]);
+    expect(read.kind === "threads" && read.headSha).toBe("head1");
+    expect(calls).toHaveLength(2);
+    // The GraphQL reviewThreads query is what is sent; page 0 carries no cursor, page 1 carries after=CUR1.
+    expect(calls[0]!.some((a) => a.startsWith("query=") && a.includes("reviewThreads"))).toBe(true);
+    expect(calls[0]!.some((a) => a.startsWith("after="))).toBe(false);
+    expect(calls[1]!).toContain("after=CUR1");
+  });
+
+  it("stops at exactly the cap when the final page completes — no false fail-closed", async () => {
+    const pages = Array.from({ length: REVIEW_THREAD_MAX_PAGES }, (_, i) =>
+      reviewThreadsPage({
+        headRefOid: "head1",
+        hasNextPage: i < REVIEW_THREAD_MAX_PAGES - 1,
+        endCursor: i < REVIEW_THREAD_MAX_PAGES - 1 ? `CUR${i}` : null,
+        nodes: [threadNode(`PRRT_${i}`)],
+      }),
+    );
+    const { client, calls } = pagingClient(pages);
+    const read = await client.readReviewThreads(50);
+    expect(read.kind).toBe("threads");
+    expect(read.kind === "threads" && read.threads).toHaveLength(REVIEW_THREAD_MAX_PAGES);
+    expect(calls).toHaveLength(REVIEW_THREAD_MAX_PAGES);
+  });
+
+  it("fails closed when the page cap is hit with hasNextPage still true (never a truncated set)", async () => {
+    // Every page reports another page — a pathological/hostile PR. Returning the threads gathered
+    // so far as kind:"threads" would let the gate merge past a blocker on an unread page.
+    const { client, calls } = pagingClient([
+      reviewThreadsPage({ headRefOid: "head1", hasNextPage: true, endCursor: "CUR", nodes: [threadNode("PRRT_x")] }),
+    ]);
+    const read = await client.readReviewThreads(50);
+    expect(read.kind).toBe("unavailable");
+    expect(read.kind === "unavailable" && read.reason).toBe("error");
+    expect(read.kind === "unavailable" && read.detail).toContain("incomplete");
+    expect(calls).toHaveLength(REVIEW_THREAD_MAX_PAGES);
+  });
+
+  it("fails closed as `permissions` when gh lacks the GraphQL scope (operator-owned)", async () => {
+    const err = Object.assign(new Error("gh failed"), { stderr: "Resource not accessible by integration" });
+    const { client, calls } = pagingClient([err]);
+    const read = await client.readReviewThreads(50);
+    expect(read.kind === "unavailable" && read.reason).toBe("permissions");
+    expect(calls).toHaveLength(1); // no cursor loop past a hard failure
+  });
+
+  it("fails closed as `rate-limited` when gh is throttled (defer, not operator-owned)", async () => {
+    const err = Object.assign(new Error("gh failed"), { stderr: "API rate limit already exceeded" });
+    const { client } = pagingClient([err], { rateLimitRetries: 0 });
+    const read = await client.readReviewThreads(50);
+    expect(read.kind === "unavailable" && read.reason).toBe("rate-limited");
+  });
+
+  it("fails closed as `error` on an empty first-page read rather than reporting zero threads", async () => {
+    const { client } = pagingClient([""]);
+    const read = await client.readReviewThreads(50);
+    expect(read.kind).toBe("unavailable");
+    expect(read.kind === "unavailable" && read.reason).toBe("error");
+  });
+});
+
+describe("GhCliClient thread mutations (reply / resolve, #43)", () => {
+  it("replyToReviewThread posts the reply mutation and lifts the new comment id", async () => {
+    const calls: string[][] = [];
+    const exec = async (args: string[]): Promise<string> => {
+      calls.push(args);
+      return JSON.stringify({ data: { addPullRequestReviewThreadReply: { comment: { id: "PRRC_new" } } } });
+    };
+    const client = new GhCliClient("owner/repo", { exec });
+    expect(await client.replyToReviewThread({ threadId: "PRRT_1", body: "Fixed in <sha>." })).toEqual({ id: "PRRC_new" });
+    expect(calls[0]!.some((a) => a.startsWith("query=") && a.includes("addPullRequestReviewThreadReply"))).toBe(true);
+    expect(calls[0]!).toContain("threadId=PRRT_1");
+    expect(calls[0]!).toContain("body=Fixed in <sha>.");
+  });
+
+  it("replyToReviewThread yields an empty id on a malformed/empty response rather than throwing", async () => {
+    const badJson = new GhCliClient("owner/repo", { exec: async () => "not json" });
+    expect(await badJson.replyToReviewThread({ threadId: "PRRT_1", body: "x" })).toEqual({ id: "" });
+    const noComment = new GhCliClient("owner/repo", { exec: async () => JSON.stringify({ data: {} }) });
+    expect(await noComment.replyToReviewThread({ threadId: "PRRT_1", body: "x" })).toEqual({ id: "" });
+  });
+
+  it("resolveReviewThread posts the resolve mutation keyed on the thread id", async () => {
+    const calls: string[][] = [];
+    const exec = async (args: string[]): Promise<string> => {
+      calls.push(args);
+      return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "PRRT_1", isResolved: true } } } });
+    };
+    const client = new GhCliClient("owner/repo", { exec });
+    await client.resolveReviewThread("PRRT_1");
+    expect(calls[0]!.some((a) => a.startsWith("query=") && a.includes("resolveReviewThread"))).toBe(true);
+    expect(calls[0]!).toContain("threadId=PRRT_1");
+  });
+});
+
+describe("parseMergeStatusSnapshot (typed BLOCKED cause, #43)", () => {
+  it("lifts state, the human-review verdict and the anchoring head SHA together", () => {
+    expect(
+      parseMergeStatusSnapshot(JSON.stringify({ mergeStateStatus: "BLOCKED", reviewDecision: "REVIEW_REQUIRED", headRefOid: "abc" })),
+    ).toEqual({ state: "BLOCKED", reviewDecision: "REVIEW_REQUIRED", headSha: "abc" });
+    // Case-normalised verdict.
+    expect(
+      parseMergeStatusSnapshot(JSON.stringify({ mergeStateStatus: "CLEAN", reviewDecision: "approved", headRefOid: "def" })),
+    ).toEqual({ state: "CLEAN", reviewDecision: "APPROVED", headSha: "def" });
+  });
+
+  it("reads a missing / blank / unrecognised field as null (unknown), never as satisfied", () => {
+    expect(parseMergeStatusSnapshot(JSON.stringify({ mergeStateStatus: "BLOCKED" }))).toEqual({
+      state: "BLOCKED",
+      reviewDecision: null,
+      headSha: null,
+    });
+    expect(parseMergeStatusSnapshot(JSON.stringify({ mergeStateStatus: "BLOCKED", reviewDecision: "WAT", headRefOid: "" }))).toEqual({
+      state: "BLOCKED",
+      reviewDecision: null,
+      headSha: null,
+    });
+    expect(parseMergeStatusSnapshot("")).toEqual({ state: "UNKNOWN", reviewDecision: null, headSha: null });
+    expect(parseMergeStatusSnapshot("not json")).toEqual({ state: "UNKNOWN", reviewDecision: null, headSha: null });
+  });
+});
+
+describe("isPermissionError (operator-owned scope defect vs transient fault, #43)", () => {
+  it("matches missing-scope / access-denied wording on stderr or a thrown Error", () => {
+    for (const s of [
+      "Resource not accessible by integration",
+      "GraphQL: must have push access to view review threads",
+      "Your token has insufficient scope",
+      "requires authentication",
+      "HTTP 403: Forbidden",
+      "not authorized",
+    ]) {
+      expect(isPermissionError({ stderr: s })).toBe(true);
+      expect(isPermissionError(new Error(s))).toBe(true);
+    }
+  });
+
+  it("does not swallow a rate limit or an unrelated fault as a permission error", () => {
+    expect(isPermissionError(new Error("API rate limit already exceeded"))).toBe(false);
+    expect(isPermissionError({ stderr: "You have exceeded a secondary rate limit." })).toBe(false);
+    expect(isPermissionError(new Error("ENOENT: no such file"))).toBe(false);
+    expect(isPermissionError(null)).toBe(false);
   });
 });

@@ -5,6 +5,7 @@
  * can assert "no double pickup" and "ready-for-agent removed on pickup".
  */
 
+import { REVIEW_THREAD_MAX_PAGES } from "../github/gh-cli";
 import { refKey, sameRef } from "../github/ref";
 import type {
   AwaitChecksOptions,
@@ -615,7 +616,9 @@ export class FakeGitHub implements GitHubClient {
   /**
    * Test helper: seed a PR's review threads. Pagination is modelled by
    * {@link setReviewThreadPageSize} — the fake pages internally exactly as the GraphQL
-   * adapter does, so a test that seeds more threads than one page exercises the paging.
+   * adapter does (including its {@link REVIEW_THREAD_MAX_PAGES} cap), so a test that seeds
+   * more threads than one page exercises the paging and one that overruns the cap sees the
+   * same fail-closed the real adapter produces.
    */
   setReviewThreads(prNumber: number, threads: ReviewThread[], headSha: string | null = null): void {
     this.reviewThreads.set(prNumber, threads.map((t) => ({ ...t, comments: [...t.comments] })));
@@ -648,16 +651,23 @@ export class FakeGitHub implements GitHubClient {
     if (queued && queued.length > 0) {
       return queued.length > 1 ? queued.shift()! : queued[0]!;
     }
-    // Page through the seeded threads the way the adapter does, then hand back the union —
-    // so a fake read of 3 pages is indistinguishable from a real one.
+    // Page through the seeded threads the way the real adapter does. Reading `all` at
+    // `reviewThreadPageSize` per page takes ceil(all.length / pageSize) pages; the real
+    // adapter caps at REVIEW_THREAD_MAX_PAGES and fails closed (never returns a silently
+    // truncated set) once it would overrun. Mirror both here so `setReviewThreadPageSize`
+    // has an *observable* effect and a fake-based pagination test is not trivially satisfied.
     const all = this.reviewThreads.get(prNumber) ?? [];
-    const pages: ReviewThread[] = [];
-    for (let i = 0; i < all.length; i += this.reviewThreadPageSize) {
-      pages.push(...all.slice(i, i + this.reviewThreadPageSize));
+    const pagesNeeded = Math.ceil(all.length / this.reviewThreadPageSize);
+    if (pagesNeeded > REVIEW_THREAD_MAX_PAGES) {
+      return {
+        kind: "unavailable",
+        reason: "error",
+        detail: `review threads exceeded ${REVIEW_THREAD_MAX_PAGES} pages; read is incomplete`,
+      };
     }
     return {
       kind: "threads",
-      threads: pages.map((t) => ({ ...t, comments: [...t.comments] })),
+      threads: all.map((t) => ({ ...t, comments: [...t.comments] })),
       headSha: this.reviewThreadHeads.get(prNumber) ?? null,
     };
   }

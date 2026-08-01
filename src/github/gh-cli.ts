@@ -203,8 +203,12 @@ export function parseMergeStatusSnapshot(out: string): MergeStatusSnapshot {
 const REVIEW_THREAD_PAGE_SIZE = 50;
 /** How many comments per thread one page requests (a thread is rarely deep). */
 const REVIEW_THREAD_COMMENT_PAGE_SIZE = 30;
-/** Hard cap on pages, so a pathological PR cannot spin the reader forever. */
-const REVIEW_THREAD_MAX_PAGES = 20;
+/**
+ * Hard cap on pages, so a pathological PR cannot spin the reader forever. Exported so the
+ * fake models the same bound — a cap that only the real adapter enforces is a cap the tests
+ * cannot see (issue #43).
+ */
+export const REVIEW_THREAD_MAX_PAGES = 20;
 
 /**
  * The thread-aware read the hosted-review gate needs. Flat issue/review comments carry no
@@ -1126,11 +1130,20 @@ export class GhCliClient implements GitHubClient {
       threads.push(...parsed.threads);
       headSha = headSha ?? parsed.headSha;
       if (!parsed.hasNextPage || !parsed.endCursor) {
-        break;
+        return { kind: "threads", threads, headSha };
       }
       after = parsed.endCursor;
     }
-    return { kind: "threads", threads, headSha };
+    // The page cap ran out while GitHub still reported `hasNextPage: true`: the read is
+    // *incomplete*. Returning the threads gathered so far as `kind:"threads"` would let the
+    // gate treat "no unresolved thread on the pages I saw" as "no unresolved thread" and merge
+    // past a blocker sitting on an unread page — the exact fail-open this gate exists to prevent
+    // (issue #43). Fail closed instead: a typed `unavailable` the gate reads as "not clear".
+    return {
+      kind: "unavailable",
+      reason: "error",
+      detail: `review threads exceeded ${REVIEW_THREAD_MAX_PAGES} pages; read is incomplete`,
+    };
   }
 
   async replyToReviewThread(input: { threadId: string; body: string }): Promise<{ id: string }> {

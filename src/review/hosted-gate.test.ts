@@ -8,6 +8,7 @@ import { MEMORY_DB, openStore, type ScopedStore } from "../store/store";
 import { FakeGitHub } from "../testing/fake-github";
 import { createLogger } from "../log/logger";
 import type { ReviewThread, ReviewThreadComment } from "../github/types";
+import { REVIEW_THREAD_MAX_PAGES } from "../github/gh-cli";
 import { HostedReviewGate, foldHostedGateState, renderDisposition } from "./hosted-gate";
 import { buildHostedWorklist } from "./hosted-review";
 
@@ -248,6 +249,18 @@ describe("HostedReviewGate (issue #43)", () => {
     github.setReviewThreads(50, threads, HEAD);
     const verdict = await gate.observe(ctx);
     expect(verdict.kind === "findings" && verdict.worklist.findings).toHaveLength(5);
+  });
+
+  it("fails closed when the seeded threads overrun the page cap — setReviewThreadPageSize is observable", async () => {
+    // pageSize 1 with more than REVIEW_THREAD_MAX_PAGES threads needs more pages than the cap
+    // allows. The fake now models the real adapter: it refuses to hand back a silently truncated
+    // set, and the gate reads that as "not clear" rather than merging on a half-read conversation.
+    github.setReviewThreadPageSize(1);
+    const threads = Array.from({ length: REVIEW_THREAD_MAX_PAGES + 1 }, (_, i) => thread({ id: `PRRT_${i}` }));
+    github.setReviewThreads(50, threads, HEAD);
+    const verdict = await gate.observe(ctx);
+    expect(verdict.kind).toBe("blocked");
+    expect(verdict.kind === "blocked" && verdict.cause.kind).toBe("threads-unavailable");
   });
 
   it("renders a disposition reply that states the head, the rationale and the verification", () => {
