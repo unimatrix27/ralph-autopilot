@@ -63,10 +63,33 @@ is indexed, no durable label is applied, and there is no separate resume protoco
 `buildHealCardQuestion` / `formatHealCard` surface is *removed*, not merely unused: a renderer
 nothing calls is a renderer something will call again.
 
-**7. `agent-stuck` is selectable only by a completed master adjudication.** After the autonomous
-budget is exhausted, or once the master proves no useful next action exists. It is not answerable
-through `ralph-answer`. This is enforced by source scan (`master/terminal-authority.test.ts`), not
-by convention — a path nobody thought of must be unable to reach it quietly.
+**7. `agent-stuck` is selectable only by a completed master adjudication**, after the autonomous
+budget is exhausted or once the master proves no useful next action exists — **and it is not
+answerable through `ralph-answer`.** Two invariants, enforced two ways, because they fail in
+opposite directions:
+
+- *Who may write it* — source scan (`master/terminal-authority.test.ts`), which admits a fallback
+  only at a site carrying an explicit marker and pins the exact set of marked sites. A path nobody
+  thought of must be unable to reach the terminal quietly.
+- *Who may lift it* — the **type**: `agent-stuck` is not in `ANSWERABLE_LABELS`, so
+  `OpenQuestionItem["label"]` cannot hold it and the queue never serves it. Answering it used to
+  re-admit a fresh worker run, silently un-terminalizing a finished adjudication into a second
+  lifecycle for the same condition.
+
+The terminal still carries a self-explaining card — the master's conclusion has to stay readable
+on the issue — but the card is *evidence*, not a question, and it offers only moves that work:
+re-scope and re-label, or close. Every surface refuses an answer explicitly rather than reporting
+an indistinguishable "nothing here".
+
+**7a. A master decision is recorded before its effect; its attempt span closes after.** The window
+between them is real — a crash, or a failed GitHub/SQLite write inside the effect — and it used to
+close the span with nothing having happened, wedging the run in `master-triage` where no later
+tick could pick it up (`pending` and `inProgress` both null → `no-request`, forever). So
+`MasterResolutionSelected` carries the validated outcome payload and the next tick **replays that
+exact ruling**, rather than spending a fresh session to reach a possibly different one. Replay is
+idempotent where it must be: the two card-posting arms adopt an already-posted card instead of
+publishing a second copy GitHub cannot un-post. A *new* triage request supersedes an undelivered
+effect — a fresh failure is something to adjudicate, never the old hand-back to re-run.
 
 **8. `awaiting-answer` is the only state that means a human decision is requested**, it carries
 exactly one structured `ralph-question`, and `ralph-answer` resumes the checkpointed *master*
@@ -147,8 +170,13 @@ shutdown contract.
 ## Consequences
 
 - `MasterRequestSource` grows eight harness-origin members and `MasterLane` grows three harness
-  lanes; the event vocabulary grows three additive hosted-review facts. Nothing is rewritten, so a
-  rebuild from the append-only log produces the same queues and labels.
+  lanes; the event vocabulary grows three additive hosted-review facts, and three existing master
+  facts grow optional fields (`MasterInterventionStarted` restates its request's
+  `source`/`lane`/`headline`, so a *running* triage can still be named once its queue entry is
+  consumed; `MasterResolutionSelected` carries `conclusion` and the replayable `outcome`). Nothing
+  is rewritten, so a rebuild from the append-only log produces the same queues and labels — and
+  `IssueEventLog.rebuildIssueProjection()` now makes that executable rather than asserted, folding
+  the read model from the log with the same pure `foldIssueState` the inline projection uses.
 - `ReviewLoopOutcome`'s `review-maxed` arm becomes `master-triage`. The rename is deliberate: the
   compiler finding every consumer is the point, because a caller that still believes it means "a
   human must act" is a bug.

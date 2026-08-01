@@ -33,10 +33,30 @@ export interface MasterInterventionRecord {
   attempt: number;
   phase: string;
   signature: string;
+  /**
+   * What the serviced request said — restated on `MasterInterventionStarted` so a *running*
+   * intervention can still be named on the operator surface after its request left the queue.
+   * Null on a pre-cutover stream that recorded no such fields (ADR-0026 tolerance).
+   */
+  source: MasterRequestSource | null;
+  lane: MasterLane | null;
+  headline: string | null;
   /** The chosen resolution, or null while the intervention is still running. */
   resolution: MasterResolution | null;
   /** The master's stated rationale for the resolution, or null while running. */
   rationale: string | null;
+  /**
+   * The master's own reading of the situation — what an operator needs to rule, as distinct
+   * from the `rationale` for the resolution that followed from it. Null while running, and on
+   * a pre-cutover stream that recorded only the rationale.
+   */
+  conclusion: string | null;
+  /**
+   * The validated outcome payload, kept so the effect is replayable after a crash between the
+   * decision and its application (ADR-0042). Opaque here — `master/outcome.ts` owns the grammar
+   * and re-validates on replay. Null while running, and on a pre-cutover stream.
+   */
+  outcome: Record<string, unknown> | null;
   /** Whether a `MasterInterventionCompleted` closed this attempt span. */
   completed: boolean;
   /**
@@ -58,6 +78,13 @@ export interface MasterHistory {
    * serviced request is never re-serviced.
    */
   pending: PendingMasterRequest | null;
+  /**
+   * The most recent request in this run span, whether or not it is still queued. `pending` is
+   * the *queue* view and is deliberately cleared the moment a session claims it (the
+   * never-duplicate guarantee); this is the *descriptive* view, so a reader can still say what
+   * is being adjudicated while a session is running. Reset only when the run span restarts.
+   */
+  lastRequest: PendingMasterRequest | null;
   /** Whether an intervention is currently open (started, not completed) — the restart guard. */
   inProgress: MasterInterventionRecord | null;
   /** Every intervention for the CURRENT run span, in append order. */
@@ -79,6 +106,7 @@ export interface MasterHistory {
 export function emptyMasterHistory(): MasterHistory {
   return {
     pending: null,
+    lastRequest: null,
     inProgress: null,
     interventions: [],
     awaitingHuman: null,
@@ -109,6 +137,7 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
         // A fresh span: the per-run intervention budget resets by construction. The
         // cross-span facts (promotion, published decisions) deliberately persist.
         history.pending = null;
+        history.lastRequest = null;
         history.inProgress = null;
         history.interventions = [];
         history.awaitingHuman = null;
@@ -128,6 +157,14 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
           ...(typeof data.recommendation === "string" ? { recommendation: data.recommendation } : {}),
           ...(typeof data.prNumber === "number" ? { prNumber: data.prNumber } : {}),
         };
+        // A fresh request SUPERSEDES an attempt whose decision was already made. The span may
+        // still be open because the effect's hand-back failed after the run had already left the
+        // queue — but a new failure has been detected since, and adjudicating that is never the
+        // same thing as replaying the old decision's hand-back (ADR-0042).
+        if (history.inProgress?.resolution) {
+          history.inProgress = null;
+        }
+        history.lastRequest = history.pending;
         break;
       case "ComplexityPromoted":
         history.promoted = true;
@@ -145,6 +182,8 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
             ...existing,
             resolution: null,
             rationale: null,
+            conclusion: null,
+            outcome: null,
             completed: false,
             humanResumes: existing.humanResumes + (history.awaitingHuman?.attempt === attempt ? 1 : 0),
           };
@@ -156,8 +195,15 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
             attempt,
             phase,
             signature: str(data, "signature"),
+            // Absent on a pre-cutover stream — null, never a guessed default, so a reader can
+            // tell "this build did not record it" from "the request said this".
+            source: isMasterRequestSource(data.source) ? data.source : null,
+            lane: typeof data.lane === "string" ? (data.lane as MasterLane) : null,
+            headline: typeof data.headline === "string" ? data.headline : null,
             resolution: null,
             rationale: null,
+            conclusion: null,
+            outcome: null,
             completed: false,
             humanResumes: 0,
           };
@@ -186,6 +232,11 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
                 ...i,
                 resolution: str(data, "resolution") as MasterResolution,
                 rationale: str(data, "rationale"),
+                conclusion: typeof data.conclusion === "string" ? data.conclusion : null,
+                outcome:
+                  typeof data.outcome === "object" && data.outcome !== null
+                    ? (data.outcome as Record<string, unknown>)
+                    : null,
               }
             : i,
         );

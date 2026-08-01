@@ -770,6 +770,40 @@ function asPhase(data: Record<string, unknown>): number | null {
   return typeof data.phase === "number" ? data.phase : null;
 }
 
+/**
+ * The master's per-phase intervention ceiling (ADR-0041 —
+ * {@link import("../../master/budget").MAX_MASTER_INTERVENTIONS_PER_PHASE}), restated here
+ * for the same reason the fix-attempt "/3" is: this module is browser-safe and imports no
+ * daemon code. It is display text only; the budget itself is decided daemon-side.
+ */
+const MASTER_ATTEMPTS_PER_PHASE = 2;
+
+/**
+ * Join the parts of a node detail, dropping the ones the fact did not carry. A tolerant
+ * reader may see a master event written by an older/newer daemon with fields missing — it
+ * degrades to a shorter line, never to `null · null`.
+ */
+function detailParts(...parts: (string | null)[]): string | null {
+  const kept = parts.filter((p): p is string => p !== null && p.length > 0);
+  return kept.length > 0 ? oneLine(kept.join(" · ")) : null;
+}
+
+/** `att n/2` — the master attempt against the per-phase ceiling, when the fact carries one. */
+function masterAttempt(data: Record<string, unknown>): string | null {
+  return typeof data.attempt === "number" ? `att ${data.attempt}/${MASTER_ATTEMPTS_PER_PHASE}` : null;
+}
+
+/**
+ * What one master resolution *means for the operator*: `ask-human` is the only route that
+ * asks for a decision, `terminal-stuck` is the only one that ends the run. The three
+ * autonomous routes are neither — they are the daemon carrying on, so they stay neutral.
+ */
+function resolutionTone(resolution: string | null): RenderTone {
+  if (resolution === "ask-human") return "attention";
+  if (resolution === "terminal-stuck") return "danger";
+  return "neutral";
+}
+
 interface DerivedTimeline {
   dividers: PhaseDividerItem[];
   nodes: TimelineNode[];
@@ -870,6 +904,118 @@ function deriveTimeline(events: DomainEvent[]): DerivedTimeline {
       case "RunStuck": {
         stuck = true;
         nodes.push({ id: `tl-${gp}`, globalPosition: gp, type: ev.type, label: "Agent stuck", detail: str(data.reason) ? oneLine(String(data.reason)) : null, tone: "danger", targetId: null });
+        break;
+      }
+      // ── master triage lifecycle (ADR-0041/0042) ──────────────────────────────
+      // The run's own account of who adjudicated it and how: which fault entered the queue,
+      // which attempt against the budget ran, what the master concluded, and whether it ended
+      // needing a human. Only named fields are projected — never the payload wholesale, so no
+      // prompt, context packet or transcript can ride out through this surface (#43).
+      case "MasterTriageRequested": {
+        // Queued for the master — work the daemon owes, not the operator: `waiting`, never
+        // `attention` (ADR-0042: the triage band is visible and never in "Needs you").
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Master triage",
+          detail: detailParts(str(data.source), str(data.phase), str(data.headline)),
+          tone: "waiting",
+          targetId: null,
+        });
+        break;
+      }
+      case "ComplexityPromoted": {
+        const tier = typeof data.tier === "number" ? data.tier : null;
+        const from = typeof data.from === "number" ? data.from : null;
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Complexity promoted",
+          detail: tier === null ? null : from === null ? `tier ${tier}` : `tier ${from} → ${tier}`,
+          tone: "neutral",
+          targetId: null,
+        });
+        break;
+      }
+      case "MasterInterventionStarted":
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Master intervention",
+          detail: detailParts(masterAttempt(data), str(data.phase)),
+          tone: "running",
+          targetId: null,
+        });
+        break;
+      case "MasterResolutionSelected": {
+        // The master's own conclusion, with the rationale it published — the one line that
+        // says why the run went where it went.
+        const resolution = str(data.resolution);
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Master resolution",
+          detail: detailParts(resolution, str(data.rationale)),
+          tone: resolutionTone(resolution),
+          targetId: null,
+        });
+        break;
+      }
+      case "MasterInterventionCompleted": {
+        const resolution = str(data.resolution);
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Master intervention ended",
+          detail: detailParts(masterAttempt(data), resolution),
+          tone: resolutionTone(resolution),
+          targetId: null,
+        });
+        break;
+      }
+      case "DecisionPublished":
+        // The decision's identity and reach; the record itself stays on GitHub.
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Decision published",
+          detail: detailParts(str(data.key), str(data.scope)),
+          tone: "neutral",
+          targetId: null,
+        });
+        break;
+      case "MasterHumanQuestionRequested":
+        // The only master route that reaches a human — the reason it did, in its own words.
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Human decision requested",
+          detail: str(data.headline) ? oneLine(String(data.headline)) : null,
+          tone: "attention",
+          targetId: null,
+        });
+        break;
+      case "MasterStuck": {
+        // The adjudicated terminal (ADR-0042 §7). It reads `stuck` in the header exactly as a
+        // worker `RunStuck` does — the difference is that a master signed it, not that the run
+        // ended differently.
+        stuck = true;
+        nodes.push({
+          id: `tl-${gp}`,
+          globalPosition: gp,
+          type: ev.type,
+          label: "Master stuck",
+          detail: str(data.reason) ? oneLine(String(data.reason)) : null,
+          tone: "danger",
+          targetId: null,
+        });
         break;
       }
       case "Merged": {

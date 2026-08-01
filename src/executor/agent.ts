@@ -16,7 +16,6 @@ import type { Logger } from "../log/logger";
 import type { Mode } from "../store/types";
 import type { EscalationQuestion } from "../review/escalation";
 import { SYSTEM_APPEND, type ResumeInjection } from "./prompts";
-import type { StuckHealGuidance } from "../hitl/heal-readmit";
 import { type StuckReport } from "./stuck-tool";
 import { createGitGuardrailsHook } from "./git-guardrails";
 import { type SessionReaper } from "./process-reaper";
@@ -57,12 +56,6 @@ export interface AgentRunContext {
    * fresh impl prompt (CONTEXT: resume, not restart).
    */
   resume?: ResumeInjection;
-  /**
-   * Present when *re-admitting* a healed stuck issue (#86): a fresh impl run whose
-   * prompt carries the operator's guidance for why the prior attempt stopped. Unlike
-   * {@link resume} there is no WIP branch — this is a clean start, not a continuation.
-   */
-  stuckHeal?: StuckHealGuidance;
   /**
    * The transcript capture sink for this run (ADR-0030), built by the executor from the
    * run's (repo, issue, runId). Forwarded into the session chokepoint so the impl/resume

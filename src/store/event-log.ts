@@ -677,6 +677,55 @@ export class EventLog {
   }
 
   /**
+   * Rebuild the issue read model from the append-only log, and return how many streams it
+   * covered.
+   *
+   * The read model is a *derived* view — "SQLite holds only runtime state and is rebuildable"
+   * (ADR-0021/0027) — but until now nothing could actually derive it: `es_issue_projection` was
+   * only ever maintained incrementally, so the claim was untested and a corrupted or
+   * partially-written row had no repair. This folds the same pure {@link foldIssueState} the
+   * inline projection uses over each stream from empty, so a rebuild and an incremental fold
+   * cannot drift by construction.
+   *
+   * Synchronous and transactional: the table is replaced, never left half-written.
+   */
+  rebuildIssueProjection(): number {
+    if (!this.emtMessagesExists()) {
+      return 0;
+    }
+    const streamIds = (
+      this.db
+        .prepare(
+          `SELECT DISTINCT stream_id FROM ${messagesTable.name}
+            WHERE is_archived = 0
+            ORDER BY stream_id ASC`,
+        )
+        .all() as { stream_id: string }[]
+    )
+      .map((row) => row.stream_id)
+      .filter((streamId) => parseIssueStreamId(streamId) !== null);
+
+    const upsert = this.db.prepare(ISSUE_PROJECTION_UPSERT_SQL);
+    const at = this.now();
+    const rebuild = this.db.transaction(() => {
+      this.db.exec(`DELETE FROM ${ISSUE_PROJECTION_TABLE}`);
+      for (const streamId of streamIds) {
+        const ref = parseIssueStreamId(streamId);
+        if (!ref) {
+          continue;
+        }
+        const events = this.readStreamEvents(streamId).map(
+          (recorded) => ({ type: recorded.type, data: recorded.data }) as IssueEvent,
+        );
+        const state = foldIssueState(events);
+        upsert.run(projectionUpsertParams(streamId, ref, state, events.length, at));
+      }
+    });
+    rebuild();
+    return streamIds.length;
+  }
+
+  /**
    * Read an issue's domain stream `<repo>#<issue>` in append order — the **permanent**
    * timeline tier the run-detail viewer (issue #111) renders as a clickable spine. Unlike
    * the prunable transcript, these events survive forever, so a pruned run still has its

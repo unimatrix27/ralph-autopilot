@@ -229,11 +229,27 @@ export type PromoteComplexity = Command<
 >;
 export type StartMasterIntervention = Command<
   "StartMasterIntervention",
-  { runId: string; attempt: number; phase: string; signature: string }
+  {
+    runId: string;
+    attempt: number;
+    phase: string;
+    signature: string;
+    source?: MasterRequestSource;
+    lane?: MasterLane;
+    headline?: string;
+  }
 >;
 export type SelectMasterResolution = Command<
   "SelectMasterResolution",
-  { runId: string; attempt: number; phase: string; resolution: MasterResolution; rationale: string }
+  {
+    runId: string;
+    attempt: number;
+    phase: string;
+    resolution: MasterResolution;
+    rationale: string;
+    conclusion?: string;
+    outcome?: Record<string, unknown>;
+  }
 >;
 export type CompleteMasterIntervention = Command<
   "CompleteMasterIntervention",

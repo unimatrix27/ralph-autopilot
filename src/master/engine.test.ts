@@ -4,7 +4,7 @@
  * fail-closed route, the decision-ledger write, and the "only the master reaches a human"
  * invariant.
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MEMORY_DB, openStore, type ScopedStore } from "../store/store";
 import { FakeGitHub } from "../testing/fake-github";
 import { FakeMasterAgent, FakeMasterPipeline } from "../testing/fake-master-agent";
@@ -692,6 +692,137 @@ describe("MasterEngine (ADR-0041)", () => {
       expect(github.merges).toEqual([]);
       expect(github.closedIssues).toEqual([]);
       expect(github.closedPulls).toEqual([]);
+    });
+  });
+
+  /**
+   * The outcome→effect boundary (issue #43: "restart tests at request/start/action/outcome/effect
+   * boundaries recover exactly once, do not repeat pushed commits/comments/retries").
+   *
+   * The decision is recorded *before* its effect, so a restart replays the adjudication the master
+   * actually made instead of spending a fresh session to make a possibly different one. That makes
+   * the window between the two writes real, and the attempt span is what keeps it recoverable: the
+   * span closes only once the effect has landed.
+   */
+  describe("restart at the outcome→effect boundary", () => {
+    it("re-applies the effect exactly once, with no second master session", async () => {
+      await seedQueuedEscalation();
+      agent.push(outcome());
+      // Fail at the FIRST step of the effect — taking the run off the queue. That is the arm of
+      // the window that actually strands: once the run has left, a failed hand-back is a plain
+      // `running` orphan the sweep re-drives, by design.
+      const leave = vi.spyOn(store, "recordResumed").mockRejectedValueOnce(new Error("sqlite: locked"));
+
+      // The effect throws; the engine must surface that rather than report a resolution.
+      await expect(engineWith().runIntervention(run, issue)).rejects.toThrow("sqlite: locked");
+      leave.mockRestore();
+      expect(pipeline.continued).toEqual([]);
+
+      // The decision is durable, the attempt span is still open, and the run is still queued —
+      // so the next tick has something to recover rather than a silently wedged run.
+      const stalled = foldMasterHistory(store.events.readIssueStream(REPO, 7));
+      expect(stalled.inProgress).toMatchObject({ attempt: 1, resolution: "resolved-and-continue", completed: false });
+      expect(store.getRunByIssue(7)!.status).toBe("master-triage");
+
+      // Next tick: the effect lands, the span closes, and no fresh session was scripted —
+      // FakeMasterAgent throws if asked for one, so this passing IS the "no second session" proof.
+      const recovered = await engineWith().runIntervention(run, issue);
+
+      expect(recovered).toMatchObject({ kind: "resolved", attempt: 1, resolution: "resolved-and-continue" });
+      expect(pipeline.continued).toHaveLength(1);
+      expect(pipeline.continued[0]).toMatchObject({
+        issueNumber: 7,
+        resolution: "resolved-and-continue",
+        brief: "Re-run the suite; the fixture now supplies the missing field.",
+      });
+      const healed = foldMasterHistory(store.events.readIssueStream(REPO, 7));
+      expect(healed.inProgress).toBeNull();
+      expect(healed.interventions).toHaveLength(1);
+      expect(healed.interventions[0]).toMatchObject({ attempt: 1, completed: true });
+    });
+
+    it("spends no fresh budget recovering, so the phase's two real attempts survive", async () => {
+      await seedQueuedEscalation();
+      agent.push(outcome());
+      const leave = vi.spyOn(store, "recordResumed").mockRejectedValueOnce(new Error("sqlite: locked"));
+      await expect(engineWith().runIntervention(run, issue)).rejects.toThrow("sqlite: locked");
+      leave.mockRestore();
+      await engineWith().runIntervention(run, issue);
+
+      const history = foldMasterHistory(store.events.readIssueStream(REPO, 7));
+      // One attempt spent, not two: a recovery is the same intervention finishing, not a new one.
+      expect(history.interventions.filter((i) => i.phase === "impl")).toHaveLength(1);
+    });
+
+    it("does not post a second question when the crash landed between the comment and its fact", async () => {
+      await seedQueuedEscalation();
+      // Built explicitly rather than spread over the `resolved-and-continue` base: the outcome
+      // contract is strict, and production stores exactly what `parseMasterSessionResult`
+      // accepted — so a replay payload carrying a foreign key would not be reproducing the
+      // real thing.
+      agent.push({
+        outcome: {
+          resolution: "ask-human",
+          conclusion: "Both contracts are live; only their owner can say which is authoritative.",
+          rationale: "Choosing one silently would break the other consumer.",
+          question: {
+            headline: "Which contract is the design of record?",
+            feature: "Ingestion",
+            whereWeStand: "Two shapes parse; the rubric rejects widening.",
+            decision: "Pick the authoritative contract.",
+            options: ["The v2 shape", "The legacy shape"],
+            stakes: "One-way door for the other consumer.",
+            recommendation: "The v2 shape.",
+          },
+        },
+        decisions: [],
+      });
+      // The comment lands, then the durable fact fails — the exact split the AC names.
+      const record = vi
+        .spyOn(store, "recordMasterHumanQuestion")
+        .mockRejectedValueOnce(new Error("sqlite: disk I/O error"));
+      await expect(engineWith().runIntervention(run, issue)).rejects.toThrow("disk I/O error");
+      record.mockRestore();
+      const posted = (await github.listIssueComments(7)).filter((c) => c.body.includes(RALPH_QUESTION_FENCE));
+      expect(posted).toHaveLength(1);
+
+      const recovered = await engineWith().runIntervention(run, issue);
+
+      expect(recovered).toMatchObject({ kind: "resolved", resolution: "ask-human" });
+      // Exactly one question on the issue: the recovery adopted the posted comment rather than
+      // publishing a second one an operator would have to reconcile by hand.
+      const after = (await github.listIssueComments(7)).filter((c) => c.body.includes(RALPH_QUESTION_FENCE));
+      expect(after).toHaveLength(1);
+      expect(after[0]!.id).toBe(posted[0]!.id);
+      expect(foldMasterHistory(store.events.readIssueStream(REPO, 7)).awaitingHuman).toMatchObject({ attempt: 1 });
+    });
+
+    it("does not post a second terminal card when the crash landed between the card and its fact", async () => {
+      await seedQueuedEscalation();
+      agent.push({
+        outcome: {
+          resolution: "terminal-stuck",
+          conclusion: "The issue depends on an unmerged upstream change that does not exist yet.",
+          rationale: "No autonomous action and no human answer can conjure the dependency.",
+          reason: "blocked on a prerequisite that has not been written",
+        },
+        decisions: [],
+      });
+      const record = vi
+        .spyOn(store, "recordMasterStuck")
+        .mockRejectedValueOnce(new Error("sqlite: disk I/O error"));
+      await expect(engineWith().runIntervention(run, issue)).rejects.toThrow("disk I/O error");
+      record.mockRestore();
+      const cards = (await github.listIssueComments(7)).filter((c) => c.body.includes(RALPH_QUESTION_FENCE));
+      expect(cards).toHaveLength(1);
+
+      const recovered = await engineWith().runIntervention(run, issue);
+
+      expect(recovered).toMatchObject({ kind: "resolved", resolution: "terminal-stuck" });
+      expect(
+        (await github.listIssueComments(7)).filter((c) => c.body.includes(RALPH_QUESTION_FENCE)),
+      ).toHaveLength(1);
+      expect(store.getRunByIssue(7)!.status).toBe("agent-stuck");
     });
   });
 });

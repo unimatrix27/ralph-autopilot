@@ -167,8 +167,9 @@ describe("agent-stuck is a terminal, not a healable pause (ADR-0042 §7, issue #
 
     expect(runner.calls).toHaveLength(2);
     const readmitted = runner.calls.at(-1)!;
-    expect(readmitted.resume).toBeUndefined(); // re-admit, not resume
-    expect(readmitted.stuckHeal).toBeUndefined(); // the #86 guidance lane is retired
+    // Re-admit, not resume — and the run context has no other injection channel: the #86
+    // guidance field is gone from `AgentRunContext` entirely (ADR-0042 / #43).
+    expect(readmitted.resume).toBeUndefined();
     expect(store.getRunByIssue(51)!.prNumber).not.toBeNull();
   });
 });

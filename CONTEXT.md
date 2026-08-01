@@ -402,9 +402,9 @@ and the startup orphan sweep keep the claim path from firing on the common
 re-pickup collision.
 
 **Resume, not restart**:
-A paused agent (escalate / heal) continues from its checkpointed WIP branch with
-the answer injected — it does not start over from a clean tree. Preserves work and
-decision continuity.
+A paused session (a master awaiting an answer, or a pre-cutover park) continues from its
+checkpointed WIP branch with the answer injected — it does not start over from a clean
+tree. Preserves work and decision continuity.
 
 **Self-update**:
 The daemon adopting new commits on its *own* branch — its auto-merged fixes or an

@@ -395,13 +395,21 @@ describe("buildSnapshot — master triage (ADR-0042)", () => {
       phase: "review-0",
       signature: "ci|review-0|red",
     });
-    await scoped.recordMasterInterventionResolved({
+    await scoped.recordMasterResolutionSelected({
       issueNumber: 8,
       runId: run.id,
       attempt: 1,
       phase: "review-0",
       resolution: "resolved-and-continue",
-      rationale: "The failing check was a flaky fixture.",
+      conclusion: "The failing check was a flaky fixture.",
+      rationale: "Re-running it against a stable fixture is enough; no behaviour changes.",
+    });
+    await scoped.recordMasterInterventionCompleted({
+      issueNumber: 8,
+      runId: run.id,
+      attempt: 1,
+      phase: "review-0",
+      resolution: "resolved-and-continue",
     });
     // A second request re-opens the queue in the same phase.
     await scoped.recordHarnessMasterTriage({
@@ -423,7 +431,91 @@ describe("buildSnapshot — master triage (ADR-0042)", () => {
 
     const [item] = buildSnapshot(store).masterTriage;
     expect(item).toMatchObject({ running: true, attempt: 2, budget: 2, phase: "review-0" });
+    // The master's own reading of the situation — not the rationale for the resolution that
+    // followed from it. The field is documented as "the master's latest recorded conclusion",
+    // and a rationale in its place answers a question the operator did not ask.
     expect(item!.latestConclusion).toBe("The failing check was a flaky fixture.");
+    store.close();
+  });
+
+  /**
+   * Issue #43 requires the operator surfaces to expose "queued/running master triage, source,
+   * attempt/budget, chosen route/model, latest conclusion". Starting a session consumes the
+   * pending request, so without the request context restated on the span, a *running* master
+   * went blank on source/lane/headline — the moment an operator most wants to know what it is
+   * adjudicating.
+   */
+  it("keeps source, lane and headline visible while the master is RUNNING, not just queued", async () => {
+    const store = openStore(MEMORY_DB);
+    const scoped = store.forRepo("owner/repo");
+    const run = scoped.upsertRun({ issueNumber: 12, mode: "tdd", branch: "ralph/12-x" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 12,
+      runId: run.id,
+      source: "hosted-review",
+      phase: "review-0",
+      lane: "merge",
+      signature: "hosted-review|review-0|thread-unresolved",
+      headline: "The hosted reviewer still blocks the merge",
+    });
+
+    expect(buildSnapshot(store).masterTriage[0]).toMatchObject({
+      running: false,
+      source: "hosted-review",
+      lane: "merge",
+      headline: "The hosted reviewer still blocks the merge",
+    });
+
+    await scoped.recordMasterInterventionStarted({
+      issueNumber: 12,
+      runId: run.id,
+      attempt: 1,
+      phase: "review-0",
+      signature: "hosted-review|review-0|thread-unresolved",
+      source: "hosted-review",
+      lane: "merge",
+      headline: "The hosted reviewer still blocks the merge",
+    });
+
+    expect(buildSnapshot(store).masterTriage[0]).toMatchObject({
+      running: true,
+      attempt: 1,
+      source: "hosted-review",
+      lane: "merge",
+      headline: "The hosted reviewer still blocks the merge",
+    });
+    store.close();
+  });
+
+  it("still renders a pre-cutover running span that recorded no request context", async () => {
+    const store = openStore(MEMORY_DB);
+    const scoped = store.forRepo("owner/repo");
+    const run = scoped.upsertRun({ issueNumber: 14, mode: "tdd", branch: "ralph/14-x" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 14,
+      runId: run.id,
+      source: "ci",
+      phase: "review-0",
+      lane: "ci",
+      signature: "ci|review-0|red",
+      headline: "CI never greened",
+    });
+    // No source/lane/headline — an older daemon's span (ADR-0026 tolerance).
+    await scoped.recordMasterInterventionStarted({
+      issueNumber: 14,
+      runId: run.id,
+      attempt: 1,
+      phase: "review-0",
+      signature: "ci|review-0|red",
+    });
+
+    // Falls back to the request that opened the queue rather than blanking the band.
+    expect(buildSnapshot(store).masterTriage[0]).toMatchObject({
+      running: true,
+      source: "ci",
+      lane: "ci",
+      headline: "CI never greened",
+    });
     store.close();
   });
 });

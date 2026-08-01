@@ -1137,8 +1137,11 @@ describe("the executor failure guard reaches no terminal of its own (ADR-0042)",
 
     await ex.run({ issue: github.issues.get(78)!, mode: "tdd" });
 
+    // One fresh impl run, started from the issue alone: no resume (no WIP branch to continue)
+    // and no guidance channel at all — `AgentRunContext` no longer has a field the retired
+    // lane could fill (ADR-0042 / #43).
     expect(runner.runs).toHaveLength(1);
-    expect(runner.runs[0]!.stuckHeal).toBeUndefined();
+    expect(runner.runs[0]!.resume).toBeUndefined();
   });
 });
 
