@@ -472,6 +472,10 @@ export class MasterEngine {
   ): Promise<void> {
     switch (outcome.resolution) {
       case "resolved-and-continue":
+        // Leave `master-triage` *before* handing back, so the transition is atomic with the
+        // decision: if the continuation then fails, the run is a plain `running` orphan the
+        // sweep re-drives, never a queued escalation that re-dispatches a second master.
+        await this.leaveQueue(run);
         await this.deps.pipeline.continueRun({
           run,
           issue,
@@ -481,6 +485,7 @@ export class MasterEngine {
         });
         return;
       case "redispatch-tier-1":
+        await this.leaveQueue(run);
         await this.deps.pipeline.continueRun({
           run,
           issue,
@@ -490,6 +495,7 @@ export class MasterEngine {
         });
         return;
       case "retry-pipeline":
+        await this.leaveQueue(run);
         await this.deps.pipeline.retry({
           run,
           issue,
@@ -504,6 +510,16 @@ export class MasterEngine {
         await this.terminalStuck(run, attempt, outcome.reason, outcome.conclusion);
         return;
     }
+  }
+
+  /**
+   * Take the run off the master queue for an autonomous resolution: `Resumed` projects it back
+   * to `running`, which is what makes the ordinary pipeline own it again. The two final-
+   * adjudication arms deliberately do NOT call this — they project their own terminal
+   * (`awaiting-answer` / `agent-stuck`).
+   */
+  private async leaveQueue(run: Run): Promise<void> {
+    await this.deps.store.recordResumed({ runId: run.id, issueNumber: run.issueNumber });
   }
 
   /**
