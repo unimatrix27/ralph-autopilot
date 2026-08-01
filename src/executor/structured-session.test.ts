@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractJsonObject } from "./structured-session";
+import { extractJsonObject, runStructuredWithBackend } from "./structured-session";
 
 describe("extractJsonObject", () => {
   it("parses a fenced ```json block", () => {
@@ -52,5 +52,36 @@ describe("extractJsonObject", () => {
   it("skips a fenced JSON array in favour of the real object", () => {
     const text = '{ "items": [] }\ntrailing list:\n```json\n[1, 2]\n```';
     expect(extractJsonObject(text)).toEqual({ items: [] });
+  });
+});
+
+describe("runStructuredWithBackend", () => {
+  it("feeds a valid-but-schema-wrong output's validation error into the retry prompt", async () => {
+    const prompts: string[] = [];
+    const outputs = [
+      '{"resolution":"redispatch-tier-1","outcome":"redispatch-tier-1"}',
+      '{"outcome":{"resolution":"redispatch-tier-1"},"decisions":[]}',
+    ];
+    const result = await runStructuredWithBackend(
+      {
+        async run(req) {
+          prompts.push(req.prompt);
+          return outputs.shift()!;
+        },
+      },
+      { prompt: "adjudicate", worktreePath: "/tmp/worktree" },
+      (text) => {
+        const value = extractJsonObject(text) as { outcome?: { resolution?: string } };
+        if (typeof value.outcome !== "object") {
+          throw new Error('outcome: expected object, received string');
+        }
+        return value;
+      },
+    );
+
+    expect(result).toEqual({ outcome: { resolution: "redispatch-tier-1" }, decisions: [] });
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("VALIDATION ERROR FROM THE PRIOR ATTEMPT");
+    expect(prompts[1]).toContain("outcome: expected object, received string");
   });
 });
