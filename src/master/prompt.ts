@@ -316,7 +316,44 @@ function outcomeBlock(context: MasterContext): string[] {
     "`ask-human` is the ONLY way to create a human question, and it exists for decisions only a human can make —",
     "a product/priority call, a contradiction of standing design authority, or an external blocker. Use",
     "`terminal-stuck` only when neither another autonomous action nor a human decision could help.",
+    "",
+    "Your final message is machine-validated. Return ONLY one JSON object with the exact envelope",
+    '`{"outcome": <one outcome object below>, "decisions": []}`. `outcome` MUST be an object, never the',
+    "resolution name as a string. Do not add top-level keys. Use exactly the keys shown for the chosen arm:",
+    ...allowed.map((resolution) => `- \`${JSON.stringify(masterOutcomeExample(resolution))}\``),
+    "",
+    "Keep `decisions` as `[]` unless design authority was genuinely silent and you are publishing a binding",
+    "decision. A decision object uses exactly: `key`, `scope` (`issue`, `subtree`, or `initiative`), `decision`,",
+    "`rationale`, and optional `constraints`, `rejectedAlternatives`, `evidence`, `subtreeRoot`, `supersedes`.",
   ]);
+}
+
+/** A minimal, schema-valid example for each strict master outcome arm. */
+function masterOutcomeExample(resolution: (typeof MASTER_RESOLUTIONS)[number]): Record<string, unknown> {
+  const common = { conclusion: "your independently verified conclusion", rationale: "why this outcome follows" };
+  switch (resolution) {
+    case "resolved-and-continue":
+      return { resolution, ...common, guidance: "authoritative guidance for the resumed phase" };
+    case "redispatch-tier-1":
+      return { resolution, ...common, brief: "complete brief for the fresh tier-1 worker" };
+    case "retry-pipeline":
+      return { resolution, ...common, action: "ci" };
+    case "ask-human":
+      return {
+        resolution,
+        ...common,
+        question: {
+          headline: "short decision headline",
+          feature: "feature or initiative in plain language",
+          whereWeStand: "current state without requiring code context",
+          decision: "the specific decision the operator must make",
+          stakes: "consequences of the choice",
+          recommendation: "the master's recommendation and why",
+        },
+      };
+    case "terminal-stuck":
+      return { resolution, ...common, reason: "why neither autonomy nor a human decision can help" };
+  }
 }
 
 /** Build the full master prompt. Pure. */

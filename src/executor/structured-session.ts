@@ -229,6 +229,11 @@ export const STRICT_JSON_REMINDER =
   "other control character may appear ONLY inside a double-quoted, JSON-escaped string. No " +
   "markdown prose before or after the object.";
 
+/** Include the parser's actual objection so a valid-but-wrong JSON shape can be corrected. */
+export function structuredOutputRetryReminder(lastError: string): string {
+  return `${STRICT_JSON_REMINDER}\nVALIDATION ERROR FROM THE PRIOR ATTEMPT: ${lastError}`;
+}
+
 /**
  * Run a structured session through any {@link SessionBackend} and parse its final
  * message into structured output, retrying with a louder JSON contract when the output
@@ -250,7 +255,7 @@ export async function runStructuredWithBackend<T>(
   let lastError = "";
   let rawTail = "";
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const prompt = attempt === 1 ? req.prompt : `${req.prompt}\n\n${STRICT_JSON_REMINDER}`;
+    const prompt = attempt === 1 ? req.prompt : `${req.prompt}\n\n${structuredOutputRetryReminder(lastError)}`;
     const text = await backend.run({ ...req, prompt });
     try {
       return parse(text);
