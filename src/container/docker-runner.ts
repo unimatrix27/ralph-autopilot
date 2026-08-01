@@ -515,6 +515,16 @@ export class DockerCliRunner implements DockerRunner, ContainerSweeper {
     });
   }
 
+  /**
+   * Run an arbitrary read-only `docker` subcommand and resolve its stdout — the port the
+   * runner-capability probe (ADR-0041) reads an image's `io.ralph.runner-capabilities` label
+   * through. Failure resolves to an empty string, which the probe reads as "declares nothing"
+   * and therefore refuses the dispatch: an unreadable declaration is never a permissive one.
+   */
+  inspect(args: string[]): Promise<string> {
+    return this.capture(args);
+  }
+
   /** Run a `docker` subcommand and resolve with its captured stdout (empty string on failure). */
   private async capture(args: string[]): Promise<string> {
     return new Promise<string>((resolve) => {

@@ -22,7 +22,7 @@ Optionally add:
 
 | Label | Meaning |
 | --- | --- |
-| `complexity:1` \| `complexity:2` \| `complexity:3` | Selects the impl agent profile (ADR-0039). **Lower = more demanding** (the `priority:p0` convention): `1` hard/architectural, `2` standard, `3` routine/mechanical. Which model each tier maps to is operator config (`agent.tiers`), not fixed here. Unlabeled = the global default profile — absence never stalls an issue. Duplicates resolve to the most demanding. Impl only; review/fix are unaffected. |
+| `complexity:1` \| `complexity:2` \| `complexity:3` | Selects the agent profile (ADR-0039, amended by ADR-0041). **Lower = more demanding** (the `priority:p0` convention): `1` hard/architectural, `2` standard, `3` routine/mechanical. The tier→model mapping is **binding**: `complexity:1` → `claude-fable-5`, `complexity:2` → `claude-opus-5` (see `agent.tiers` in the example config). Unlabeled = the global default profile — absence never stalls an issue. Duplicates resolve to the most demanding. **Tier 1 governs every lane** (impl, resume, review, fix, master); tiers 2–3 are impl-only, so review/fix stay uniform. **The daemon may set `complexity:1` itself:** the first master escalation promotes the issue permanently — that is expected, not a stray edit. |
 | `priority:p0`, `priority:p1` | Admission ordering when slots are scarce: p0 before p1 before unlabelled. Not urgency theater — only ordering. |
 | `hitl` | Explicitly bars the issue from unattended pickup even while `ready-for-agent` is present (e.g. specced but you want to be around when it runs). Remove it to release. |
 
@@ -59,12 +59,23 @@ machine from the store (see the runbooks for safe recovery):
 
 - `awaiting-ci`, `awaiting-merge` — automated in-flight states (parked on CI / queued
   for integration).
-- `awaiting-answer` — the agent escalated a question; answer it with `ralph-answer`
-  (which performs the label swap itself).
+- `master-triage` — an automated in-flight state, **not** a request for you. A worker
+  handed its decision up to a **master** escalation (ADR-0041): the work is checkpointed
+  on the issue branch and a fresh highest-tier session is adjudicating it. Nothing is
+  waiting on you; if the master concludes only a human can decide, it will post a real
+  `ralph-question` and swap to `awaiting-answer`. Removing this label by hand takes the
+  issue out of the master queue and re-admits it as ordinary work, discarding the
+  adjudication in progress.
+- `awaiting-answer` — a **master** escalation asked you a question; answer it with
+  `ralph-answer` (which performs the label swap itself). Your answer resumes the master's
+  adjudication, not the original worker.
 - `review-maxed`, `agent-stuck`, `daemon-anomaly` — human-attention states. Fix the
   cause, then re-arm by swapping back to `ready-for-agent` (for `agent-stuck` after a
   manual branch force-push: do **not** re-arm — see the legacy issue 255 guard note in the
-  runbooks; reopen and merge the PR by hand instead).
+  runbooks; reopen and merge the PR by hand instead). Since ADR-0041 a worker no longer
+  reaches `agent-stuck` on its own for an impl run: it goes to `master-triage` first, so an
+  `agent-stuck` there means a master adjudicated and concluded nothing further helps (or the
+  two-intervention budget was exhausted). Read the card it left before re-arming.
 
 Success has **no label**: a finished issue is simply *merged + closed*.
 

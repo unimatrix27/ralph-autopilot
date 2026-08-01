@@ -3,6 +3,17 @@ import type { Account, AgentSettings, ProvidersSettings } from "../config/schema
 import type { RoutingConfig, RouteWorld } from "../providers/resolve";
 import { providerPreferenceList } from "../providers/select";
 import { MASTER_TIER, resolveMasterRoute } from "./route";
+import { readFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
+import { loadConfig } from "../config/load";
+
+/** Load the shipped example config through the real loader (strict, unknown keys rejected). */
+function loadExampleConfig(text: string) {
+  const path = join(mkdtempSync(join(tmpdir(), "ralph-master-cfg-")), "config.yaml");
+  writeFileSync(path, text);
+  return loadConfig(path);
+}
 
 const claudeAccount: Account = { id: "claude-a", provider: "claude", configDir: "~/.claude" };
 const zaiAccount: Account = { id: "zai-1", provider: "zai", authTokenEnv: "ZAI_API_KEY" };
@@ -183,5 +194,34 @@ describe("tier-1 governs every agent lane (ADR-0041 amending ADR-0039)", () => {
   it("leaves every lane on agent.types when the issue carries no tier", () => {
     expect(providerPreferenceList(settings, "impl", undefined, null)).toEqual([{ provider: "zai" }]);
     expect(providerPreferenceList(settings, "review", 1, null)).toEqual([{ provider: "zai" }]);
+  });
+});
+
+describe("the checked-in example config pins the binding tier→model mappings (ADR-0041)", () => {
+  it("declares complexity:1 → claude-fable-5 and complexity:2 → claude-opus-5", () => {
+    const text = readFileSync(resolve(__dirname, "../../.ralph/config.example.yaml"), "utf8");
+    const config = loadExampleConfig(text);
+    const tiers = config.agent.tiers;
+    expect(tiers["1"]?.routes).toEqual([{ provider: "claude", model: "claude-fable-5" }]);
+    expect(tiers["2"]?.routes).toEqual([{ provider: "claude", model: "claude-opus-5" }]);
+    // …and they are ACTIVE (uncommented), not merely documented — a master escalation on a
+    // fresh deployment must route, not fail closed on a missing tier-1 profile.
+    expect(providerPreferenceList(config.agent, "master", undefined, 1)).toEqual([
+      { provider: "claude", modelOverride: "claude-fable-5" },
+    ]);
+    expect(providerPreferenceList(config.agent, "impl", undefined, 2)).toEqual([
+      { provider: "claude", modelOverride: "claude-opus-5" },
+    ]);
+  });
+
+  it("the example's tier 1 is tools-capable, so master escalation can actually dispatch", () => {
+    const text = readFileSync(resolve(__dirname, "../../.ralph/config.example.yaml"), "utf8");
+    const config = loadExampleConfig(text);
+    const resolved = resolveMasterRoute(
+      { agent: config.agent, providers: config.providers },
+      "acme/widgets",
+      worldWith([claudeAccount]),
+    );
+    expect(resolved).toMatchObject({ kind: "route", route: { model: "claude-fable-5" } });
   });
 });

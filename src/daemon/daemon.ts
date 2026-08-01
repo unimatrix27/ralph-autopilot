@@ -36,6 +36,12 @@ import { ReviewLoop } from "../review/review-loop";
 import { AGENT_TYPES, providerForAgentType } from "../providers/select";
 import type { RouteWorld, RoutingSource } from "../providers/resolve";
 import { EscalationCheckpointer } from "../hitl/escalation-checkpoint";
+import { MasterTriageRequester } from "../master/request";
+import { MasterEngine } from "../master/engine";
+import { MasterLease } from "../master/lease";
+import { ContainerMasterAgentRunner } from "../master/container-master-runner";
+import { createExecutorMasterPipeline } from "../master/pipeline";
+import { createDockerCapabilityProbe } from "../container/capabilities";
 import type { Logger } from "../log/logger";
 import type { Account, RalphConfig, TargetConfig } from "../config/schema";
 import { expandHome, groupAccountsByProvider, resolveAccountPool, resolveTargets } from "../config/load";
@@ -435,6 +441,11 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
   // (ADR-0037/0038, issue #228) — claude → the OAuth meter by account id, z.ai → the cooldown meter,
   // never cross-fed. Replaces the retired in-process feed; every container runner relays through it.
   const recordRateLimit = buildRateLimitRecorder(usageMeter, providerUsageMeter);
+  // ONE process-wide master lease shared by every per-repo reconciler (ADR-0041 V1 global
+  // serialization) — the same discipline as the shared build budget. Two repos can therefore
+  // never run master sessions concurrently, which is what makes concurrent decision-ledger
+  // writes (and their fail-closed conflicts) unrepresentable rather than merely unlikely.
+  const masterLease = new MasterLease();
 
   // Every configured z.ai account's key env-var name, forwarded into EVERY container regardless
   // of its route (issue #270): the in-container runner loadConfig-validates the FULL mounted
@@ -502,6 +513,9 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
     // reflected on the next dispatch with no daemon restart; an in-flight container is unaffected.
     const routing: RoutingSource = routingStore.routingSourceFor(target.targetRepo);
     const docker = new DockerCliRunner(containerDockerConfig(target, logger, deps.configPath, zaiKeyEnvNames));
+    // The runner-capability probe (ADR-0041): reads the target agent image's
+    // `io.ralph.runner-capabilities` label so a stale image fails PRE-dispatch, by name.
+    const capabilities = createDockerCapabilityProbe((args) => docker.inspect(args));
     const agentRunner: AgentRunner = new ContainerAgentRunner({
       docker,
       store: scopedStore,
@@ -520,6 +534,12 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
       // Drain gate (issue #35): the impl/resume runner refuses fresh container dispatch once a
       // drain is signalled, while in-flight runs' review/fix containers still complete.
       drainSignal: deps.drain,
+      // ADR-0041: a worker `escalate` is an INTERNAL escalation to the master, so the runner
+      // relays the question rather than posting a `ralph-question`. Gated on the image's declared
+      // `master-escalation` capability — a stale runner fails pre-dispatch with a precise error
+      // instead of paging a human the daemon never meant to page.
+      escalationMode: "master",
+      capabilities,
     });
     const reviewLoop = new ReviewLoop({
       store: scopedStore,
@@ -540,6 +560,12 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
       baseBranch,
       merge: target.merge,
     });
+    // Master escalation (ADR-0041). Wiring the requester CHANGES what a worker `escalate` and
+    // `stuck` mean for this target: both become internal escalations to the master rather than a
+    // human question / a terminal. The container runner is told the same thing through
+    // `escalationMode: "master"` above, and refuses to dispatch into a runner image that does not
+    // declare the capability — so the two halves can never disagree about who talks to a human.
+    const masterTriage = new MasterTriageRequester({ store: scopedStore, github, worktrees });
     const escalation = new EscalationCheckpointer({ store: scopedStore, github, worktrees });
     const executor = new Executor({
       store: scopedStore,
@@ -549,6 +575,7 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
       logger,
       reviewLoop,
       escalation,
+      masterTriage,
       heartbeatMs: target.agent.heartbeatSeconds * 1000,
       // On a graceful drain, a Codex session killed by the terminal SIGINT (its CLI
       // shares the daemon's process group, ADR-0033) must be left resumable, not
@@ -600,6 +627,37 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
         // waits as `no-provider` (kept `ready-for-agent`), re-resolved automatically next tick.
         routing,
         routeWorld,
+        // Master escalation (ADR-0041): the queue is serviced before fresh admission, on the
+        // ordinary cap, under the ONE process-wide lease every reconciler shares (so masters
+        // are globally serialized and can never race the decision ledger).
+        masterEngine: new MasterEngine({
+          store: scopedStore,
+          github,
+          agent: new ContainerMasterAgentRunner({
+            docker,
+            store: scopedStore,
+            config: target,
+            baseBranch,
+            recordRateLimit,
+            capabilities,
+            drainSignal: deps.drain,
+          }),
+          pipeline: createExecutorMasterPipeline({ executor, github, logger }),
+          logger,
+          targetRepo: target.targetRepo,
+          baseBranch,
+          routing,
+          routeWorld,
+          context: {
+            recentEvents: (runId, limit) => scopedStore.tailLog(runId, limit),
+            fixAttempts: (runId) => ({
+              0: scopedStore.getFixAttempts(runId, 0),
+              1: scopedStore.getFixAttempts(runId, 1),
+              2: scopedStore.getFixAttempts(runId, 2),
+            }),
+          },
+        }),
+        masterLease,
         // The no-provider wait's reset ETA (ADR-0037 P3.2): the soonest the claude pool (the v1
         // metered impl provider) regains headroom, stamped onto the parked backlog rows.
         implProviderResetsAt: () => implProviderResetsAt(usageMeter, config.usageLimit.admitBelowPercent, Date.now()),

@@ -30,6 +30,7 @@ import type { StuckReport } from "../executor/stuck-tool";
 import type { EscalationQuestion } from "../review/escalation";
 import type { FixOutcome } from "../review/agents";
 import type { Worklist } from "../review/worklist";
+import type { MasterSessionResult } from "../master/outcome";
 import type { RateLimitSignal } from "../core/usage";
 
 /** The isolated working tree a run executes in — a fresh clone, never reused (ADR-0038 L3). */
@@ -183,6 +184,18 @@ export interface FixSessionHost {
   fix(input: ReviewFixSessionInput): Promise<FixOutcome>;
 }
 
+/**
+ * Hosts one **master** adjudication inside the container (ADR-0041): runs the pushed master
+ * prompt as a fully agentic session over the cloned workspace — it may read, edit, run tests,
+ * commit and push the issue branch, and inspect GitHub — and returns exactly one
+ * {@link MasterSessionResult}. Structurally identical to the review/fix hosts (one prompt in,
+ * one validated contract out), which is what lets the master reuse the whole container
+ * lifecycle — transcript capture, wall clock, route injection, cleanup — unchanged.
+ */
+export interface MasterSessionHost {
+  adjudicate(input: ReviewFixSessionInput): Promise<MasterSessionResult>;
+}
+
 /** Construction deps for one {@link runContainerRunner} invocation. */
 export interface ContainerRunnerDeps {
   /** Fresh-clones the run's workspace. */
@@ -206,6 +219,8 @@ export interface ContainerRunnerDeps {
   reviewSession?: ReviewSessionHost;
   /** Hosts a fix attempt for a `kind: "fix"` assignment (#189). Required for such a run. */
   fixSession?: FixSessionHost;
+  /** Hosts a master adjudication for a `kind: "master"` assignment (ADR-0041). */
+  masterSession?: MasterSessionHost;
 }
 
 /**
@@ -300,7 +315,9 @@ export async function runContainerRunner(
       ? await runReviewPass(deps, assignment, workspace.path, transcriptSink, onRateLimit)
       : assignment.kind === "fix"
         ? await runFixAttempt(deps, assignment, workspace.path, transcriptSink, onRateLimit)
-        : await runImplSession(deps, assignment, workspace.path, transcriptSink, onRateLimit);
+        : assignment.kind === "master"
+          ? await runMasterSession(deps, assignment, workspace.path, transcriptSink, onRateLimit)
+          : await runImplSession(deps, assignment, workspace.path, transcriptSink, onRateLimit);
 
   // Drain the shared chain — every captured transcript message + relayed rate-limit signal — onto the
   // wire before the terminal frame, so the daemon sees the run's transcript and folds its meter ahead of
@@ -437,8 +454,42 @@ async function runFixAttempt(
   }
 }
 
-/** A human-readable `failed` detail for a review/fix session that threw (parse/wall-clock terminal). */
-function failureDetail(role: "review" | "fix", assignment: Assignment, err: unknown): string {
+/**
+ * Host one master adjudication (ADR-0041) and relay its single chosen resolution as a `master`
+ * terminal. A thrown terminal (parse failure, wall-clock kill) degrades to `failed`, which the
+ * daemon reads as "no outcome this attempt" and defers — the pending intervention stays
+ * re-adoptable rather than the escalation being lost (best-effort pipe, ADR-0016).
+ */
+async function runMasterSession(
+  deps: ContainerRunnerDeps,
+  assignment: Assignment,
+  workspacePath: string,
+  transcriptSink: TranscriptSink,
+  onRateLimit: ((signal: RateLimitSignal) => void) | undefined,
+): Promise<ResultFrame> {
+  if (!deps.masterSession) {
+    return { kind: "result", outcome: "failed", detail: "master run dispatched without a master session host" };
+  }
+  try {
+    const result = await deps.masterSession.adjudicate({
+      assignment,
+      workspacePath,
+      transcriptSink,
+      onRateLimit,
+    });
+    return {
+      kind: "result",
+      outcome: "master",
+      detail: `master chose ${result.outcome.resolution} (issue #${assignment.issueNumber})`,
+      master: { resolution: result.outcome.resolution, result },
+    };
+  } catch (err) {
+    return { kind: "result", outcome: "failed", detail: failureDetail("master", assignment, err) };
+  }
+}
+
+/** A human-readable `failed` detail for a review/fix/master session that threw. */
+function failureDetail(role: "review" | "fix" | "master", assignment: Assignment, err: unknown): string {
   const reason = err instanceof Error ? err.message : String(err);
   return `${role} session failed (issue #${assignment.issueNumber}): ${reason}`;
 }

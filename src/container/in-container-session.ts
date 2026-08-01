@@ -36,7 +36,9 @@ import type { FixOutcome } from "../review/agents";
 import type { ProviderName, TargetConfig } from "../config/schema";
 import type { Assignment, SessionProfile } from "./assignment";
 import { CONTAINER_CODEX_HOME, MODEL_ENV_VAR, PROVIDER_ENV_VAR, ZAI_TOKEN_ENV_NAME_VAR } from "./docker-runner";
-import type { FixSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerFinalizeInput, RunnerFinalizer, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
+import { MASTER_SYSTEM_APPEND } from "../master/prompt";
+import { parseMasterSessionResult } from "../master/outcome";
+import type { FixSessionHost, MasterSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerFinalizeInput, RunnerFinalizer, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
 
 /**
  * Run a git subcommand in `cwd`, returning stdout (throws with stderr on a non-zero exit).
@@ -378,6 +380,40 @@ export function createReviewSessionHost(
         backend,
         { prompt: input.assignment.prompt, worktreePath: input.workspacePath, systemAppend: REVIEW_SYSTEM_APPEND },
         (text) => parseWorklist(extractJsonObject(text)),
+      );
+    },
+  };
+}
+
+/**
+ * A {@link MasterSessionHost} that runs one master adjudication *inside the container*
+ * (ADR-0041). It is deliberately the **same** structured-output contract the review/fix hosts
+ * use — one prompt in, one validated object out — so the master inherits the entire container
+ * lifecycle unchanged: transcript capture, the wall clock, the injected route, secret redaction,
+ * and cleanup. What differs is capability, not plumbing: the session runs agentically over the
+ * cloned WIP worktree (read, edit, run tests, commit and push the issue branch, inspect GitHub),
+ * and the harness invariants it must not cross are enforced by the master guardrails hook and by
+ * simply never handing it merge/close.
+ *
+ * The system append is the master's, not a review rubric: it states the adjudicate-don't-relay
+ * rule, the binding invariants, and the exactly-one-outcome contract.
+ */
+export function createMasterSessionHost(
+  config: TargetConfig,
+  route: InContainerRoute,
+  deps: ContainerSessionDeps = {},
+): MasterSessionHost {
+  return {
+    adjudicate(input) {
+      const backend = structuredBackendForRoute(config, route, input.transcriptSink, deps, input.onRateLimit);
+      return runStructuredWithBackend(
+        backend,
+        {
+          prompt: input.assignment.prompt,
+          worktreePath: input.workspacePath,
+          systemAppend: MASTER_SYSTEM_APPEND,
+        },
+        (text) => parseMasterSessionResult(extractJsonObject(text)),
       );
     },
   };

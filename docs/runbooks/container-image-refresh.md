@@ -35,6 +35,33 @@ The L0 base is **versioned by ralph release** and adopted deliberately:
    re-establishes container-eligibility; if you want the full belt-and-braces, produce + review a
    shadow run before relying on it ([`container-flip.md`](container-flip.md)).
 
+#### Runner capabilities — why a stale base now fails LOUD (ADR-0041)
+
+The L0 base stamps what its runner build can do into an `io.ralph.runner-capabilities` image
+label (and the matching `RALPH_RUNNER_CAPABILITIES` env var). The daemon reads that label
+**before** it dispatches anything a stale runner would mis-serve.
+
+Most dispatch fields are safely additive — an old runner ignores what it does not know. Master
+escalation is the exception: `assignment.escalationMode: "master"` says *do not post a
+`ralph-question`; relay it and let the daemon queue a master*. A runner that ignores it posts the
+question anyway, and an operator is paged for a decision the master was supposed to make —
+silently. So the daemon refuses instead:
+
+```
+RunnerCompatibilityError: runner image `acme/widgets` does not declare the capability required
+for this dispatch: master-escalation. It declares [impl, review-fix, runner-direct-escalate].
+```
+
+**Fix:** rebuild the L0 base (step 1), bump the target's `FROM` pin (step 2), re-run the
+smoke test (step 3) — it checks the label and fails at onboarding rather than mid-run:
+
+```bash
+docker image inspect --format '{{ index .Config.Labels "io.ralph.runner-capabilities" }}' <tag>
+```
+
+The capability list is **additive**: a name is added when the runner learns a new trick, never
+removed or repurposed, so a newer image always satisfies an older daemon.
+
 ### B. Toolchain / deps bump (L1 / L2)
 
 L1 (toolchain) and L2 (deps) are **owned by the target repo** and rebuilt on change:

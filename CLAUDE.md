@@ -97,11 +97,17 @@ One pass through the system, mapped to modules (all under `src/`):
    `review/prompts.ts` and target-independent (ADR-0012). `sdk-agents.ts` are the real SDK
    review/fix runners; `worklist.ts` is the deduped, severity-ranked finding list.
 
-5. **`hitl/`** — the async escalate/heal path. An agent calls **`escalate`** (never Claude's
-   built-in `AskUserQuestion`): it checkpoints WIP, posts a structured `ralph-question`
-   comment, swaps `ready-for-agent → awaiting-answer`, frees the slot. `ralph-answer.ts`
-   (CLI in `bin/`) serves open questions one at a time anywhere; the next tick **resumes,
-   not restarts** the agent (`resume.ts`) from its WIP branch with the answer injected.
+5. **`hitl/`** + **`master/`** — the escalate path, which now runs through a **master** first
+   (ADR-0041, DESIGN §13). A worker calls **`escalate`** (never Claude's built-in
+   `AskUserQuestion`) or `stuck`: both checkpoint WIP, promote the issue to `complexity:1`,
+   and enter `master-triage` — **no** `ralph-question`, **no** `agent-stuck`. The reconciler
+   services that queue before fresh admission, on the ordinary cap, under one process-wide
+   lease (`master/lease.ts`); `master/engine.ts` runs a fresh tier-1 session that adjudicates
+   under a two-per-phase loop budget (`master/budget.ts`, keyed on the normalized
+   `master/signature.ts`) and picks exactly one of five outcomes (`master/outcome.ts`). Only
+   its `ask-human` posts a `ralph-question` and reaches `awaiting-answer`; `ralph-answer.ts`
+   (CLI in `bin/`) serves it, and the next tick **resumes the master** — not the worker — with
+   the answer injected (`resume.ts` still drives ordinary worker resumes).
 
 6. **`daemon/completeness.ts`** — `classifyIssueState()` is a **total, pure** function that
    sorts every open issue + non-terminal run into exactly one of
