@@ -181,6 +181,31 @@ describe("master loop budget (ADR-0041)", () => {
     expect(resolutionAllowed(verdict, "terminal-stuck")).toBe(true);
   });
 
+  it("a re-adopted attempt already human-resumed on a prior tick may not ask again, with no answer present", () => {
+    // attempt 1 asked a human; the human answered, re-opening attempt 1 (humanResumes → 1); then the
+    // resumed session deferred or the daemon crashed before it decided. The NEXT tick re-adopts the
+    // still-open attempt with NO answer in hand, so the transient `humanResumed` flag is false. The
+    // durable humanResumes count folded from the stream — not the transient flag — must still forbid a
+    // second `ask-human`, or ask → answer → ask cycles unbounded, one ordinary deferral per turn
+    // (ADR-0041 decision 16; the issue #42 loop-budget acceptance criterion).
+    const history = foldMasterHistory([
+      started(),
+      requested("s1"),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 1, phase: "impl", signature: "s1" }),
+      ev("MasterHumanQuestionRequested", { runId: "r1", attempt: 1, phase: "impl", headline: "h" }),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 1, phase: "impl", signature: "s1" }),
+    ]);
+    const open = resumeAttempt(history)!;
+    expect(open.humanResumes).toBe(1);
+
+    const verdict = readoptedAttemptBudget(history, open, false);
+
+    expect(resolutionAllowed(verdict, "ask-human")).toBe(false);
+    expect(verdict.allowed && verdict.forbiddenResolutions).toContain("ask-human");
+    // Terminal adjudication stays open — the run remains human-visible, but the loop cannot continue.
+    expect(resolutionAllowed(verdict, "terminal-stuck")).toBe(true);
+  });
+
   it("never refuses an already-open attempt — it constrains its resolutions instead", () => {
     // Pathological: two completed attempts AND an open third (a state the engine cannot
     // produce, but the fold must survive). Refusing would strand the run with no session and

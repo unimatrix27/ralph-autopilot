@@ -134,8 +134,14 @@ export function resumeAttempt(history: MasterHistory): MasterInterventionRecord 
  * fresh — proposes `retry-pipeline` again. So the verdict is computed by evaluating the ordinary
  * rule against the history **with this attempt removed**, then pinning the attempt number back.
  *
- * `humanResumed` additionally forbids `ask-human`: an answered question that could ask again is
- * the one loop a human in the middle would otherwise make unbounded.
+ * A human-resumed attempt additionally forbids `ask-human`: an answered question that could ask
+ * again is the one loop a human in the middle would otherwise make unbounded. This holds whether
+ * the resume is happening on THIS call (`humanResumed`) or already happened on a prior tick and the
+ * resumed session then deferred or crashed before deciding. In that deferred case the next tick
+ * re-adopts the still-open attempt with no answer in hand — `humanResumed` is false — so only the
+ * durable `open.humanResumes` count (folded from the stream) still remembers that asking again would
+ * reopen the ask → answer → ask cycle. Reading it here mirrors how the repeated-signature constraint
+ * is already inherited durably from the fold below.
  */
 export function readoptedAttemptBudget(
   history: MasterHistory,
@@ -148,7 +154,11 @@ export function readoptedAttemptBudget(
   };
   const base = evaluateMasterBudget({ history: without, phase: open.phase, signature: open.signature });
   const inherited = base.allowed ? base.forbiddenResolutions : [...AUTONOMOUS_RESOLUTIONS];
-  const forbiddenResolutions = humanResumed ? [...new Set([...inherited, "ask-human" as const])] : inherited;
+  // The transient flag OR the durable fold — either means a human has resumed this attempt, and a
+  // second `ask-human` on it would re-arm the loop the budget exists to break. `open.humanResumes`
+  // is what survives a deferral/crash after the resume, so it must gate ask-human independently.
+  const humanResumedEver = humanResumed || open.humanResumes > 0;
+  const forbiddenResolutions = humanResumedEver ? [...new Set([...inherited, "ask-human" as const])] : inherited;
   return {
     // An attempt that is already open is never refused — refusing it would strand the run in
     // `master-triage` with no session and no terminal. Its *resolutions* are constrained instead.
