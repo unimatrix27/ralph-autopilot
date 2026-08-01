@@ -16,6 +16,7 @@ import {
   type ReviewContext,
 } from "./agents";
 import { LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "../hitl/labels";
+import { isGitHubRateLimitError } from "../github/gh-cli";
 import { parseEscalationQuestion, RALPH_QUESTION_FENCE } from "./escalation";
 import { formatReviewComment, parseReviewComment } from "./review-comment";
 import { type MergeConfig, ReviewLoop, type ReviewLoopContext } from "./review-loop";
@@ -724,6 +725,245 @@ describe("ReviewLoop", () => {
     expect(masterRequests()[0]!.source).toBe("hosted-review");
   });
 
+  // ── the ordinary fix lane over a hosted worklist (issue #43 AC) ───────────
+  //
+  // "The ordinary fix lane MAY address the first hosted-Codex worklist. Repeated findings, a
+  // materially unchanged thread after a claimed fix, conflicting findings, or exhausted fix
+  // attempts route to the master BEFORE any human question." Before this, the FIRST sighting
+  // went straight to the master with a hardcoded `attempts: 1` and the fix agent never saw a
+  // hosted finding at all — so the gate could never converge: master repairs → re-enter phase 0
+  // → still BLOCKED → escalate → budget exhausts → terminal-stuck.
+
+  /** A disposition the fix agent reports for the seeded Codex thread. */
+  const codexDisposition = {
+    threadId: "PRRT_codex",
+    disposition: "fixed" as const,
+    rationale: "The merge poll now types the blocker before spending a poll on it.",
+    verification: "Added a regression test for the conversation blocker; `npm test` is green.",
+  };
+
+  it("hands the FIRST hosted worklist to the fix lane, then replies + resolves on the VERIFIED head and merges", async () => {
+    const ctx = setup();
+    const { loop, fixAgent } = wire({
+      review: [clean],
+      hostedGate: true,
+      fix: [{ kind: "fixed", dispositions: [codexDisposition] }],
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // The fix agent pushed: origin/<branch> has advanced past the head the reviewer looked at.
+    worktrees.scriptRemoteBranchHead("head2");
+    github.setMergeStatusSequence(ctx.prNumber, [
+      { state: "BLOCKED", headSha: "head1" },
+      { state: "CLEAN", headSha: "head2" },
+    ]);
+    github.setReviewThreads(ctx.prNumber, [codexThread()], "head1");
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "merged" });
+    // The fix lane was handed the finding with its exact thread / path / line / head context.
+    const hosted = fixAgent.calls[0]!.hosted!;
+    expect(hosted.findings.map((f) => f.threadId)).toEqual(["PRRT_codex"]);
+    expect(hosted.findings[0]!.path).toBe("src/review/review-loop.ts");
+    expect(hosted.findings[0]!.line).toBe(1204);
+    expect(hosted.headSha).toBe("head1");
+    // Exactly one reply and one resolution, carrying the rationale AND its verification, and
+    // only AFTER the push was verified on the relevant head.
+    expect(github.threadReplies).toHaveLength(1);
+    expect(github.threadReplies[0]!.body).toContain(codexDisposition.rationale);
+    expect(github.threadReplies[0]!.body).toContain("npm test");
+    expect(github.threadReplies[0]!.body).toContain("head2");
+    expect(github.resolvedThreads).toEqual(["PRRT_codex"]);
+    // No human was involved and no master attempt was spent — the lane converged on its own.
+    expect(masterRequests()).toHaveLength(0);
+    expect(store.listOpenQuestions()).toHaveLength(0);
+  });
+
+  it("persists an independent rationale + verification for a finding the agent judges invalid", async () => {
+    const ctx = setup();
+    const { loop } = wire({
+      review: [clean],
+      hostedGate: true,
+      fix: [
+        {
+          kind: "fixed",
+          dispositions: [
+            {
+              threadId: "PRRT_codex",
+              disposition: "reasoned-invalid",
+              rationale: "The poll is already bounded by maxPolls, which the reviewer did not read.",
+              verification: "Traced every exit of awaitMergeable; the bound is asserted by an existing test.",
+            },
+          ],
+        },
+      ],
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // A reasoned-invalid disposition needs no push — but it still names the head it was made on.
+    worktrees.scriptRemoteBranchHead("head1");
+    github.setMergeStatusSequence(ctx.prNumber, [
+      { state: "BLOCKED", headSha: "head1" },
+      { state: "CLEAN", headSha: "head1" },
+    ]);
+    github.setReviewThreads(ctx.prNumber, [codexThread()], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+    // The reply argues the finding on its merits — a bot finding is never dismissed merely
+    // because a bot raised it (ADR-0042 §12).
+    expect(github.threadReplies[0]!.body).toContain("already bounded by maxPolls");
+    expect(github.threadReplies[0]!.body).toContain("Traced every exit");
+    expect(github.threadReplies[0]!.body).toContain("not accepted");
+    const resolved = store.readIssueStream(3).find((e) => e.type === "HostedReviewThreadResolved")!;
+    expect((resolved.data as { disposition: string }).disposition).toBe("reasoned-invalid");
+  });
+
+  it("routes a CLAIMED fix that was never pushed to the master instead of replying to an unverified head", async () => {
+    const ctx = setup();
+    const { loop } = wire({
+      review: [clean],
+      hostedGate: true,
+      fix: [{ kind: "fixed", dispositions: [codexDisposition] }],
+      merge: { ciTimeoutMinutes: 60, pollIntervalSeconds: 30 },
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // origin/<branch> is still the head the reviewer looked at: nothing was pushed.
+    worktrees.scriptRemoteBranchHead("head1");
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [codexThread()], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "master-triage", phase: 0 });
+    // NOTHING was written to the thread: a reply is a GitHub write that cannot be undone, and
+    // "fixed" on a head that never moved is not a fix.
+    expect(github.threadReplies).toEqual([]);
+    expect(github.resolvedThreads).toEqual([]);
+    expect(masterRequests()[0]!.source).toBe("hosted-review");
+    expect(masterEvidence()).toContain("not verified on the head");
+  });
+
+  it("routes a materially unchanged thread after a claimed fix to the master, not a second identical repair", async () => {
+    const ctx = setup();
+    const { loop, fixAgent } = wire({
+      review: [clean],
+      hostedGate: true,
+      fix: [{ kind: "fixed", dispositions: [codexDisposition] }],
+      merge: { ciTimeoutMinutes: 60, pollIntervalSeconds: 30 },
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    worktrees.scriptRemoteBranchHead("head2", "head3");
+    // The reviewer keeps reporting the SAME finding on every head: the repair did not take.
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", headSha: "head1" });
+    github.setReviewThreadSequence(ctx.prNumber, [
+      { kind: "threads", threads: [codexThread()], headSha: "head1" },
+      { kind: "threads", threads: [codexThread({ isResolved: false })], headSha: "head1" },
+    ]);
+
+    expect(await loop.run(ctx)).toEqual({ kind: "master-triage", phase: 0 });
+    // The lane spent exactly ONE repair on it; the second sighting of the same content is a
+    // repeat, and a repeat is the master's, not another container run's.
+    expect(fixAgent.calls).toHaveLength(1);
+    expect(masterRequests()).toHaveLength(1);
+    expect(masterRequests()[0]!.source).toBe("hosted-review");
+    expect(masterEvidence()).toContain("materially unchanged");
+    // The signature carries the finding's content, so a re-push (a new head, same finding)
+    // cannot present as a brand-new failure to the master's loop budget.
+    expect(masterRequests()[0]!.signature).toContain("hosted-review");
+  });
+
+  it("routes conflicting findings (a human thread alongside the hosted ones) to the master, resolving nothing", async () => {
+    const ctx = setup();
+    const { loop, fixAgent } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", headSha: "head1" });
+    github.setReviewThreads(
+      ctx.prNumber,
+      [
+        codexThread(),
+        codexThread({
+          id: "PRRT_human",
+          comments: [
+            {
+              id: "PRRC_human",
+              author: "alice",
+              authorIsBot: false,
+              body: "I would rather we kept the old adapter.",
+              createdAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+        }),
+      ],
+      "head1",
+    );
+
+    expect(await loop.run(ctx)).toEqual({ kind: "master-triage", phase: 0 });
+    // Resolution authority is split, so the fix lane never runs: the human thread would still
+    // hold the merge however well the hosted one was addressed.
+    expect(fixAgent.calls).toHaveLength(0);
+    expect(github.resolvedThreads).toEqual([]);
+    // Both conversations reach the master as evidence.
+    expect(masterEvidence()).toContain("kept the old adapter");
+    expect(masterEvidence()).toContain("burn its whole budget");
+  });
+
+  it("runs the hosted gate even when CI gating is off — the hosted reviewer is not CI (#43)", async () => {
+    const ctx = setup();
+    const { loop } = wire({
+      review: [clean],
+      hostedGate: true,
+      // A repo that does not gate on checks at all (`merge.waitForChecks: false`) still has a
+      // hosted reviewer; before this, awaitMergeable returned `mergeable` before ever reading a
+      // review thread, so the merge fired past an open conversation.
+      merge: { waitForChecks: false },
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [codexThread()], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "master-triage", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    expect(github.checkPolls).toHaveLength(0);
+    expect(masterRequests()[0]!.source).toBe("hosted-review");
+  });
+
+  it("merges with CI gating off once the hosted gate is clear", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true, merge: { waitForChecks: false } });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+    expect(github.checkPolls).toHaveLength(0);
+  });
+
+  it("defers a rate-limit-dominated merge wait instead of escalating a phantom merge failure (#43)", async () => {
+    const ctx = setup();
+    const { loop } = wire({
+      review: [clean],
+      hostedGate: true,
+      // One poll of merge-readiness budget: the rate-limited window outlasts it.
+      merge: { ciTimeoutMinutes: 1, pollIntervalSeconds: 60 },
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", headSha: "head1" });
+    github.setReviewThreadSequence(ctx.prNumber, [
+      { kind: "unavailable", reason: "rate-limited", detail: "API rate limit exceeded" },
+    ]);
+
+    const thrown = await loop.run(ctx).then(
+      () => null,
+      (err: unknown) => err,
+    );
+
+    // It defers exactly as every other transient GitHub limit does — the executor's merge path
+    // recognises this and leaves the run `awaiting-merge` for the next tick (ADR-0023/#101).
+    // Before this it escalated `merge-not-mergeable state=CLEAN`: an attempt spent AND evidence
+    // naming a blocker that did not exist.
+    expect(isGitHubRateLimitError(thrown)).toBe(true);
+    expect(masterRequests()).toHaveLength(0);
+    expect(github.merges).toHaveLength(0);
+    expect(store.getRunByIssue(3)!.status).not.toBe("master-triage");
+  });
+
   it("merges without stalling when the repo has no hosted reviewer (issue #43)", async () => {
     const ctx = setup();
     const { loop } = wire({ review: [clean], hostedGate: true });
@@ -737,7 +977,7 @@ describe("ReviewLoop", () => {
     expect(github.merges).toHaveLength(1);
   });
 
-  it("a fix agent can escalate instead of applying a risky structural change", async () => {
+  it("a fix agent's escalate is adjudicated by a master FIRST — never a straight-to-human question (ADR-0042 §8)", async () => {
     const ctx = setup();
     const { loop, reviewAgent } = wire({
       review: [blocked],
@@ -746,24 +986,55 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "escalated", phase: 1 });
-    // Status swaps to awaiting-answer (the reconciler diff projects its label, #82),
-    // not review-maxed; the loop sets neither label imperatively.
-    expect(store.getRunByIssue(3)!.status).toBe("awaiting-answer");
+    // The run parks on the master queue, not on a human-attention state: `awaiting-answer` is
+    // reachable only through a master's `ask-human`, and a risky structural change is exactly
+    // the diagnosable, issue-scoped fault a tier-1 master adjudicates before anyone is paged.
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.addedLabels.some((l) => l.label === LABEL_AWAITING_ANSWER)).toBe(false);
     expect(github.addedLabels.some((l) => l.label === LABEL_REVIEW_MAXED)).toBe(false);
-    // A parseable ralph-question was posted and indexed.
-    const questions = store.listOpenQuestions();
-    expect(questions[0]!.kind).toBe("escalate");
-    const comment = (github.comments.get(3) ?? [])[0]!;
-    const fence = comment.body.split("```" + RALPH_QUESTION_FENCE)[1]!.split("```")[0]!;
-    expect(parseEscalationQuestion(JSON.parse(fence)).headline).toBe(escalation.headline);
-    // It checkpointed for resume-not-restart, carrying the review phase so the resume
-    // re-enters the review loop there (not the impl prompt) — issue #9.
+    // NO ralph-question was posted or indexed — that surface is the master's alone.
+    expect(store.listOpenQuestions()).toHaveLength(0);
+    expect((github.comments.get(3) ?? []).some((c) => c.body.includes(RALPH_QUESTION_FENCE))).toBe(false);
+    // The agent's question travels intact as the request's evidence: the master adjudicates the
+    // actual decision, not a "the fix agent escalated" stub.
+    const requests = masterRequests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.source).toBe("escalate");
+    expect(requests[0]!.lane).toBe("fix");
+    expect(masterEvidence()).toContain(escalation.decision);
+    expect(masterEvidence()).toContain(escalation.stakes);
+    // It still checkpointed for resume-not-restart, carrying the review phase so a master
+    // hand-back re-enters the review loop there (not the impl prompt) — issue #9.
     expect(store.getResumeContext(ctx.runId)!.context.phase).toBe(1);
     // Stopped before phase 2 and never merged.
     expect(reviewAgent.calls.every((c) => c.phase === 1)).toBe(true);
     expect(github.merges).toHaveLength(0);
+  });
+
+  it("keeps the legacy checkpoint when NO master is wired (the pre-cutover unit fixtures)", async () => {
+    const ctx = setup();
+    // wireRunners builds a loop with a master wired; this one deliberately has none, which is
+    // the only configuration in which a fix escalate may still reach a human directly.
+    const loop = new ReviewLoop({
+      store,
+      github,
+      reviewAgent: new ScriptedReviewAgent([blocked]),
+      fixAgent: new ScriptedFixAgent([{ kind: "escalate", question: escalation }]),
+      logger: silent,
+      maxFixAttempts: 3,
+      maxContainerRetries: 2,
+      worktrees,
+      baseBranch: BASE,
+      merge: mergeConfig,
+      sleep: async () => {},
+    });
+
+    expect(await loop.run(ctx)).toEqual({ kind: "escalated", phase: 1 });
+    expect(store.getRunByIssue(3)!.status).toBe("awaiting-answer");
+    const comment = (github.comments.get(3) ?? [])[0]!;
+    const fence = comment.body.split("```" + RALPH_QUESTION_FENCE)[1]!.split("```")[0]!;
+    expect(parseEscalationQuestion(JSON.parse(fence)).headline).toBe(escalation.headline);
   });
 
   it("threads mode:infra to the review and fix agents (AC4 — no test gate)", async () => {
@@ -1001,7 +1272,7 @@ describe("ReviewLoop", () => {
     expect(reviewAgent.calls).toHaveLength(0);
   });
 
-  it("a fix agent can escalate out of the CI gate", async () => {
+  it("a fix agent escalating out of the CI gate reaches the master, not a human", async () => {
     const ctx = setup();
     github.setCiRed(ctx.prNumber, ["build"]);
     const { loop, reviewAgent } = wire({
@@ -1011,11 +1282,12 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "escalated", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(reviewAgent.calls).toHaveLength(0);
-    // Status swaps to awaiting-answer (the reconciler diff's label source, #82).
-    expect(store.getRunByIssue(3)!.status).toBe("awaiting-answer");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
+    expect(store.listOpenQuestions()).toHaveLength(0);
     expect(github.addedLabels.some((l) => l.label === LABEL_AWAITING_ANSWER)).toBe(false);
+    expect(masterRequests()[0]!.source).toBe("escalate");
   });
 
   it("skips the CI gate when waitForChecks is false (merges without polling)", async () => {
@@ -1343,7 +1615,7 @@ describe("ReviewLoop", () => {
     expect(body).toContain("diverged");
   });
 
-  it("a rebase conflict implying a risky structural change escalates (never resolved blind)", async () => {
+  it("a rebase conflict implying a risky structural change escalates to the master (never resolved blind, never a human question)", async () => {
     const ctx = setup();
     worktrees.scriptRebase({ kind: "conflict", files: ["src/core/ledger.ts"], baseSha: "base-1" });
     const { loop } = wire({
@@ -1353,11 +1625,15 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "escalated", phase: 0 });
+    // A non-trivial rebase divergence is exactly the issue-scoped fault ADR-0042 binds to the
+    // master queue: no `ralph-question`, no `awaiting-answer`.
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(github.merges).toHaveLength(0);
     // Escalated, not resolved → the daemon never verified.
     expect(worktrees.rebaseVerifyCalls).toHaveLength(0);
-    expect(store.getRunByIssue(3)!.status).toBe("awaiting-answer");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
+    expect(store.listOpenQuestions()).toHaveLength(0);
+    expect(masterRequests()[0]!.source).toBe("escalate");
   });
 
   it("a rebase-conflict fix reported `failed` maxes out gracefully, never orphaning the PR (#273)", async () => {

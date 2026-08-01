@@ -85,13 +85,32 @@ export function latestComment(thread: ReviewThread): ReviewThreadComment | null 
 }
 
 /**
+ * The 16 letters a finding hash is written in — deliberately **disjoint from hex** (`0-9a-f`)
+ * and containing no digits. See {@link hashFindingBody}.
+ */
+const FINDING_HASH_ALPHABET = "ghijklmnopqrstuv";
+
+/**
  * A stable content hash of a finding's latest comment. Two reads of a thread whose body has
  * not materially changed hash identically, which is what makes "the same finding after a
  * claimed fix" detectable — and therefore what stops the same repair from looping.
  * Whitespace-insensitive so a reflowed body is not a new finding.
+ *
+ * The digest is rendered in a **non-hex, non-numeric alphabet** rather than as hex. That is
+ * not cosmetic: this hash is the *material* half of the hosted failure signature, and the
+ * master's signature normalizer erases every `[0-9a-f]{7,40}` run as an incidental SHA
+ * (`master/signature.ts`, ADR-0041). A hex digest was therefore erased along with the head
+ * SHAs — collapsing the signature to thread-id + path, so a genuinely NEW comment on the same
+ * thread read as a repeat and burned the master's budget on a forced final adjudication
+ * instead of a fresh recovery (issue #43). Written in `g–v`, it survives normalization intact
+ * while the head SHA still (correctly) does not.
  */
 export function hashFindingBody(body: string): string {
-  return createHash("sha256").update(body.replace(/\s+/g, " ").trim().toLowerCase()).digest("hex").slice(0, 16);
+  const digest = createHash("sha256")
+    .update(body.replace(/\s+/g, " ").trim().toLowerCase())
+    .digest("hex")
+    .slice(0, 16);
+  return Array.from(digest, (c) => FINDING_HASH_ALPHABET[parseInt(c, 16)]!).join("");
 }
 
 /** Severity a hosted reviewer states in its comment, when it states one. */
@@ -135,6 +154,23 @@ export interface HostedFinding {
   author: string;
 }
 
+/**
+ * How an agent disposed of one hosted finding. Both fields are mandatory and both are written
+ * into the reply body: a bot finding is never accepted **nor dismissed** because a bot raised
+ * it (ADR-0042 §12), so "I decided it was invalid" without the reasoning and the verification
+ * behind it is not a disposition — it is a silent dismissal wearing a label.
+ */
+export interface HostedDisposition {
+  /** The thread this disposition answers — matched against the worklist, never trusted blind. */
+  threadId: string;
+  /** `fixed` (the change is pushed) or `reasoned-invalid` (the finding does not hold). */
+  disposition: "fixed" | "reasoned-invalid";
+  /** The agent's OWN reasoning, independent of the reviewer's recommendation. */
+  rationale: string;
+  /** The evidence that reasoning rests on (a test, a trace, a command and its result). */
+  verification: string;
+}
+
 /** The bounded, deduped worklist one gate pass hands to a fix agent or the master. */
 export interface HostedWorklist {
   /** Actionable hosted-reviewer findings, oldest thread first. */
@@ -146,6 +182,16 @@ export interface HostedWorklist {
   humanThreads: HostedFinding[];
   /** Threads whose author could not be classified — a fail-closed condition. */
   unknownBotThreads: HostedFinding[];
+  /**
+   * Unresolved threads that are NOT actionable on this head — outdated, or anchored to an
+   * older one. They are deliberately kept out of the three buckets above (re-fixing a finding
+   * the head already moved past is how a repair loop is manufactured) but they are NOT
+   * nothing: GitHub's "require conversation resolution" ruleset counts an unresolved-outdated
+   * thread, so dropping them entirely is what turned a real, nameable blocker into
+   * `unknown-ruleset` — the same mis-attribution as #3430, one layer down. When the merge state
+   * is actually blocked, {@link classifyMergeBlock} names these instead of guessing.
+   */
+  unresolvedStale: HostedFinding[];
 }
 
 /** Why a thread did not enter the worklist — logged, so an empty worklist is never mysterious. */
@@ -224,9 +270,20 @@ export function buildHostedWorklist(
   threads: readonly ReviewThread[],
   headSha: string | null,
 ): HostedWorklist {
-  const worklist: HostedWorklist = { findings: [], humanThreads: [], unknownBotThreads: [] };
+  const worklist: HostedWorklist = {
+    findings: [],
+    humanThreads: [],
+    unknownBotThreads: [],
+    unresolvedStale: [],
+  };
   for (const thread of threads) {
-    if (!admitThread(thread, headSha).admit) {
+    const admission = admitThread(thread, headSha);
+    if (!admission.admit) {
+      // Not actionable here — but an UNRESOLVED thread still counts against the repository's
+      // conversation-resolution ruleset, so keep it nameable rather than invisible.
+      if (!thread.isResolved && (admission.reason === "outdated" || admission.reason === "stale-head")) {
+        worklist.unresolvedStale.push(normalizeThread(thread));
+      }
       continue;
     }
     const finding = normalizeThread(thread);
@@ -247,7 +304,13 @@ export function buildHostedWorklist(
   return worklist;
 }
 
-/** Whether a worklist has anything at all that blocks the merge. */
+/**
+ * Whether a worklist has anything **actionable on this head** that blocks the merge.
+ * `unresolvedStale` is deliberately excluded: a thread the head has already moved past is not
+ * a finding to fix, and treating it as one would re-open every superseded conversation after
+ * every push. It only becomes a named cause when GitHub *itself* reports the merge blocked
+ * (see {@link classifyMergeBlock}) — i.e. when the ruleset is provably counting it.
+ */
 export function hostedGateClean(worklist: HostedWorklist): boolean {
   return (
     worklist.findings.length === 0 &&
@@ -346,6 +409,13 @@ export function classifyMergeBlock(input: MergeBlockInput): MergeBlockCause {
       pending: input.checks.state === "pending",
     };
   }
+  // Blocked, no required check pending, no human verdict, and nothing actionable on this head —
+  // but there ARE unresolved conversations the head has moved past. GitHub's
+  // conversation-resolution ruleset counts those, so they are the blocker, and naming them is
+  // the whole difference between "resolve these two threads" and an unattributable ruleset.
+  if (input.worklist && input.worklist.unresolvedStale.length > 0) {
+    return hostedCause(bucketByAuthor(input.worklist.unresolvedStale), merge);
+  }
   return {
     kind: "unknown-ruleset",
     detail: `mergeStateStatus=${merge.state} with no identified blocker (reviewDecision=${
@@ -354,8 +424,32 @@ export function classifyMergeBlock(input: MergeBlockInput): MergeBlockCause {
   };
 }
 
+/** The three author buckets a merge cause is chosen from. */
+type HostedBuckets = Pick<HostedWorklist, "findings" | "humanThreads" | "unknownBotThreads">;
+
+/** Split a flat finding list back into its author buckets (Ralph's own never appear here). */
+function bucketByAuthor(findings: readonly HostedFinding[]): HostedBuckets {
+  const buckets: HostedBuckets = { findings: [], humanThreads: [], unknownBotThreads: [] };
+  for (const finding of findings) {
+    switch (finding.authorType) {
+      case "hosted-reviewer":
+        buckets.findings.push(finding);
+        break;
+      case "human":
+        buckets.humanThreads.push(finding);
+        break;
+      case "unknown-bot":
+        buckets.unknownBotThreads.push(finding);
+        break;
+      case "ralph":
+        break;
+    }
+  }
+  return buckets;
+}
+
 /** Pick the hosted/human/unknown arm for a non-clean worklist, in fail-closed order. */
-function hostedCause(worklist: HostedWorklist, merge: MergeStatusSnapshot): MergeBlockCause {
+function hostedCause(worklist: HostedBuckets, merge: MergeStatusSnapshot): MergeBlockCause {
   if (worklist.unknownBotThreads.length > 0) {
     return { kind: "unknown-bot", threads: worklist.unknownBotThreads };
   }
@@ -429,6 +523,12 @@ export function renderHostedWorklist(worklist: HostedWorklist): string {
     "Unclassifiable bot conversations (fail closed)",
     worklist.unknownBotThreads,
     "The author could not be classified as the hosted reviewer, so nothing here may be auto-resolved.",
+  );
+  render(
+    "Unresolved conversations the head has moved past",
+    worklist.unresolvedStale,
+    "Outdated or anchored to an older head, so they are not a fix worklist — but the repository's " +
+      "conversation-resolution ruleset still counts them, so they can hold the merge.",
   );
   return lines.join("\n").trimEnd();
 }

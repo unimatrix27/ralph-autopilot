@@ -23,6 +23,7 @@ import {
   classifyIssueState,
   isNonTerminalStatus,
   OPERATOR_OWNED_ANOMALIES,
+  SELF_HEALING_ANOMALIES,
   type Classification,
   type IssueSnapshot,
 } from "./completeness";
@@ -574,7 +575,6 @@ describe("the post-cutover lifecycle enumeration (ADR-0042)", () => {
       "running-row-not-in-flight",
       "paused-run-unresumable",
       "paused-run-label-missing",
-      "answered-pause-stranded",
       "paused-label-missing-run",
       "non-terminal-run-on-closed-issue",
     ] as const) {
@@ -584,7 +584,23 @@ describe("the post-cutover lifecycle enumeration (ADR-0042)", () => {
     }
   });
 
+  it("never spends a master intervention on a GitHub-rate-limit stranding (#43, #132)", () => {
+    // `answered-pause-stranded` is a rate-limited `ready-for-agent` re-arm that failed, and
+    // the reconciler's own deterministic compensator retries it until it lands. Handing it to
+    // a master would burn one of the two per-phase interventions on a self-clearing GitHub
+    // condition AND flip the run off `awaiting-answer`, orphaning the operator's answer (the
+    // resume scan only looks at `awaiting-answer` / `review-maxed`).
+    expect(anomalyEnqueuesMaster("answered-pause-stranded", true)).toBe(false);
+    expect(SELF_HEALING_ANOMALIES).toContain("answered-pause-stranded");
+  });
+
   it("names every operator-owned anomaly exactly once (the boundary is one list, not a habit)", () => {
     expect(new Set(OPERATOR_OWNED_ANOMALIES).size).toBe(OPERATOR_OWNED_ANOMALIES.length);
+    expect(new Set(SELF_HEALING_ANOMALIES).size).toBe(SELF_HEALING_ANOMALIES.length);
+    // The two exclusion lists are disjoint: a reason is either the operator's to repair or
+    // the daemon's to retry, never both (they carry opposite operator actions).
+    for (const reason of SELF_HEALING_ANOMALIES) {
+      expect(OPERATOR_OWNED_ANOMALIES, reason).not.toContain(reason);
+    }
   });
 });

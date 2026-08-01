@@ -15,6 +15,7 @@ import { buildStuckCardQuestion } from "../executor/stuck";
 import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED, LABEL_READY } from "../hitl/labels";
 import { LABEL_AFK, LABEL_HITL, LABEL_MODE_TDD } from "../core/labels";
 import { parseRalphAnswer } from "../hitl/answer";
+import { operatorActionFor } from "../daemon/anomaly-action";
 import {
   accountsResponseSchema,
   analyticsResponseSchema,
@@ -219,10 +220,17 @@ describe("createWebPorts", () => {
     expect(view.daemon!.cap).toBe(5);
     expect(view.daemon!.lastTickAt).toBe("2026-06-21T00:59:50.000Z");
     expect(view.daemon!.stale).toBe(false);
-    // The island is listed with its logged reason.
-    expect(view.anomalies).toEqual([
-      { repo: "owner/a", issue: 42, reason: "paused-label-missing-run", title: "an island", since: "2026-06-21T00:00:00.000Z" },
-    ]);
+    // The island is listed with its logged reason AND the operator action it requires
+    // (issue #43 — a `daemon-anomaly` must name what the operator should do about it).
+    expect(view.anomalies).toHaveLength(1);
+    expect(view.anomalies[0]).toMatchObject({
+      repo: "owner/a",
+      issue: 42,
+      title: "an island",
+      since: "2026-06-21T00:00:00.000Z",
+    });
+    expect(view.anomalies[0]!.reason).toContain("paused-label-missing-run");
+    expect(view.anomalies[0]!.reason).toContain(operatorActionFor("paused-label-missing-run"));
     // The injected usage state flows through: the active login (no state) is optimistic;
     // the secondary login is gated at 95% ≥ 85%.
     expect(view.usage.activeId).toBe("primary");
@@ -499,21 +507,25 @@ describe("createWebPorts — Inbox + answers (issue #112)", () => {
       control: fakeControl(),
     });
 
-  it("lists open questions across repos oldest-first as structured cards with consequence + deep links (AC1/AC3)", async () => {
+  it("lists open questions across repos oldest-first, never the agent-stuck terminal (AC1/AC3, ADR-0042 §7)", async () => {
     // owner/a: an awaiting-answer escalation with a tracked run (branch + PR for deep links).
     seedEscalation(githubs["owner/a"]!, 11, "2026-02-02T00:00:00Z");
     store.forRepo("owner/a").upsertRun({ issueNumber: 11, mode: "tdd", branch: "ralph/11-x", prNumber: 42 });
-    // owner/b: an older agent-stuck stuck-card (no tracked run → null enrichment).
-    seedStuck(githubs["owner/b"]!, 10, "2026-02-01T00:00:00Z");
+    // owner/b: an older answerable pause (no tracked run → null enrichment).
+    seedHealCard(githubs["owner/b"]!, 10, "2026-02-01T00:00:00Z", 1);
+    // owner/b: the oldest issue of all is an `agent-stuck` terminal carrying a card. A
+    // completed master adjudication selected it, so the Inbox never offers it for answering.
+    seedStuck(githubs["owner/b"]!, 9, "2026-01-31T00:00:00Z");
 
     const res = await ports().inbox({});
     expect(inboxResponseSchema.safeParse(res).success).toBe(true);
     expect(res.reconcileIntervalSeconds).toBe(30);
-    // Oldest-first across repos, regardless of kind.
+    // Oldest-first across repos — with the terminal absent, not merely ranked last.
     expect(res.cards.map((c) => [c.repo, c.issue, c.attentionLabel, c.consequence])).toEqual([
-      ["owner/b", 10, "agent-stuck", "readmit-fresh"],
+      ["owner/b", 10, "review-maxed", "resume-from-wip"],
       ["owner/a", 11, "awaiting-answer", "resume-from-wip"],
     ]);
+    expect(res.cards.map((c) => c.issue)).not.toContain(9);
     // Stakes + recommendation are carried; the run enrichment yields deep links.
     expect(res.cards[1]!.question.stakes).toBe(inboxQuestion.stakes);
     expect(res.cards[1]!.question.recommendation).toBe(inboxQuestion.recommendation);
@@ -541,7 +553,7 @@ describe("createWebPorts — Inbox + answers (issue #112)", () => {
     githubs["owner/a"] = new BlockingListFakeGitHub("owner/a", started, release.promise);
     githubs["owner/b"] = new BlockingListFakeGitHub("owner/b", started, release.promise);
     seedEscalation(githubs["owner/a"]!, 31, "2026-02-03T00:00:00Z");
-    seedStuck(githubs["owner/b"]!, 30, "2026-02-02T00:00:00Z");
+    seedHealCard(githubs["owner/b"]!, 30, "2026-02-02T00:00:00Z", 1);
 
     const pending = ports().inbox({});
     try {
@@ -599,18 +611,20 @@ describe("createWebPorts — Inbox + answers (issue #112)", () => {
     expect(textAnswer).toEqual({ kind: "free-text", text: "log a deprecation first" });
   });
 
-  it("answering an agent-stuck stuck-card reports the re-admit-fresh consequence (AC3)", async () => {
+  it("refuses to answer an agent-stuck terminal and writes nothing (ADR-0042 §7)", async () => {
     seedStuck(githubs["owner/a"]!, 34, "2026-02-10T00:00:00Z");
+    const before = githubs["owner/a"]!.comments.get(34)!.length;
+
     const result = await ports().answer({ repo: "owner/a", issue: 34, kind: "free-text", text: "regenerate the lockfile" });
-    expect(result.kind).toBe("answered");
-    if (result.kind === "answered") {
-      expect(result.response.attentionLabel).toBe("agent-stuck");
-      expect(result.response.consequence).toBe("readmit-fresh");
-    }
-    // The stuck label swapped to ready-for-agent (re-admit, never a stale paused run).
+
+    // The terminal carries no answerable question, so the write edge refuses it (→ 404).
+    expect(result.kind).toBe("no-open-question");
+    // Nothing was written: the terminal still stands and the daemon is not re-armed.
+    expect(githubs["owner/a"]!.comments.get(34)!).toHaveLength(before);
+    expect(githubs["owner/a"]!.labelPatches).toEqual([]);
     const labels = githubs["owner/a"]!.issues.get(34)!.labels;
-    expect(labels).toContain(LABEL_READY);
-    expect(labels).not.toContain(LABEL_AGENT_STUCK);
+    expect(labels).toContain(LABEL_AGENT_STUCK);
+    expect(labels).not.toContain(LABEL_READY);
   });
 
   it("404s an answer for an issue with no open question, and 400s a malformed body", async () => {

@@ -133,9 +133,10 @@ Either of these begins a drain:
 
 On a drain the daemon logs `daemon.draining` with the issues still in flight,
 stops all new pickups and resumes, waits for the in-flight runs to finish, and
-exits `0` once the in-flight set empties. Paused runs (`awaiting-answer` /
-`master-triage`) are **not** resumed or started during a drain — they stay parked for a
-human, which is a clean state, not an abandonment.
+exits `0` once the in-flight set empties. Paused runs are **not** resumed or started
+during a drain: an `awaiting-answer` stays parked for its human, and a `master-triage`
+stays queued on GitHub for the next startup to service (a drain starts no master
+session, ADR-0042). Both are clean states, not abandonment.
 
 ### The drain timeout (a stalled drain)
 
@@ -177,8 +178,10 @@ the completion criterion for running unattended:
 
 What this means for operating the daemon:
 
-- **`daemon-anomaly` is a human-attention state.** When the reconciler cannot
-  classify an issue/run or finds a contradiction, it labels the issue
+- **`daemon-anomaly` is a human-attention state**, and since ADR-0042 the *only*
+  issue-side one you own (§4a): an anomaly the daemon can scope to an issue and a run
+  goes to `master-triage` instead, and what reaches you is a broken master path, an
+  unclassifiable issue state, or a host/supervisor fault. It labels the issue
   `daemon-anomaly` and logs the reason (`grep daemon.anomaly` the log, or watch the
   web control plane's recent-outcomes panel at http://127.0.0.1:4280). The daemon advances nothing in this
   state — **a human must read the anomaly reason and repair the underlying state**
@@ -196,7 +199,8 @@ What this means for operating the daemon:
   per-session wall-clock fails and a run sits in flight past its lifetime ceiling
   (`scheduler.maxRunLifetimeSeconds`, default 6h), the orphan sweep actively kills it:
   it asks the executor — the single owner of the run's session-kill handle — to abort
-  the run's live session, which terminalizes the run to `agent-stuck`, prunes its
+  the run's live session, which enqueues **master triage** for the wedge (ADR-0042; only
+  a completed master adjudication can terminalize it to `agent-stuck`), prunes its
   worktree, and frees the slot through that single owner once the killed session
   settles (no premature release while the session is still alive). In parallel it is
   surfaced as a `daemon-anomaly` (`reason: run-wedged-past-lifetime`) so you can see it
@@ -240,8 +244,9 @@ independently and resolves it if it can. What changes operationally:
 - **You will get fewer, better questions.** A `ralph-question` now only ever comes from a
   master that concluded a human decision is genuinely required — a product/priority call, a
   contradiction of standing design authority, or an external blocker. Answer it with
-  `ralph-answer` exactly as before; your answer resumes the **master's** adjudication, not the
-  original worker's session.
+  `node dist/bin/ralph-answer.js --repo owner/name` exactly as before — it runs anywhere an
+  authenticated `gh` does, serves one question at a time and performs the label swap itself;
+  your answer resumes the **master's** adjudication, not the original worker's session.
 - **`agent-stuck` now means more.** *Nothing* can reach it except a completed master
   adjudication — not a worker, not the review loop, not the executor's failure guard, not the
   reconciler (enforced by a source-scan test, not by convention). When you see it, either a

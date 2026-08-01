@@ -32,7 +32,6 @@ import {
 } from "../master/request";
 import type { EscalationQuestion } from "../review/escalation";
 import { buildHealGuidance } from "../review/prompts";
-import { findStuckHealGuidance, type StuckHealGuidance } from "../hitl/heal-readmit";
 import type { ResumeInjection } from "./prompts";
 import type { AgentRunner, AgentRunResult } from "./agent";
 import { createRunTranscriptSink } from "./transcript-sink";
@@ -70,6 +69,22 @@ export interface ExecutorResult {
   worktreePath: string;
   prNumber: number | null;
 }
+
+/**
+ * What the master door did with a post-claim session failure (ADR-0042). Four outcomes, not a
+ * boolean: the failure guard has no terminal of its own, so "the enqueue failed" and "there is
+ * no master" and "the issue is gone" must not collapse into the same fall-through.
+ *
+ *  - `escalated`    — the master queue owns it: no status write, PR left OPEN.
+ *  - `deferred`     — the enqueue itself failed; the run stays recoverable and the next tick
+ *                     retries it. Never a terminal (issue #43).
+ *  - `issue-closed` — nothing left to adjudicate and nobody to page: the span closes on the
+ *                     effect-neutral `closed` terminal (issue #81).
+ *  - `no-master`    — no master wired at all, which happens only in unit fixtures; the
+ *                     pre-cutover `agent-stuck` terminal runs (see `terminal-authority.test.ts`,
+ *                     which machine-checks that this is the sole remaining projection site).
+ */
+type FailureEscalation = "escalated" | "deferred" | "issue-closed" | "no-master";
 
 export interface ExecutorDeps {
   store: ScopedStore;
@@ -378,20 +393,10 @@ export class Executor {
       );
     }
 
-    // A fresh run on an issue whose prior attempt bounded out and was healed via
-    // `ralph-answer` carries the operator's guidance into its impl prompt (#86). The
-    // signal is GitHub-only (the issue's stuck-card + answer comments), so it survives
-    // a cold store. Reading it is best-effort: a transient GitHub blip must not
-    // terminalize a launchable run — the agent still runs from the issue body.
-    let stuckHeal: StuckHealGuidance | undefined;
-    try {
-      stuckHeal = (await findStuckHealGuidance(this.deps.github, issue.number)) ?? undefined;
-    } catch (err) {
-      log.warn("heal-readmit.read-failed", { error: String(err) });
-    }
-    if (stuckHeal) {
-      log.info("agent.heal-readmit", { headline: stuckHeal.question.headline });
-    }
+    // No stuck-heal read (ADR-0042 / issue #43): the #86 heal lane is retired. `agent-stuck`
+    // is a master-selected terminal, not an answerable pause, so no `ralph-answer` can ever
+    // post-date a stuck-card and the guidance this used to look for is never written. A
+    // re-admitted issue starts from its (re-scoped) body, and the master owns everything else.
     return this.withFailureGuard(
       {
         issueNumber: issue.number,
@@ -409,7 +414,6 @@ export class Executor {
           agentId: claimed.agentId,
           branch: claimed.branch,
           worktreePath: claimed.worktreePath,
-          stuckHeal,
           abortSignal,
           log,
         }),
@@ -736,6 +740,7 @@ export class Executor {
       // to the reconciler diff (issue #82) — the diff yields the state label to a standing
       // `daemon-anomaly` (the #28 claim-park rule), so it would never introduce `agent-stuck`.
       await github.addLabel(run.issueNumber, LABEL_AGENT_STUCK);
+      /* terminal-authority: no-master-fallback */
       await store.recordRunStuck({ runId: run.id, issueNumber: run.issueNumber, reason: "" });
     }
     // The closed-issue orphan needs no status write (issue #81): the `RunEnded { closed }`
@@ -760,30 +765,32 @@ export class Executor {
   }
 
   /**
-   * Route a mid-run session failure to the master queue (ADR-0042). Returns true when the
-   * escalation landed — the caller then leaves the PR OPEN and skips every `agent-stuck`
-   * effect, because a master adjudicating a run whose PR was auto-closed is adjudicating a
-   * corpse. Returns false when no master is wired, so the legacy terminal still runs.
+   * Route a mid-run session failure to the master queue (ADR-0042).
    *
-   * Fully guarded: an escalation that itself throws must never mask the original error, and
-   * must never leave the run stranded on `running` — a false return falls through to the
-   * pre-cutover terminal, which is exactly the right fallback.
+   * The return value is a *disposition*, not a boolean, because the three ways this can fail
+   * to enqueue want three different outcomes and collapsing them was the defect: a swallowed
+   * error used to read as "no master", which fell straight through to the pre-cutover
+   * terminal. A rate-limited `getIssue` — the single most likely fault here — therefore
+   * terminalized a recoverable run to `agent-stuck` with no adjudication at all, spending
+   * human attention on a transient external limit that self-clears (issue #43).
+   *
+   * Fully guarded: an escalation that itself throws must never mask the original error.
    */
   private async escalateFailureToMaster(
     ctx: { issueNumber: number; runId: number; branch: string; log: Logger },
     error: unknown,
-  ): Promise<boolean> {
+  ): Promise<FailureEscalation> {
     const escalation = this.deps.masterEscalation;
     if (!escalation) {
-      return false;
+      return "no-master";
     }
     const { issueNumber, runId, branch, log } = ctx;
     try {
       const issue = await this.deps.github.getIssue(issueNumber);
       if (!issue || issue.state !== "OPEN") {
-        // A closed issue has nothing left to adjudicate — fall through to the ordinary
-        // terminal, which records the span-closing fact.
-        return false;
+        // A closed issue has nothing left to adjudicate — and nothing to page a human about
+        // either. The caller closes the span on the effect-neutral `closed` terminal.
+        return "issue-closed";
       }
       const prNumber = this.deps.store.getRunByIssue(issueNumber)?.prNumber ?? null;
       await escalation.escalate({
@@ -808,10 +815,21 @@ export class Executor {
         logger: log,
       });
       log.warn("executor.failure-to-master", { issue: issueNumber, error: String(error).slice(0, 200) });
-      return true;
+      return "escalated";
     } catch (err) {
-      log.error("executor.failure-escalation-failed", { error: String(err) });
-      return false;
+      // The *enqueue* failed — which says nothing about the run. Downgrading to `agent-stuck`
+      // here would hand an operator a terminal whose only content is "GitHub was briefly
+      // unreachable", and would consume the one disposition ADR-0042 reserves for a completed
+      // adjudication. So defer: the caller leaves the run recoverable and the next tick's
+      // orphan sweep retries the enqueue. Rate limits keep their defer/rotation semantics and
+      // must not become stuck (issue #43); every other transient fault gets the same
+      // treatment, because "the door is shut" is never evidence about the work.
+      log.error("executor.failure-escalation-failed", {
+        issue: issueNumber,
+        rateLimited: isGitHubRateLimitError(err),
+        error: String(err),
+      });
+      return "deferred";
     }
   }
 
@@ -933,14 +951,12 @@ export class Executor {
     worktreePath: string;
     prNumber?: number | null;
     resume?: ResumeInjection;
-    /** Set on a fresh run re-admitted after a healed stuck terminal (#86): the operator's guidance, injected into the impl prompt. */
-    stuckHeal?: StuckHealGuidance;
     /** Run-level abort signal (issue #61); links into this session so the orphan sweep can kill a wedged run. */
     abortSignal?: AbortSignal;
     log: Logger;
   }): Promise<ExecutorResult> {
     const { store, github } = this.deps;
-    const { issue, mode, runId, agentId, branch, worktreePath, resume, stuckHeal, abortSignal, log } = params;
+    const { issue, mode, runId, agentId, branch, worktreePath, resume, abortSignal, log } = params;
 
     // Wire the `escalate` tool. Its meaning depends on whether a master engine is wired
     // (ADR-0041): with one, `escalate` means **internal escalation to the master** — the WIP
@@ -991,7 +1007,6 @@ export class Executor {
         logger: log,
         onEscalate,
         resume,
-        stuckHeal,
         abortSignal,
         transcriptSink: this.transcriptSinkFor(runId, issue.number, log),
       });
@@ -1396,11 +1411,11 @@ export class Executor {
   }
 
   /**
-   * Terminalize a run whose session threw after claim (issue #34): set the row to
-   * `agent-stuck`, label the issue for human attention, and close any orphaned PR
-   * so none dangles. Every step is best-effort and individually guarded — the
-   * critical invariant (the run leaves `running`) must hold even if a GitHub call
-   * fails, and this must never mask the original error with one of its own.
+   * Dispose of a run whose session threw after claim (issue #34). The one non-negotiable is
+   * that the row must not be left `running` with no live agent *and* no owner — but which
+   * disposition that is belongs to {@link escalateFailureToMaster} (ADR-0042), not here: the
+   * failure guard has no terminal of its own. Every step is best-effort and individually
+   * guarded, and none of them may mask the original error with one of its own.
    */
   private async recordExecutorFailure(
     ctx: { issueNumber: number; runId: number; branch: string; log: Logger },
@@ -1415,27 +1430,37 @@ export class Executor {
     // `agent-stuck` and closing the PR. Only a completed master adjudication may reach that
     // terminal now. The `RunStuck` fact is still appended (in the same commit as the request)
     // so the failure stays readable as history; the projected status is `master-triage`.
-    if (await this.escalateFailureToMaster(ctx, error)) {
+    const disposition = await this.escalateFailureToMaster(ctx, error);
+    if (disposition === "escalated") {
+      return;
+    }
+    if (disposition === "deferred") {
+      this.deferFailureEscalation(ctx, error);
       return;
     }
 
-    // No master wired (legacy fixtures): the one non-negotiable is still to get the run off
-    // `running`. The status fact is `RunStuck` (issue #81); awaited so its append settles
-    // before the read-back below, guarded so a transient append fault cannot mask the
-    // original error.
-    try {
-      await store.recordRunStuck({ runId, issueNumber, reason: "" });
-    } catch (err) {
-      log.error("executor.terminalize-failed", { error: String(err) });
+    // `issue-closed` is terminal but *not* human-attention: the effect-neutral `closed`
+    // outcome (issue #81) closes the span with no label and no `RunStuck`. `no-master`
+    // happens only in unit fixtures and keeps the pre-cutover `agent-stuck` terminal.
+    const stuck = disposition === "no-master";
+
+    if (stuck) {
+      // The status fact is `RunStuck` (issue #81); awaited so its append settles before the
+      // read-back below, guarded so a transient append fault cannot mask the original error.
+      try {
+        /* terminal-authority: no-master-fallback */
+        await store.recordRunStuck({ runId, issueNumber, reason: "" });
+      } catch (err) {
+        log.error("executor.terminalize-failed", { error: String(err) });
+      }
     }
 
-    // Close the run span as a bounded-out terminal (issue #80), mirroring
-    // recordAgentStuck — this is the same `agent-stuck` disposition reached via a
-    // thrown/aborted session, so its span must close with the same `stuck` outcome.
+    // Close the run span (issue #80), mirroring recordAgentStuck for the bounded-out
+    // terminal and discardOrphan's `closed` for an issue that resolved out-of-band.
     // Best-effort and guarded: a transient append failure must not throw out of this
     // method and mask the original error, nor skip the human-surfacing label below.
     try {
-      await store.recordRunEnded({ runId, issueNumber, outcome: "stuck" });
+      await store.recordRunEnded({ runId, issueNumber, outcome: stuck ? "stuck" : "closed" });
     } catch (err) {
       log.warn("executor.record-run-ended-failed", { error: String(err) });
     }
@@ -1476,28 +1501,33 @@ export class Executor {
     } catch (err) {
       log.warn("executor.append-log-failed", { error: String(err) });
     }
-    log.warn("executor.terminalized", { status: "agent-stuck", prNumber });
+    log.warn("executor.terminalized", { status: stuck ? "agent-stuck" : "closed", prNumber });
 
-    // Seed `agent-stuck` inline rather than relocating it to the reconciler diff (issue
-    // #82): a run terminalized here can already carry `daemon-anomaly` (a session aborted
-    // by the orphan sweep was surfaced as a run-wedged-past-lifetime island while it
-    // settled). The diff yields a state label to a standing `daemon-anomaly` (the #28
-    // claim-park rule), so it would not introduce `agent-stuck` — the seed is what flips a
-    // terminalized run off the stale anomaly onto its human-attention label. The per-tick
-    // diff maintains the label from the `agent-stuck` status thereafter.
-    try {
-      await github.addLabel(issueNumber, LABEL_AGENT_STUCK);
-    } catch (err) {
-      log.warn("executor.label-failed", { error: String(err) });
+    if (stuck) {
+      // Seed `agent-stuck` inline rather than relocating it to the reconciler diff (issue
+      // #82): a run terminalized here can already carry `daemon-anomaly` (a session aborted
+      // by the orphan sweep was surfaced as a run-wedged-past-lifetime island while it
+      // settled). The diff yields a state label to a standing `daemon-anomaly` (the #28
+      // claim-park rule), so it would not introduce `agent-stuck` — the seed is what flips a
+      // terminalized run off the stale anomaly onto its human-attention label. The per-tick
+      // diff maintains the label from the `agent-stuck` status thereafter.
+      try {
+        await github.addLabel(issueNumber, LABEL_AGENT_STUCK);
+      } catch (err) {
+        log.warn("executor.label-failed", { error: String(err) });
+      }
     }
 
     if (prNumber !== null) {
       try {
         await github.closePullRequest(
           prNumber,
-          "Closed automatically: the executor failed mid-run, so this PR has no " +
-            "live agent. The issue is labelled `agent-stuck` for human attention — " +
-            "re-label it `ready-for-agent` to retry from a clean run.",
+          stuck
+            ? "Closed automatically: the executor failed mid-run, so this PR has no " +
+                "live agent. The issue is labelled `agent-stuck` for human attention — " +
+                "re-label it `ready-for-agent` to retry from a clean run."
+            : "Closed automatically: the executor failed mid-run and the issue it " +
+                "implements is closed, so this PR has no live agent and nothing left to land.",
         );
         store.appendLog({
           runId,
@@ -1509,6 +1539,36 @@ export class Executor {
       } catch (err) {
         log.warn("executor.close-orphan-pr-failed", { prNumber, error: String(err) });
       }
+    }
+  }
+
+  /**
+   * Record a *deferred* failure escalation (ADR-0042 / issue #43): the master door was shut
+   * (a rate limit, a transient store fault), so the run keeps its recoverable shape — row
+   * `running`, PR OPEN, span unclosed, no human-attention label — and the next tick's orphan
+   * sweep re-drives it, retrying the enqueue. This is the same defer the drain (#131) and
+   * usage-limit (ADR-0028) paths take, and the same family as the merge/resume rate-limit
+   * defers: an external limit that self-clears must never be paid for with human attention.
+   *
+   * Synchronous and fully guarded — it appends one run-log line so the deferral is visible in
+   * the live view, and a failure to append must not mask the original error.
+   */
+  private deferFailureEscalation(
+    ctx: { issueNumber: number; runId: number; log: Logger },
+    error: unknown,
+  ): void {
+    const { issueNumber, runId, log } = ctx;
+    log.warn("executor.failure-escalation-deferred", { issue: issueNumber });
+    try {
+      this.deps.store.appendLog({
+        runId,
+        issueNumber,
+        level: "warn",
+        event: "master-enqueue-deferred",
+        data: { error: String(error), reason: "master-escalation-unavailable" },
+      });
+    } catch (err) {
+      log.warn("executor.append-log-failed", { error: String(err) });
     }
   }
 

@@ -120,6 +120,27 @@ export const OPERATOR_OWNED_ANOMALIES: readonly AnomalyReason[] = [
 ];
 
 /**
+ * The anomaly reasons the **daemon itself already repairs** on a later tick, and which must
+ * therefore reach neither a master nor an operator's to-do list (issue #43: "Usage-limit and
+ * GitHub-rate-limit conditions retain their defer/rotation semantics and must not consume
+ * master attempts or become stuck").
+ *
+ * One member today: `answered-pause-stranded` is a *GitHub rate limit* — the `ready-for-agent`
+ * re-arm of an answered pause did not land — and the reconciler re-issues that one label write
+ * every tick until it does (#132). Handing it to a master would be wrong three times over: it
+ * would spend one of the two per-phase interventions on a self-clearing condition; it would
+ * flip the run from `awaiting-answer` to `master-triage`, where the resume scan (which only
+ * looks at `awaiting-answer` / `review-maxed`) can never re-find the operator's already-posted
+ * answer; and the master would run with no answer in hand at all.
+ *
+ * Distinct from {@link OPERATOR_OWNED_ANOMALIES}, whose members need a *human* — these need
+ * only the next tick. The two lists are disjoint by construction: they carry opposite operator
+ * actions (see `anomaly-action.ts`). The anomaly stays visible as `daemon-anomaly` while it
+ * self-clears, so "not escalated" never means "not surfaced".
+ */
+export const SELF_HEALING_ANOMALIES: readonly AnomalyReason[] = ["answered-pause-stranded"];
+
+/**
  * Whether an anomaly is issue-scoped enough to hand to a master (ADR-0042). Pure and total,
  * so the issue-vs-host boundary is one testable predicate rather than a condition repeated at
  * every call site. `hasContext` is the caller's answer to "is there an issue AND a run row to
@@ -127,7 +148,11 @@ export const OPERATOR_OWNED_ANOMALIES: readonly AnomalyReason[] = [
  * an issue-scoped reason stays operator-owned.
  */
 export function anomalyEnqueuesMaster(reason: AnomalyReason, hasContext: boolean): boolean {
-  return hasContext && !OPERATOR_OWNED_ANOMALIES.includes(reason);
+  return (
+    hasContext &&
+    !OPERATOR_OWNED_ANOMALIES.includes(reason) &&
+    !SELF_HEALING_ANOMALIES.includes(reason)
+  );
 }
 
 /**

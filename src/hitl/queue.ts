@@ -1,9 +1,15 @@
 /**
  * The GitHub-only open-question queue the `ralph-answer` CLI serves from
  * (ADR-0007). The label *is* the index: every issue carrying `awaiting-answer`
- * (escalate), `review-maxed` (heal-card), or `agent-stuck` (an open stuck-card,
- * #85/#86) has an open `ralph-question` comment. No SQLite, no daemon — the whole
+ * (the one question a master may ask) or the pre-cutover `review-maxed` (heal-card)
+ * has an open `ralph-question` comment. No SQLite, no daemon — the whole
  * queue is re-derivable from GitHub on any box.
+ *
+ * `agent-stuck` is **not** in the index (ADR-0042 §7). The terminal carries a card of its
+ * own — the master's self-explaining conclusion — but that card is evidence, not a question,
+ * and serving it would let an answer un-terminalize a completed adjudication. The queue types
+ * such an issue as {@link OpenQuestionForIssueResult} `terminal` so a caller can refuse it
+ * informatively rather than reporting an indistinguishable "nothing here".
  *
  * Questions are ordered FIFO by issue age, matching the daemon's own scheduling
  * order, so the operator works the oldest pause first.
@@ -13,16 +19,16 @@ import type { GitHubClient, Issue, PrComment } from "../github/types";
 import type { EscalationQuestion } from "../review/escalation";
 import type { Phase } from "../store/types";
 import { isRalphAnswerComment, latestAnswerAfter, latestRalphQuestion } from "./answer";
-import { ANSWERABLE_LABELS, isAwaitingAnswerLabel } from "./labels";
+import { ANSWERABLE_LABELS, isTerminalAttentionLabel, type TerminalAttentionLabel } from "./labels";
 
 /** One open question awaiting an operator answer. */
 export interface OpenQuestionItem {
   issue: Issue;
   question: EscalationQuestion;
   /**
-   * Which human-attention label the issue carries — swapped back to
-   * `ready-for-agent` on answer. `awaiting-answer` / `review-maxed` resume the paused
-   * run; `agent-stuck` re-admits a fresh run with the operator's guidance (#86).
+   * Which human-attention label the issue carries — swapped back to `ready-for-agent` on
+   * answer, resuming the paused run. Only the resume-on-answer pauses appear here: the
+   * `agent-stuck` terminal is never an answerable item (ADR-0042 §7).
    */
   label: (typeof ANSWERABLE_LABELS)[number];
   /**
@@ -52,8 +58,8 @@ function alreadyAnswered(comments: PrComment[], questionId: number): boolean {
 
 /**
  * The answerable label the issue carries, in `ANSWERABLE_LABELS` precedence
- * (awaiting-answer → review-maxed → agent-stuck), or `null` if none. Derived
- * straight from the canonical tuple so the answerable set lives in ONE place: the
+ * (awaiting-answer → review-maxed), or `null` if none. Derived straight from the
+ * canonical tuple so the answerable set lives in ONE place: the
  * `OpenQuestionItem['label']` type is `(typeof ANSWERABLE_LABELS)[number]`, so
  * adding a label means editing `ANSWERABLE_LABELS` alone — no parallel union or
  * runtime ladder to drift. The tuple is literal-typed, so `.find` returns exactly
@@ -67,6 +73,8 @@ type LatestQuestion = ReturnType<typeof latestRalphQuestion>;
 
 export type OpenQuestionForIssueResult =
   | { kind: "not-answerable" }
+  /** A master-selected terminal (ADR-0042 §7): never answerable, and named so a caller can say why. */
+  | { kind: "terminal"; label: TerminalAttentionLabel }
   | { kind: "open"; item: OpenQuestionItem }
   | {
       kind: "not-open";
@@ -84,18 +92,18 @@ export async function openQuestionForIssue(
   github: GitHubClient,
   issue: Issue,
 ): Promise<OpenQuestionForIssueResult> {
+  // The terminal is checked first, so an issue that somehow carries both a terminal and a
+  // pause fails *closed* — an answer can never un-terminalize a completed adjudication
+  // (ADR-0042 §7). The contradiction itself is not swallowed: the completeness pass sees the
+  // same labels and surfaces the island as a `daemon-anomaly` within one tick.
+  const terminal = issue.labels.find(isTerminalAttentionLabel);
+  if (terminal) {
+    return { kind: "terminal", label: terminal };
+  }
+
   const label = answerableLabel(issue);
   if (!label) {
     return { kind: "not-answerable" };
-  }
-
-  if (issue.state !== "OPEN" && !isAwaitingAnswerLabel(label)) {
-    return {
-      kind: "not-open",
-      label,
-      latestQuestion: null,
-      hasParseableAnswerAfterLatestQuestion: false,
-    };
   }
 
   const comments = await github.listIssueComments(issue.number);
@@ -120,10 +128,10 @@ export async function openQuestionForIssue(
 
 /**
  * Every open question across the target repo, FIFO by issue age. Reads each
- * answerable issue's comments and parses the latest `ralph-question`. Escalate,
- * heal-card, and stuck-card questions all flow through here — same shape, one queue.
- * An `agent-stuck` issue is surfaced only when it actually carries an open (unanswered)
- * stuck-card; a bare `agent-stuck` terminal with no card stays parked, not served.
+ * answerable issue's comments and parses the latest `ralph-question`. Master questions and
+ * pre-cutover heal-cards flow through here — same shape, one queue. An `agent-stuck` issue is
+ * never listed, whether or not it carries a card: the terminal is a conclusion, not a question
+ * (ADR-0042 §7).
  */
 export async function listOpenQuestions(github: GitHubClient): Promise<OpenQuestionItem[]> {
   const issues = (await github.listOpenIssues()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));

@@ -1,22 +1,23 @@
 /**
- * The terminal side effect of the stuck budget and the wall-clock ceiling
- * (DESIGN §§3,8). Both an agent's self-stop (the `stuck` tool) and the daemon's
- * wall-clock kill converge here: the issue is labelled `agent-stuck`, a structured
- * stuck-card comment is posted, the run is marked `agent-stuck`, and the event is
- * logged. No PR is opened or recorded; the caller tears the worktree down in its
- * `finally`.
+ * The **pre-cutover** terminal side effect of the stuck budget and the wall-clock ceiling
+ * (DESIGN §§3,8): a structured stuck-card comment is posted, the run is marked `agent-stuck`,
+ * and the event is logged. No PR is opened or recorded; the caller tears the worktree down in
+ * its `finally`.
  *
- * `ready-for-agent` was already removed on pickup, so the only label change is to
- * add `agent-stuck` — the single human-attention state for a bounded-out run.
+ * Since the triage cutover (ADR-0042 / issue #43) a worker bounding out is a *signal*, not a
+ * verdict: `executor.ts` routes `stuck` and finished-without-a-PR to the master queue, and only
+ * a completed master adjudication may reach `agent-stuck`. The recorders below therefore run
+ * only when **no master is wired at all** — a shape that exists in unit fixtures and nowhere in
+ * the live daemon. Their status writes carry the no-master fallback marker that
+ * `master/terminal-authority.test.ts` counts, so the hatch cannot widen quietly.
  *
- * The stuck-card comment (#85) makes the terminal self-explaining: the stuck
- * category and the agent's free-text reason — otherwise written only to the daemon
- * host's run log — become an on-issue artifact a human (and the follow-up heal
- * path) can read. It reuses the `ralph-question`/heal-card shape escalate and
- * review-maxed already post, so it renders and parses identically. This is
- * **visibility only**: it adds no awaiting/heal label and indexes no open question,
- * so the issue stays terminal on `agent-stuck` — neither picked up nor surfaced for
- * answering (making it answerable is the follow-up).
+ * The stuck-card comment (#85) makes the terminal self-explaining: the stuck category and the
+ * agent's free-text reason — otherwise written only to the daemon host's run log — become an
+ * on-issue artifact a human can read. It reuses the `ralph-question` shape escalate posts, so
+ * it renders and parses identically. It is **evidence, not a question**: the card adds no
+ * awaiting label and indexes no open question, and the GitHub-only answer queue refuses an
+ * `agent-stuck` issue outright (`hitl/queue.ts`, ADR-0042 §7) — an answer must never
+ * un-terminalize a conclusion.
  */
 
 import type { GitHubClient } from "../github/types";
@@ -31,12 +32,10 @@ export interface RecordAgentStuckInput {
 }
 
 /**
- * The `feature` field every stuck-card carries — the stable, recognisable marker
- * that tells a stuck-card apart from an escalate or review-maxed `ralph-question`
- * (they all share the one fenced shape). The heal re-admission path (#86) keys on
- * this to decide whether an answered question is *stuck-heal* guidance (re-admit a
- * fresh run with it injected) rather than a resolved escalation. Owned here with the
- * builder so the marker and its recogniser ({@link isStuckCardQuestion}) cannot drift.
+ * The `feature` field every stuck-card carries — the stable, recognisable marker that tells a
+ * stuck-card apart from an escalate or master `ralph-question` (they all share the one fenced
+ * shape), so a reader of the issue thread can see at a glance which comments are conclusions
+ * and which are questions.
  */
 export const STUCK_CARD_FEATURE = "Bounded-effort run (no PR opened)";
 
@@ -49,11 +48,11 @@ const STUCK_CATEGORY_BLURB: Record<StuckCategory, string> = {
 };
 
 /**
- * Render a stuck terminal as the `ralph-question`/heal-card shape (#85). The
- * category lands in the headline (and so the fenced payload) and the agent's reason
- * in `where we stand`, both verbatim, so the on-issue comment carries exactly what
- * the run log holds. The options are the standard heal moves — provide guidance and
- * re-enable / re-scope / close — even though answering is not yet wired (follow-up).
+ * Render a stuck terminal as the `ralph-question` shape (#85). The category lands in the
+ * headline (and so the fenced payload) and the agent's reason in `where we stand`, both
+ * verbatim, so the on-issue comment carries exactly what the run log holds. The options name
+ * the moves an operator can make **on the issue** — re-scope and re-label, or close — because
+ * the card is not answerable through `ralph-answer` (ADR-0042 §7).
  */
 export function buildStuckCardQuestion(report: StuckReport): EscalationQuestion {
   return {
@@ -67,24 +66,26 @@ export function buildStuckCardQuestion(report: StuckReport): EscalationQuestion 
     ].join("\n"),
     decision: "How should this stuck run be resolved?",
     options: [
-      "Provide guidance and re-enable the run (heal) so the agent retries with it injected",
-      "Re-scope the issue (edit it and re-label `ready-for-agent`)",
+      "Re-enable the run (re-label `ready-for-agent`) to retry from a clean start",
+      "Re-scope the issue (edit its body with what the agent was missing, then re-label `ready-for-agent`)",
       "Close the issue",
     ],
     stakes:
       "The agent stopped with no pull request — nothing was implemented or merged. The issue is " +
       "parked on `agent-stuck` for a human, and the daemon will not pick it up again on its own.",
     recommendation:
-      "Read the agent's reason above, then either provide concrete guidance to unblock a retry, " +
-      "re-scope the issue, or close it.",
+      "Read the agent's reason above, then edit the issue body with what it was missing and " +
+      "re-label `ready-for-agent`, or close it. This card is a conclusion, not a question — " +
+      "`ralph-answer` will not serve it, so guidance belongs in the issue itself.",
   };
 }
 
 /**
  * Record an agent-stuck terminal against GitHub and the store: post the structured
- * stuck-card comment, add the `agent-stuck` label, set the run status, and log the
- * bounded-out reason. The comment goes up first so the reason is durable on the
- * issue before the label change, mirroring the escalate path.
+ * stuck-card comment, set the run status, and log the bounded-out reason. The comment goes up
+ * first so the reason is durable on the issue before the status change, mirroring the escalate
+ * path. **No-master fallback only** (ADR-0042): `executor.ts` calls this solely when no
+ * `masterTriage` is wired.
  */
 export async function recordAgentStuck(
   store: ScopedStore,
@@ -97,6 +98,7 @@ export async function recordAgentStuck(
   // `agent-stuck` run status the `RunStuck` fact (appended below) projects — the
   // reconciler's per-tick desired-vs-actual diff applies it (issue #82, ADR-0027). The
   // non-idempotent stuck-card comment stays inline (the reason goes up before the label).
+  /* terminal-authority: no-master-fallback */
   await store.recordRunStuck({ runId, issueNumber, reason: "" });
   // Close the run span as a bounded-out terminal (issue #80).
   await store.recordRunEnded({ runId, issueNumber, outcome: "stuck" });
@@ -119,8 +121,7 @@ export async function recordAgentStuck(
  * the work is lost. This is distinct from a crash-orphan (the session finished; it
  * just produced nothing), so it earns its own self-explaining card rather than the
  * bare, next-tick `agent-stuck` the generic orphan sweep would apply. It reuses
- * {@link STUCK_CARD_FEATURE} so the heal path (#86) treats an answered card exactly
- * like any other stuck-heal — the operator's answer re-admits a fresh run.
+ * {@link STUCK_CARD_FEATURE} so the whole stuck-card family reads as one thing on the issue.
  */
 export function buildNoPrCardQuestion(): EscalationQuestion {
   return {
@@ -138,7 +139,7 @@ export function buildNoPrCardQuestion(): EscalationQuestion {
     decision: "How should this run be resolved?",
     options: [
       "Re-enable the run (re-label `ready-for-agent`) to retry from a clean start",
-      "Provide guidance and re-enable the run (heal) so the retry has it injected",
+      "Re-scope the issue (edit its body) first, if it keeps stopping here",
       "Close the issue",
     ],
     stakes:
@@ -159,7 +160,8 @@ export function buildNoPrCardQuestion(): EscalationQuestion {
  * the row `running` for the next-tick orphan sweep — makes the terminal immediate and
  * self-explaining, and keeps the orphan sweep for genuine crashes (a `running` row
  * with no live agent), not clean finishes. No PR is recorded; the caller tears the
- * worktree down in its `finally`.
+ * worktree down in its `finally`. **No-master fallback only** (ADR-0042): `executor.ts`
+ * calls this solely when no `masterEscalation` is wired.
  */
 export async function recordFinishedWithoutPr(
   store: ScopedStore,
@@ -168,6 +170,7 @@ export async function recordFinishedWithoutPr(
 ): Promise<void> {
   const { issueNumber, runId } = input;
   await github.postComment(issueNumber, formatRalphQuestion(buildNoPrCardQuestion()));
+  /* terminal-authority: no-master-fallback */
   await store.recordRunStuck({ runId, issueNumber, reason: "" });
   await store.recordRunEnded({ runId, issueNumber, outcome: "stuck" });
   store.appendLog({
@@ -177,14 +180,4 @@ export async function recordFinishedWithoutPr(
     event: "agent-no-pr",
     data: {},
   });
-}
-
-/**
- * Whether a parsed `ralph-question` is a stuck-card (versus an escalate or
- * review-maxed heal-card) — it carries {@link STUCK_CARD_FEATURE}. Used by the heal
- * re-admission path (#86) to tell an answered stuck-card (re-admit a fresh run with
- * the operator's guidance injected) apart from a resolved escalation.
- */
-export function isStuckCardQuestion(question: EscalationQuestion): boolean {
-  return question.feature === STUCK_CARD_FEATURE;
 }

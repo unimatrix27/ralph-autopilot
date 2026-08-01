@@ -640,7 +640,9 @@ export {
   isAwaitingAnswerLabel,
 } from "./hitl/labels";
 export type { AnswerableLabel, AnswerConsequence, AwaitingAnswerLabel } from "./hitl/labels";
-export { findStuckHealGuidance } from "./hitl/heal-readmit";
+// The #86 stuck-heal *lane* is retired (ADR-0042 / issue #43): `agent-stuck` is a terminal, not
+// an answerable pause, so `findStuckHealGuidance` is gone. Only the vestigial prompt shape
+// remains exported, because `buildImplPrompt` still takes it.
 export type { StuckHealGuidance } from "./hitl/heal-readmit";
 export {
   RALPH_ANSWER_FENCE,

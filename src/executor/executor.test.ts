@@ -15,7 +15,15 @@ import { UsageLimitError } from "../core/usage";
 import type { PullRequest } from "../github/types";
 import { ScriptedFixAgent, ScriptedReviewAgent } from "../testing/fake-review-agents";
 import { ReviewLoop } from "../review/review-loop";
+import { formatRalphQuestion } from "../review/escalation";
+import { formatRalphAnswer } from "../hitl/answer";
+import type {
+  HarnessEscalationInput,
+  HarnessEscalationResult,
+  MasterEscalationPort,
+} from "../master/harness-escalation";
 import { BranchDivergedError, GitWorktreeManager } from "./worktree";
+import { buildStuckCardQuestion } from "./stuck";
 import { Executor } from "./executor";
 
 const silent = createLogger({ write: () => {} });
@@ -937,6 +945,200 @@ describe("Executor", () => {
     expect(store.getRunByIssue(34)!.status).toBe("agent-stuck");
     expect(github.issues.get(34)!.labels).toContain(LABEL_AGENT_STUCK);
     expect(run.id).toBe(store.getRunByIssue(34)!.id);
+  });
+});
+
+/**
+ * The executor's failure guard has **no terminal of its own** (ADR-0042 / issue #43).
+ * Production always wires `masterEscalation`, so every post-claim throw must either reach the
+ * master queue or *defer trying* — it may never downgrade to `agent-stuck`, which is a
+ * conclusion only a completed master adjudication may draw. The regression this pins: the
+ * enqueue's own `catch` used to swallow and fall straight through to the pre-cutover terminal,
+ * so a rate-limited `getIssue` inside the master door terminalized the run — exactly the
+ * transient class that must defer and rotate rather than spend a human.
+ */
+describe("the executor failure guard reaches no terminal of its own (ADR-0042)", () => {
+  let store: Store;
+  let github: FakeGitHub;
+  let worktrees: FakeWorktreeManager;
+
+  /** An impl runner that opens its PR and then throws — the mid-run session fault. */
+  const openThenThrow = (gh: FakeGitHub) => ({
+    async run(ctx: { issue: { number: number }; branch: string }) {
+      gh.openPullRequest(ctx.branch, `Closes #${ctx.issue.number}`);
+      throw new SyntaxError("Unexpected token '\\'");
+    },
+  });
+
+  /** A master door that always fails to enqueue, recording what it was asked. */
+  class ThrowingMasterEscalation implements MasterEscalationPort {
+    readonly attempts: HarnessEscalationInput[] = [];
+    constructor(private readonly error: Error) {}
+    async escalate(input: HarnessEscalationInput): Promise<HarnessEscalationResult> {
+      this.attempts.push(input);
+      throw this.error;
+    }
+  }
+
+  /** A master door that always accepts, recording what it was asked. */
+  class RecordingMasterEscalation implements MasterEscalationPort {
+    readonly attempts: HarnessEscalationInput[] = [];
+    async escalate(input: HarnessEscalationInput): Promise<HarnessEscalationResult> {
+      this.attempts.push(input);
+      return { kind: "queued", signature: "sig", promotedFrom: null, commentId: null };
+    }
+  }
+
+  beforeEach(() => {
+    store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    github = new FakeGitHub();
+    worktrees = new FakeWorktreeManager();
+  });
+  afterEach(() => store.close());
+
+  for (const [name, error] of [
+    ["a GitHub rate-limit", new Error("HTTP 403: API rate limit exceeded for user ID 1")],
+    ["any other transient fault", new Error("SQLITE_BUSY: database is locked")],
+  ] as const) {
+    it(`defers — never agent-stuck — when the master enqueue fails on ${name} (#43)`, async () => {
+      github.seed({ number: 74, title: "enqueue blew up" });
+      const branch = "ralph/74-enqueue-blew-up";
+      const master = new ThrowingMasterEscalation(error);
+      const ex = new Executor({
+        store,
+        github,
+        worktrees,
+        agentRunner: openThenThrow(github) as never,
+        logger: silent,
+        masterEscalation: master,
+      });
+
+      await expect(ex.run({ issue: github.issues.get(74)!, mode: "tdd" })).rejects.toThrow(
+        "Unexpected token",
+      );
+
+      // The door was tried…
+      expect(master.attempts).toHaveLength(1);
+      // …and its failure did NOT become the terminal: no `agent-stuck` status, no label.
+      expect(store.getRunByIssue(74)!.status).toBe("running");
+      expect(github.issues.get(74)!.labels).not.toContain(LABEL_AGENT_STUCK);
+      expect(github.addedLabels.some((l) => l.label === LABEL_AGENT_STUCK)).toBe(false);
+      // The PR stays OPEN — a master handed a corpse cannot adjudicate the work.
+      expect((await github.findPullRequestForBranch(branch))!.state).toBe("OPEN");
+      expect(github.closedPulls).toHaveLength(0);
+      // The span stays open: the run is recoverable and the next tick retries the enqueue.
+      expect((await store.aggregateIssue(74)).state.ended).toBe(false);
+      // The deferral is on the record, never silent.
+      expect(
+        store.tailLog(store.getRunByIssue(74)!.id).some((e) => e.event === "master-enqueue-deferred"),
+      ).toBe(true);
+      // …and the slot still frees (the worktree is torn down).
+      expect(worktrees.removed).toContain(worktrees.created[0]!.path);
+    });
+  }
+
+  it("defers when the master door's own issue read is rate-limited (#43)", async () => {
+    // The precise live path: `escalateFailureToMaster` reads the issue before enqueueing, and
+    // that read is the first thing a rate limit hits. It must defer, not terminalize.
+    class RateLimitedIssueRead extends FakeGitHub {
+      override async getIssue(): Promise<never> {
+        throw new Error("HTTP 403: API rate limit exceeded for user ID 1");
+      }
+    }
+    const gh = new RateLimitedIssueRead();
+    gh.seed({ number: 75, title: "rate-limited read" });
+    const master = new RecordingMasterEscalation();
+    const ex = new Executor({
+      store,
+      github: gh,
+      worktrees,
+      agentRunner: openThenThrow(gh) as never,
+      logger: silent,
+      masterEscalation: master,
+    });
+
+    await expect(ex.run({ issue: gh.issues.get(75)!, mode: "tdd" })).rejects.toThrow("Unexpected token");
+
+    // The read failed before the enqueue, so nothing was queued — and nothing was terminalized.
+    expect(master.attempts).toHaveLength(0);
+    expect(store.getRunByIssue(75)!.status).toBe("running");
+    expect(gh.issues.get(75)!.labels).not.toContain(LABEL_AGENT_STUCK);
+    expect(gh.closedPulls).toHaveLength(0);
+  });
+
+  it("closes the span effect-neutrally — no agent-stuck — when the issue closed under the run (#43)", async () => {
+    // A closed issue has nothing left for a master to adjudicate, but it is also not a
+    // human-attention terminal: nobody is waiting on a question about a closed issue. The run
+    // leaves `running` on the effect-neutral `closed` terminal (issue #81), like the
+    // closed-issue orphan, and no `agent-stuck` is projected on the worker's own authority.
+    github.seed({ number: 76, title: "closed under us" });
+    await github.closeIssue(76);
+    const master = new RecordingMasterEscalation();
+    const ex = new Executor({
+      store,
+      github,
+      worktrees,
+      agentRunner: openThenThrow(github) as never,
+      logger: silent,
+      masterEscalation: master,
+    });
+
+    await expect(ex.run({ issue: github.issues.get(76)!, mode: "tdd" })).rejects.toThrow(
+      "Unexpected token",
+    );
+
+    expect(master.attempts).toHaveLength(0);
+    expect(store.getRunByIssue(76)!.status).toBe("closed");
+    expect(github.issues.get(76)!.labels).not.toContain(LABEL_AGENT_STUCK);
+    expect(github.addedLabels.some((l) => l.label === LABEL_AGENT_STUCK)).toBe(false);
+    expect((await store.aggregateIssue(76)).state.ended).toBe(true);
+  });
+
+  it("routes the failure to the master when the door is healthy (the ordinary cutover path)", async () => {
+    github.seed({ number: 77, title: "healthy door" });
+    const branch = "ralph/77-healthy-door";
+    const master = new RecordingMasterEscalation();
+    const ex = new Executor({
+      store,
+      github,
+      worktrees,
+      agentRunner: openThenThrow(github) as never,
+      logger: silent,
+      masterEscalation: master,
+    });
+
+    await expect(ex.run({ issue: github.issues.get(77)!, mode: "tdd" })).rejects.toThrow(
+      "Unexpected token",
+    );
+
+    expect(master.attempts).toHaveLength(1);
+    expect(master.attempts[0]!.source).toBe("session-failed");
+    expect(github.issues.get(77)!.labels).not.toContain(LABEL_AGENT_STUCK);
+    expect((await github.findPullRequestForBranch(branch))!.state).toBe("OPEN");
+  });
+
+  it("injects no stuck-heal guidance into a fresh run — the #86 heal lane is retired (#43)", async () => {
+    // `agent-stuck` is no longer answerable, so an answered stuck-card is not guidance and the
+    // executor no longer goes looking for one. This pins the exact comment shape the retired
+    // lane keyed on: a stuck-card followed by a `ralph-answer`.
+    github.seed({ number: 78, title: "hand re-scoped" });
+    await github.postComment(
+      78,
+      formatRalphQuestion(
+        buildStuckCardQuestion({ category: "no-green-build", reason: "typecheck never went green" }),
+      ),
+    );
+    await github.postComment(
+      78,
+      formatRalphAnswer({ kind: "free-text", text: "regenerate the lockfile first" }),
+    );
+    const runner = new PrOpeningAgentRunner(github);
+    const ex = new Executor({ store, github, worktrees, agentRunner: runner, logger: silent });
+
+    await ex.run({ issue: github.issues.get(78)!, mode: "tdd" });
+
+    expect(runner.runs).toHaveLength(1);
+    expect(runner.runs[0]!.stuckHeal).toBeUndefined();
   });
 });
 

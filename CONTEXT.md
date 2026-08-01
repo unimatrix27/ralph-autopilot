@@ -350,8 +350,10 @@ _Retired (ADR-0042)._ The `ralph-question`-shaped card a `review-maxed` phase us
 an operator. No code path emits one; the builders are gone, not merely unused. Pre-cutover
 cards still *parse* so an adopted issue keeps its evidence, and `ralph-answer` still serves one
 an operator was already mid-answer on. _Avoid_: "heal the review", "post a heal-card" — a
-maxed-out phase escalates to the [[master]] now. "Heal" survives only for the `agent-stuck`
-re-admission path a human drives.
+maxed-out phase escalates to the [[master]] now. "Heal" does not survive on `agent-stuck`
+either: that is a terminal only a completed master adjudication selects, and it is **not
+answerable through `ralph-answer`** (ADR-0042 §7). A human re-scopes the issue (edit it, then
+re-label `ready-for-agent`) or closes it — neither is an answer.
 
 **Hosted review gate**:
 The GitHub-hosted reviewer (Codex) as a **first-class integration gate**, distinct from CI and

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { renderQuestion } from "./render";
-import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "./labels";
+import { ANSWERABLE_LABELS, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "./labels";
 import type { OpenQuestionItem } from "./queue";
 import type { Issue } from "../github/types";
 
@@ -47,8 +47,12 @@ describe("renderQuestion", () => {
     expect(out).not.toContain("Options:");
   });
 
-  it("tags an agent-stuck stuck-card so the operator knows it heals by re-admission (#86)", () => {
-    const out = renderQuestion({ ...base, label: LABEL_AGENT_STUCK });
-    expect(out).toContain("agent-stuck / stuck-card");
+  // ADR-0042 §7: `agent-stuck` is a terminal only a completed master adjudication may select,
+  // so it is not an answerable label and can never reach this renderer. The type is the proof —
+  // `OpenQuestionItem["label"]` no longer admits it — so there is nothing left to render here.
+  it("renders only the answerable pauses — the terminal has no operator-facing question tag", () => {
+    const tagged = ANSWERABLE_LABELS.map((label) => renderQuestion({ ...base, label }));
+    expect(tagged).toHaveLength(2);
+    for (const out of tagged) expect(out).not.toContain("agent-stuck");
   });
 });

@@ -102,8 +102,18 @@ export function alreadyRepliedTo(state: HostedGateState, finding: HostedFinding)
 export type HostedGateVerdict =
   /** Nothing hosted blocks the merge on this head. */
   | { kind: "clean"; headSha: string | null }
-  /** Actionable findings the ordinary fix lane may address. */
-  | { kind: "findings"; worklist: HostedWorklist; cause: MergeBlockCause; headSha: string | null }
+  /**
+   * Actionable findings the ordinary fix lane may address. The cause is narrowed to the
+   * hosted-review arm on purpose: this verdict is only ever built when the blocker IS the
+   * hosted reviewer, and the fix lane needs `findings` without re-testing a union it already
+   * knows the shape of.
+   */
+  | {
+      kind: "findings";
+      worklist: HostedWorklist;
+      cause: Extract<MergeBlockCause, { kind: "hosted-review" }>;
+      headSha: string | null;
+    }
   /** A typed blocker the fix lane cannot address — fail closed with evidence. */
   | { kind: "blocked"; cause: MergeBlockCause; headSha: string | null }
   /** The read failed in a way the rate-limit path owns: defer, do not escalate. */
@@ -165,12 +175,18 @@ export class HostedReviewGate {
       }
       const head = ctx.headSha ?? read.headSha;
       const worklist = buildHostedWorklist(read.threads, head);
-      // The reviewer has spoken about this head once it has ANY thread anchored to it, or
-      // once every thread it has is resolved/outdated (i.e. nothing is outstanding).
+      // The reviewer has spoken about this head once it has ANY thread anchored to it — or once
+      // it reports NO threads at all, which is genuinely indistinguishable from "this repo has
+      // no hosted reviewer" and must not stall every merge for the whole observation budget.
+      //
+      // "Every thread it has is resolved/outdated" is deliberately NOT a third disjunct: that is
+      // precisely the state a repair leaves behind (the reviewer's old findings go outdated the
+      // instant the head moves), so treating it as an observation would skip the bounded wait at
+      // the one moment the reviewer demonstrably has NOT looked at the new head yet — the "an
+      // empty read is the reviewer being happy" antipattern this module exists to forbid. The
+      // wait stays bounded: the last poll returns the verdict either way.
       const sawThisHead =
-        head === null ||
-        read.threads.some((t) => t.reviewedSha === head) ||
-        read.threads.every((t) => t.isResolved || t.isOutdated);
+        head === null || read.threads.length === 0 || read.threads.some((t) => t.reviewedSha === head);
       if (sawThisHead || poll === polls - 1) {
         await this.recordObservation(ctx, head, worklist);
         return this.verdict(ctx, worklist, head);

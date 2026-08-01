@@ -8,8 +8,10 @@
  *
  * The Inbox is the `ralph-answer` queue surfaced as a control surface: it neither owns state nor
  * bypasses the reconciler. Answer semantics live in `hitl/answer`; this module only serializes the
- * live queue entry and the resume/re-admit consequence derived from the HITL label semantics the
- * queue already carries.
+ * live queue entry and the resume consequence derived from the HITL label semantics the queue
+ * already carries. It offers exactly what that queue serves, so the `agent-stuck` terminal is
+ * never rendered as an answerable card (ADR-0042 §7) — the operator re-scopes or closes such an
+ * issue through the power actions instead of answering it.
  */
 import type { OpenQuestionItem } from "../hitl/queue";
 import { consequenceForAnswerableLabel } from "../hitl/labels";
@@ -73,8 +75,9 @@ export interface InboxEntry {
 }
 
 /**
- * Map one gathered entry to its wire card: the consequence derived from the label, the carried
- * phase marker (if any), and the run enrichment (runId / branch / PR for deep links). Pure.
+ * Map one gathered entry to its wire card: the consequence derived from the label (every
+ * answerable pause resumes from its WIP), the carried phase marker (if any), and the run
+ * enrichment (runId / branch / PR for deep links). Pure.
  */
 export function toInboxCard(entry: InboxEntry): InboxCard {
   const { item, repo, run } = entry;

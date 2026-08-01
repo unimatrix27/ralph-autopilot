@@ -32,8 +32,13 @@ import type { RecordedStreamEvent } from "../store/event-log";
 import type { Run } from "../store/types";
 import type { MasterRequestSource } from "../store/types";
 
-/** Why a pre-cutover issue is being adopted — carried into the request as its source. */
-export type AdoptionKind = "review-maxed" | "agent-stuck";
+/**
+ * Why a pre-cutover issue is being adopted — carried into the request as its source.
+ * `answered-pause` is the #132 wedge on a pre-cutover build: the operator answered, the
+ * `ready-for-agent` re-arm never landed, and after the cutover the owner that resumes it is a
+ * master (see the header note on answered-but-stranded pauses).
+ */
+export type AdoptionKind = "review-maxed" | "agent-stuck" | "answered-pause";
 
 /** One adoption the reconciler should perform this tick. */
 export interface AdoptionPlan {
@@ -61,6 +66,21 @@ export interface AdoptionInput {
   masterQueued: boolean;
   /** Whether the latest `ralph-question` on the thread is still unanswered. */
   unansweredQuestion: boolean;
+  /**
+   * Whether the comment ledger says this pause is **answered but never re-armed** — the #132
+   * wedge (`scanPausedRuns`'s `strandedAnswered`). Distinct from `!unansweredQuestion`, which
+   * is also true for an issue that was never asked anything, and authoritative over the store's
+   * open-question index, which stays populated for a stranded pause by design (the answer is
+   * only recorded when the resume lands).
+   */
+  answeredStrandedPause: boolean;
+  /**
+   * Whether a **master** is the one waiting on the outstanding question
+   * (`MasterHumanQuestionRequested` in the stream). Its answer already resumes that master's
+   * checkpointed adjudication, so adopting it would append a second request for one
+   * adjudication and spend a fresh intervention on a decision already in progress.
+   */
+  masterAwaitingHuman: boolean;
 }
 
 /**
@@ -85,8 +105,11 @@ export function planAdoption(input: AdoptionInput): AdoptionPlan | null {
   }
   const has = (label: string): boolean => issue.labels.includes(label);
 
-  // A live, unanswered question is a real question: never adopt it, never re-ask it.
-  if (has(LABEL_AWAITING_ANSWER) && input.unansweredQuestion) {
+  // A live, unanswered question is a real question: never adopt it, never re-ask it. The
+  // comment ledger overrides the store's index here — a stranded pause keeps an open question
+  // row by design (the answer is only recorded when the resume lands), so without this the
+  // answered wedge would read as a live question forever and be adopted by nothing.
+  if (has(LABEL_AWAITING_ANSWER) && input.unansweredQuestion && !input.answeredStrandedPause) {
     return null;
   }
 
@@ -112,6 +135,28 @@ export function planAdoption(input: AdoptionInput): AdoptionPlan | null {
       phase: "impl",
       headline: "Adopted a pre-cutover `agent-stuck` terminal no master ever reviewed",
       detail: "pre-cutover agent-stuck",
+    };
+  }
+
+  // The plain answered-but-stranded pause (#132) — the case this module's header promised and
+  // nothing implemented. It carries no retired label, so every branch above passed it by; the
+  // compensator then re-armed it and the ordinary resume handed a decision the *worker* had
+  // already declined straight back to that worker. After the cutover the resumed owner is a
+  // master, and the operator's reply is durable on the thread as evidence for it. A master's
+  // OWN question is excluded above by `masterAwaitingHuman`: that answer already resumes its
+  // checkpointed adjudication, and re-queueing it would spend a second intervention.
+  if (input.answeredStrandedPause && !input.masterAwaitingHuman) {
+    const phase = input.healPhase;
+    return {
+      kind: "answered-pause",
+      // A pre-cutover pause could only have come from a worker `escalate`; the source keeps
+      // that origin so the master context leads with worker-origin evidence.
+      source: "escalate",
+      // A review-origin pause re-enters the phase it was raised at (the marker survived a cold
+      // store); an impl-agent escalation carries no phase and re-enters `impl`.
+      phase: phase !== null ? `review-${phase}` : "impl",
+      headline: "Adopted a pre-cutover escalation the operator already answered",
+      detail: phase !== null ? `pre-cutover answered pause phase=${phase}` : "pre-cutover answered pause",
     };
   }
 

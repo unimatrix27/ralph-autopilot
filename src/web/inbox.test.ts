@@ -90,10 +90,12 @@ describe("toInboxCard (AC1/AC3 — structured card with consequence + deep-link 
     expect(card.run).toEqual({ runId: "11", branch: "ralph/11-x", prNumber: 1011 });
   });
 
-  it("degrades to a null run when no run row exists (a bare stuck-card)", () => {
-    const card = toInboxCard({ item: item(11, "agent-stuck", "2026-02-02T00:00:00Z"), repo: "owner/a", run: undefined });
-    expect(card.attentionLabel).toBe("agent-stuck");
-    expect(card.consequence).toBe("readmit-fresh");
+  it("degrades to a null run when no run row exists (a legacy park with no rebuilt run)", () => {
+    const card = toInboxCard({ item: item(11, "review-maxed", "2026-02-02T00:00:00Z"), repo: "owner/a", run: undefined });
+    expect(card.attentionLabel).toBe("review-maxed");
+    // ADR-0042 §7: every label the queue still serves is an answerable *pause*, so the only
+    // consequence an inbox card can carry is resuming that pause from its checkpointed WIP.
+    expect(card.consequence).toBe("resume-from-wip");
     expect(card.run).toBeNull();
   });
 });
@@ -105,8 +107,8 @@ describe("toInboxResponse (AC1 — oldest-first across repos, filter echoed)", (
     const entries = [
       // Newer escalation on owner/a.
       { item: item(31, "awaiting-answer", "2026-02-11T00:00:00Z"), repo: "owner/a", run: run(31) },
-      // Older stuck-card on owner/b.
-      { item: item(30, "agent-stuck", "2026-02-09T00:00:00Z"), repo: "owner/b", run: undefined },
+      // Older legacy review-maxed park on owner/b.
+      { item: item(30, "review-maxed", "2026-02-09T00:00:00Z"), repo: "owner/b", run: undefined },
     ];
     const res: InboxResponse = toInboxResponse(entries, {
       now,
