@@ -58,6 +58,7 @@ describe("master pipeline hand-back (ADR-0041)", () => {
       resolution: "resolved-and-continue",
       brief: "Update the caller, then re-run the suite.",
       conclusion: "The schema is right; the caller is wrong.",
+      phase: "impl",
     });
 
     const resume = (executor.resume as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0];
@@ -78,11 +79,56 @@ describe("master pipeline hand-back (ADR-0041)", () => {
       resolution: "redispatch-tier-1",
       brief: "Implement against the strict schema.",
       conclusion: "The approach was wrong from the start.",
+      phase: "impl",
     });
 
     const resume = (executor.resume as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(resume.answer.text).toBe("Implement against the strict schema.");
     expect(resume.context.question.headline).toContain("re-dispatched");
+    // An `impl` request carries no phase — the resume drives the implementation session.
+    expect(resume.context.phase).toBeUndefined();
+  });
+
+  /**
+   * The "repair and resume the EXACT phase" contract (ADR-0042). `phase`-presence is the resume
+   * dispatch axis (#9): without it a maxed-out phase-2 review would restart the implementation
+   * and discard the whole review tail.
+   */
+  it.each([
+    ["review-0", 0],
+    ["review-1", 1],
+    ["review-2", 2],
+  ] as const)("a %s request re-enters the review loop at exactly phase %i", async (key, phase) => {
+    const { executor, pipeline } = wire();
+
+    await pipeline.continueRun({
+      run,
+      issue,
+      resolution: "resolved-and-continue",
+      brief: "Guard the retry on the idempotency key.",
+      conclusion: "The reviewer is right about the double-fire.",
+      phase: key,
+    });
+
+    const resume = (executor.resume as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(resume.context.phase).toBe(phase);
+    expect(resume.answer.text).toBe("Guard the retry on the idempotency key.");
+  });
+
+  it("ignores an unrecognised phase key rather than forging a review phase", async () => {
+    const { executor, pipeline } = wire();
+
+    await pipeline.continueRun({
+      run,
+      issue,
+      resolution: "resolved-and-continue",
+      brief: "Look again.",
+      conclusion: "Transient.",
+      phase: "reconcile",
+    });
+
+    const resume = (executor.resume as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+    expect(resume.context.phase).toBeUndefined();
   });
 
   it("retry ci/review re-enters the review loop — which RE-RUNS the gate, never skips it", async () => {

@@ -392,6 +392,27 @@ export class Store {
     ]);
   }
 
+  /**
+   * Append `AnomalyDetected` + a span-closing `RunEnded { closed }` in one commit for a
+   * **claim park** (issue #28, re-typed by ADR-0042). The pre-cutover version appended
+   * `RunStuck`, which projected `agent-stuck`; after the triage cutover that terminal belongs
+   * exclusively to a completed master adjudication. A claim park never started a run for a
+   * master to adjudicate — the daemon could not mutate the issue's labels at all, an
+   * operator-owned GitHub-access condition — so the span closes effect-neutrally (terminal and
+   * re-admittable, carrying no daemon state label) and `daemon-anomaly` is the sole human
+   * surface, exactly as the #28 claim-park rule intends.
+   */
+  async recordClaimParked(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; anomalyReason: string },
+  ): Promise<void> {
+    await this.events.appendToIssue(repo, issueNumber, [
+      { type: "AnomalyDetected", data: { reason: input.anomalyReason } },
+      { type: "RunEnded", data: { runId: String(input.runId), outcome: "closed" } },
+    ]);
+  }
+
   /** Append `AnomalyDetected` — the daemon surfaced a `daemon-anomaly` human-attention state. */
   async recordAnomalyDetected(repo: string, issueNumber: number, input: { reason: string }): Promise<void> {
     await this.appendIssueEvent(repo, issueNumber, {
@@ -443,6 +464,66 @@ export class Store {
         ...(input.prNumber !== undefined ? { prNumber: input.prNumber } : {}),
       },
     });
+  }
+
+  /**
+   * Append a **harness-origin** source fact and its `MasterTriageRequested` in ONE commit
+   * (ADR-0042, the triage cutover). Before the cutover each of these facts was itself a
+   * terminal: `ReviewMaxed` projected `review-maxed`, `RunStuck` projected `agent-stuck`,
+   * `AnomalyDetected` raised `daemon-anomaly`. They keep their exact meaning and schema
+   * (ADR-0024/0026) and stay in the stream as **history**, but the request appended after
+   * them in the same commit is what the status folds to — so the latest projection is
+   * `master-triage`, never an intermediate human-facing state that a reader (or a live
+   * consumer, or a crash between two commits) could observe and page a human for.
+   *
+   * `sourceFacts` may be empty: a CI/rebase/merge/hosted-review failure has no pre-existing
+   * fact to preserve, and minting one purely to satisfy symmetry would be inventing history.
+   */
+  async recordHarnessMasterTriage(
+    repo: string,
+    issueNumber: number,
+    input: {
+      runId: number;
+      source: MasterRequestSource;
+      phase: string;
+      lane: MasterLane;
+      signature: string;
+      headline: string;
+      recommendation?: string;
+      prNumber?: number | null;
+      sourceFacts?: ReadonlyArray<
+        | { kind: "review-maxed"; phase: Phase }
+        | { kind: "run-stuck"; reason: string }
+        | { kind: "anomaly"; reason: string }
+      >;
+    },
+  ): Promise<void> {
+    const preserved = (input.sourceFacts ?? []).map((fact) => {
+      switch (fact.kind) {
+        case "review-maxed":
+          return { type: "ReviewMaxed" as const, data: { runId: String(input.runId), phase: fact.phase } };
+        case "run-stuck":
+          return { type: "RunStuck" as const, data: { runId: String(input.runId), reason: fact.reason } };
+        case "anomaly":
+          return { type: "AnomalyDetected" as const, data: { reason: fact.reason } };
+      }
+    });
+    await this.events.appendToIssue(repo, issueNumber, [
+      ...preserved,
+      {
+        type: "MasterTriageRequested",
+        data: {
+          runId: String(input.runId),
+          source: input.source,
+          phase: input.phase,
+          lane: input.lane,
+          signature: input.signature,
+          headline: input.headline,
+          ...(input.recommendation !== undefined ? { recommendation: input.recommendation } : {}),
+          ...(input.prNumber !== undefined ? { prNumber: input.prNumber } : {}),
+        },
+      },
+    ]);
   }
 
   /** Append `ComplexityPromoted` — the issue was permanently promoted to a complexity tier. */
@@ -507,6 +588,82 @@ export class Store {
         },
       },
     ]);
+  }
+
+  // ---- hosted-review gate facts (issue #43) -----------------------------
+  //
+  // Append-only dispositions of GitHub-hosted review conversations. Every mutation the gate
+  // makes on GitHub (a reply, a resolution) is preceded by nothing and FOLLOWED by its fact,
+  // and the fold of these facts is what a restart reconstructs the single pending gate action
+  // from — so a daemon that dies mid-gate never replies twice or resolves a thread it has
+  // already resolved.
+
+  /** Append `HostedReviewObserved` — the gate saw the hosted reviewer's verdict on a head. */
+  async recordHostedReviewObserved(
+    repo: string,
+    issueNumber: number,
+    input: {
+      runId: number;
+      headSha: string;
+      unresolved: number;
+      humanThreads: number;
+      unknownBots: number;
+    },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "HostedReviewObserved",
+      data: {
+        runId: String(input.runId),
+        headSha: input.headSha,
+        unresolved: input.unresolved,
+        humanThreads: input.humanThreads,
+        unknownBots: input.unknownBots,
+      },
+    });
+  }
+
+  /** Append `HostedReviewThreadReplied` — Ralph replied once to a thread's current finding. */
+  async recordHostedReviewReplied(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; threadId: string; commentHash: string; headSha: string; replyId: string },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "HostedReviewThreadReplied",
+      data: {
+        runId: String(input.runId),
+        threadId: input.threadId,
+        commentHash: input.commentHash,
+        headSha: input.headSha,
+        replyId: input.replyId,
+      },
+    });
+  }
+
+  /** Append `HostedReviewThreadResolved` — Ralph resolved a thread, with its persisted rationale. */
+  async recordHostedReviewResolved(
+    repo: string,
+    issueNumber: number,
+    input: {
+      runId: number;
+      threadId: string;
+      commentHash: string;
+      headSha: string;
+      disposition: "fixed" | "reasoned-invalid";
+      rationale: string;
+    },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "HostedReviewThreadResolved",
+      data: {
+        runId: String(input.runId),
+        threadId: input.threadId,
+        commentHash: input.commentHash,
+        headSha: input.headSha,
+        disposition: input.disposition,
+        rationale: input.rationale,
+      },
+    });
   }
 
   /** Append `DecisionPublished` — the master appended a binding record to the ledger. */
@@ -1340,6 +1497,9 @@ export class ScopedStore {
   }): Promise<void> {
     return this.store.recordRunStuckWithAnomaly(this.repo, input.issueNumber, input);
   }
+  recordClaimParked(input: { issueNumber: number; runId: number; anomalyReason: string }): Promise<void> {
+    return this.store.recordClaimParked(this.repo, input.issueNumber, input);
+  }
   recordAnomalyDetected(input: { issueNumber: number; reason: string }): Promise<void> {
     return this.store.recordAnomalyDetected(this.repo, input.issueNumber, input);
   }
@@ -1360,6 +1520,55 @@ export class ScopedStore {
     prNumber?: number | null;
   }): Promise<void> {
     return this.store.recordMasterTriageRequested(this.repo, input.issueNumber, input);
+  }
+  recordHarnessMasterTriage(input: {
+    issueNumber: number;
+    runId: number;
+    source: MasterRequestSource;
+    phase: string;
+    lane: MasterLane;
+    signature: string;
+    headline: string;
+    recommendation?: string;
+    prNumber?: number | null;
+    sourceFacts?: ReadonlyArray<
+      | { kind: "review-maxed"; phase: Phase }
+      | { kind: "run-stuck"; reason: string }
+      | { kind: "anomaly"; reason: string }
+    >;
+  }): Promise<void> {
+    return this.store.recordHarnessMasterTriage(this.repo, input.issueNumber, input);
+  }
+  recordHostedReviewObserved(input: {
+    issueNumber: number;
+    runId: number;
+    headSha: string;
+    unresolved: number;
+    humanThreads: number;
+    unknownBots: number;
+  }): Promise<void> {
+    return this.store.recordHostedReviewObserved(this.repo, input.issueNumber, input);
+  }
+  recordHostedReviewReplied(input: {
+    issueNumber: number;
+    runId: number;
+    threadId: string;
+    commentHash: string;
+    headSha: string;
+    replyId: string;
+  }): Promise<void> {
+    return this.store.recordHostedReviewReplied(this.repo, input.issueNumber, input);
+  }
+  recordHostedReviewResolved(input: {
+    issueNumber: number;
+    runId: number;
+    threadId: string;
+    commentHash: string;
+    headSha: string;
+    disposition: "fixed" | "reasoned-invalid";
+    rationale: string;
+  }): Promise<void> {
+    return this.store.recordHostedReviewResolved(this.repo, input.issueNumber, input);
   }
   recordComplexityPromoted(input: {
     issueNumber: number;

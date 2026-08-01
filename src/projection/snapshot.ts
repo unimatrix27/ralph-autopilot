@@ -17,10 +17,14 @@ import type {
   BacklogNoProvider,
   BacklogPaused,
   DaemonError,
+  MasterLane,
+  MasterRequestSource,
   OpenQuestion,
   PhaseRoute,
 } from "../store/types";
 import { decodeAgentPhase, phaseLabel, reviewPhaseNumber } from "../review/phase";
+import { foldMasterHistory, interventionsInPhase } from "../master/history";
+import { MAX_MASTER_INTERVENTIONS_PER_PHASE } from "../master/budget";
 
 /** An in-flight agent as the fleet summary shows it. */
 export interface AgentView {
@@ -119,6 +123,14 @@ export interface RuntimeSnapshot {
   /** The backlog (eligible / blocked / paused / moding candidates), aggregated across repos with each item repo-tagged. */
   backlog: RuntimeBacklog;
   awaitingAnswer: QueueItem[];
+  /**
+   * Runs queued for (or undergoing) master triage — the ONE non-human pause state for
+   * autonomous adjudication (ADR-0042). Deliberately its own list rather than folded into the
+   * attention queues: nobody is being paged, so an operator surface that showed it alongside
+   * `awaiting-answer` would re-create exactly the false alarm the cutover removes.
+   */
+  masterTriage: MasterTriageItem[];
+  /** Legacy pre-cutover `review-maxed` parks awaiting adoption; empty on a migrated store. */
   reviewMaxed: QueueItem[];
   /** Terminal runs that self-stopped on the effort budget (`agent-stuck`) — a human-attention state. */
   agentStuck: QueueItem[];
@@ -149,6 +161,30 @@ export const OUTCOME_EVENTS: ReadonlySet<string> = new Set([
   "daemon-anomaly",
   "orphan-worktree-pruned",
 ]);
+
+/**
+ * One queued/running master triage, with everything an operator needs to tell "the daemon is
+ * working on it" from "the daemon is stuck on it" — without opening a transcript and without
+ * leaking prompt contents or credentials. `route` carries the account **id** only.
+ */
+export interface MasterTriageItem extends QueueItem {
+  /** Which failure source opened the escalation (`review-maxed`, `ci`, `merge`, …). */
+  source: MasterRequestSource | null;
+  /** The interrupted lane. */
+  lane: MasterLane | null;
+  /** The run-phase key the two-per-phase budget is counted against. */
+  phase: string | null;
+  /** The intervention in flight, or the next one that would run. 1-based. */
+  attempt: number;
+  /** The binding ceiling per run phase (ADR-0041). */
+  budget: number;
+  /** True while a master session is actually running; false while it waits for a slot/lease. */
+  running: boolean;
+  /** The dispatched route (provider / model / account id) — never a credential. */
+  route: PhaseRoute | null;
+  /** The most recent master conclusion + rationale, or null before the first resolution. */
+  latestConclusion: string | null;
+}
 
 export interface SnapshotOptions {
   /** Injected clock for the deterministic stale / overdue-clamp computation in tests. */
@@ -264,6 +300,32 @@ export function buildSnapshot(store: Store, options: SnapshotOptions = {}): Runt
       noProvider: persisted.flatMap((s) => tagRepo(s.noProvider ?? [], s.targetRepo)),
     },
     awaitingAnswer: toQueue("awaiting-answer"),
+    masterTriage: allRuns
+      .filter((run) => run.status === "master-triage")
+      .map((run) => {
+        const history = foldMasterHistory(store.events.readIssueStream(run.repo, run.issueNumber));
+        const open = history.inProgress;
+        const inPhase = open
+          ? interventionsInPhase(history, open.phase)
+          : history.pending
+            ? interventionsInPhase(history, history.pending.phase)
+            : [];
+        const decided = [...history.interventions].reverse().find((i) => i.rationale !== null);
+        return {
+          repo: run.repo,
+          issueNumber: run.issueNumber,
+          headline: open ? "" : (history.pending?.headline ?? ""),
+          since: run.updatedAt,
+          source: open ? null : (history.pending?.source ?? null),
+          lane: open ? null : (history.pending?.lane ?? null),
+          phase: open?.phase ?? history.pending?.phase ?? null,
+          attempt: open?.attempt ?? inPhase.length + 1,
+          budget: MAX_MASTER_INTERVENTIONS_PER_PHASE,
+          running: open !== null,
+          route: store.getRunRoute(run.id),
+          latestConclusion: decided?.rationale ?? null,
+        };
+      }),
     reviewMaxed: toQueue("review-maxed"),
     agentStuck: toQueue("agent-stuck"),
     awaitingCi: toQueue("awaiting-ci"),

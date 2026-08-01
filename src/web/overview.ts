@@ -20,6 +20,7 @@ import type { RuntimeSnapshot, QueueItem } from "../projection/snapshot";
 import type {
   ActivityItem,
   FleetAgent,
+  MasterTriageItem,
   NeedsYouItem,
   NeedsYouState,
   OverviewResponse,
@@ -189,6 +190,32 @@ export function snapshotToOverview(
     }))
     .sort(byUrgency);
 
+  // ---- master triage: autonomous adjudication, visible but never an alarm ---
+  // Oldest park first: the one that has waited longest for the global master lease reads
+  // first, which is the order an operator wondering "is anything wedged?" wants.
+  const masterTriage: MasterTriageItem[] = (view.masterTriage ?? [])
+    .filter((m) => m.repo !== "" && m.issueNumber > 0)
+    .map((m) => ({
+      repo: m.repo,
+      issue: m.issueNumber,
+      since: m.since,
+      source: m.source,
+      phase: m.phase,
+      attempt: m.attempt,
+      budget: m.budget,
+      running: m.running,
+      // The model only — the account id and every credential stay server-side.
+      model: m.route?.model ?? null,
+      latestConclusion: m.latestConclusion,
+      summary:
+        m.headline.length > 0
+          ? m.headline
+          : m.running
+            ? "Master adjudicating"
+            : "Queued for master adjudication",
+    }))
+    .sort((x, y) => Date.parse(x.since ?? "") - Date.parse(y.since ?? "") || x.issue - y.issue);
+
   // ---- fleet summary: running agents with phase + elapsed -----------------
   // The malformed-row drop (no run row → empty repo / non-positive issue) is a
   // per-section invariant, so it stays here rather than in the repo narrowing.
@@ -230,6 +257,7 @@ export function snapshotToOverview(
     repos,
     reconcileIntervalSeconds: options.reconcileIntervalSeconds ?? 30,
     needsYou,
+    masterTriage,
     fleet,
     funnel,
     activity,
@@ -263,6 +291,9 @@ function narrowSnapshot(snapshot: RuntimeSnapshot, repo: string): RuntimeSnapsho
       noProvider: byRepo(snapshot.backlog.noProvider),
     },
     awaitingAnswer: byRepo(snapshot.awaitingAnswer),
+    // `?? []`: the master-triage band is additive (ADR-0042); a snapshot fixture or an
+    // in-place upgrade from a build predating it lacks the field despite the type.
+    masterTriage: byRepo(snapshot.masterTriage ?? []),
     reviewMaxed: byRepo(snapshot.reviewMaxed),
     agentStuck: byRepo(snapshot.agentStuck),
     awaitingCi: byRepo(snapshot.awaitingCi),

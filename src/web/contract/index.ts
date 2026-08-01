@@ -41,11 +41,13 @@ export {
   fleetAgentSchema,
   pipelineFunnelSchema,
   activityItemSchema,
+  masterTriageItemSchema,
   overviewResponseSchema,
 } from "./overview";
 export type {
   NeedsYouState,
   NeedsYouItem,
+  MasterTriageItem,
   FleetAgent,
   PipelineFunnel,
   ActivityItem,

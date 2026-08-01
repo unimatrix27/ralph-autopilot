@@ -34,7 +34,11 @@ import type {
   ParentEdge,
   PrComment,
   PullRequest,
+  PullRequestReviewDecision,
   PullRequestState,
+  ReviewThread,
+  ReviewThreadComment,
+  ReviewThreadsRead,
 } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -166,6 +170,195 @@ export function parseMergeStateStatus(out: string): MergeStateStatus {
     return "UNKNOWN";
   }
   return MERGE_STATE_STATUSES.has(raw as MergeStateStatus) ? (raw as MergeStateStatus) : "UNKNOWN";
+}
+
+/**
+ * Parse the full merge-status payload — `mergeStateStatus` plus the two fields that turn an
+ * opaque `BLOCKED` into a typed cause (issue #43): the human-review verdict and the head SHA
+ * every hosted-review observation is anchored to. Tolerant: a missing/unparseable field is
+ * `null` ("unknown"), never a value that would read as "satisfied".
+ */
+export function parseMergeStatusSnapshot(out: string): MergeStatusSnapshot {
+  const state = parseMergeStateStatus(out);
+  let reviewDecision: PullRequestReviewDecision | null = null;
+  let headSha: string | null = null;
+  try {
+    const raw = JSON.parse(out) as { reviewDecision?: unknown; headRefOid?: unknown };
+    const decision = String(raw.reviewDecision ?? "").toUpperCase();
+    if (decision === "APPROVED" || decision === "CHANGES_REQUESTED" || decision === "REVIEW_REQUIRED") {
+      reviewDecision = decision;
+    }
+    if (typeof raw.headRefOid === "string" && raw.headRefOid.length > 0) {
+      headSha = raw.headRefOid;
+    }
+  } catch {
+    // Fall through with the nulls: `state` above is already the tolerant read.
+  }
+  return { state, reviewDecision, headSha };
+}
+
+// ── review threads (issue #43) ───────────────────────────────────────────────
+
+/** How many review threads one GraphQL page requests. */
+const REVIEW_THREAD_PAGE_SIZE = 50;
+/** How many comments per thread one page requests (a thread is rarely deep). */
+const REVIEW_THREAD_COMMENT_PAGE_SIZE = 30;
+/**
+ * Hard cap on pages, so a pathological PR cannot spin the reader forever. Exported so the
+ * fake models the same bound — a cap that only the real adapter enforces is a cap the tests
+ * cannot see (issue #43).
+ */
+export const REVIEW_THREAD_MAX_PAGES = 20;
+
+/**
+ * The thread-aware read the hosted-review gate needs. Flat issue/review comments carry no
+ * thread identity, no `isResolved`/`isOutdated` and no resolver, and the repository ruleset
+ * that blocks the merge is keyed on exactly those — so this is GraphQL, not REST.
+ */
+const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$first:Int!,$comments:Int!,$after:String){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      headRefOid
+      reviewThreads(first:$first,after:$after){
+        pageInfo{ hasNextPage endCursor }
+        nodes{
+          id isResolved isOutdated path line diffSide
+          resolvedBy{ login }
+          comments(first:$comments){
+            nodes{
+              id databaseId body createdAt
+              originalCommit{ oid }
+              commit{ oid }
+              author{ login __typename }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const RESOLVE_THREAD_MUTATION = `mutation($threadId:ID!){
+  resolveReviewThread(input:{threadId:$threadId}){ thread{ id isResolved } }
+}`;
+
+const REPLY_THREAD_MUTATION = `mutation($threadId:ID!,$body:String!){
+  addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){
+    comment{ id }
+  }
+}`;
+
+/** Whether a gh failure names missing GraphQL scopes/permissions rather than a transient fault. */
+export function isPermissionError(err: unknown): boolean {
+  const text = `${(err as { stderr?: string } | null)?.stderr ?? ""} ${String(err)}`.toLowerCase();
+  return (
+    text.includes("resource not accessible") ||
+    text.includes("must have push access") ||
+    text.includes("insufficient scope") ||
+    text.includes("requires authentication") ||
+    text.includes("forbidden") ||
+    text.includes("not authorized")
+  );
+}
+
+/**
+ * Parse one page of the review-threads response into the port's shape. Exported so the
+ * adapter contract is testable against recorded GraphQL payloads with no network.
+ */
+export function parseReviewThreadsPage(out: string): {
+  threads: ReviewThread[];
+  headSha: string | null;
+  hasNextPage: boolean;
+  endCursor: string | null;
+} {
+  const empty = { threads: [] as ReviewThread[], headSha: null, hasNextPage: false, endCursor: null };
+  if (out.trim().length === 0) {
+    return empty;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    return empty;
+  }
+  const pr = (parsed as { data?: { repository?: { pullRequest?: unknown } } })?.data?.repository?.pullRequest as
+    | {
+        headRefOid?: unknown;
+        reviewThreads?: { pageInfo?: { hasNextPage?: unknown; endCursor?: unknown }; nodes?: unknown[] };
+      }
+    | undefined;
+  if (!pr) {
+    return empty;
+  }
+  const headSha = typeof pr.headRefOid === "string" ? pr.headRefOid : null;
+  const pageInfo = pr.reviewThreads?.pageInfo ?? {};
+  const nodes = Array.isArray(pr.reviewThreads?.nodes) ? pr.reviewThreads.nodes : [];
+  const threads: ReviewThread[] = [];
+  for (const node of nodes) {
+    const t = node as {
+      id?: unknown;
+      isResolved?: unknown;
+      isOutdated?: unknown;
+      path?: unknown;
+      line?: unknown;
+      diffSide?: unknown;
+      resolvedBy?: { login?: unknown } | null;
+      comments?: { nodes?: unknown[] };
+    } | null;
+    if (!t || typeof t.id !== "string") {
+      continue;
+    }
+    const commentNodes = Array.isArray(t.comments?.nodes) ? t.comments.nodes : [];
+    const comments: ReviewThreadComment[] = [];
+    let reviewedSha: string | null = null;
+    for (const raw of commentNodes) {
+      const c = raw as {
+        id?: unknown;
+        databaseId?: unknown;
+        body?: unknown;
+        createdAt?: unknown;
+        author?: { login?: unknown; __typename?: unknown } | null;
+        commit?: { oid?: unknown } | null;
+        originalCommit?: { oid?: unknown } | null;
+      } | null;
+      if (!c || typeof c.id !== "string") {
+        continue;
+      }
+      const oid = c.commit?.oid ?? c.originalCommit?.oid;
+      if (reviewedSha === null && typeof oid === "string") {
+        reviewedSha = oid;
+      }
+      const login = typeof c.author?.login === "string" ? c.author.login : "";
+      comments.push({
+        id: c.id,
+        databaseId: typeof c.databaseId === "number" ? c.databaseId : null,
+        author: login,
+        // GitHub reports a bot actor as `__typename: "Bot"`; an App-authored comment can also
+        // arrive with a `[bot]` login suffix. Both are checked because mis-reading a bot as a
+        // human would make its thread permanently un-resolvable.
+        authorIsBot: c.author?.__typename === "Bot" || login.endsWith("[bot]"),
+        body: typeof c.body === "string" ? c.body : "",
+        createdAt: typeof c.createdAt === "string" ? c.createdAt : "",
+      });
+    }
+    threads.push({
+      id: t.id,
+      isResolved: t.isResolved === true,
+      isOutdated: t.isOutdated === true,
+      path: typeof t.path === "string" ? t.path : null,
+      line: typeof t.line === "number" ? t.line : null,
+      side: t.diffSide === "LEFT" || t.diffSide === "RIGHT" ? t.diffSide : null,
+      reviewedSha,
+      resolvedBy: typeof t.resolvedBy?.login === "string" ? t.resolvedBy.login : null,
+      comments,
+    });
+  }
+  return {
+    threads,
+    headSha,
+    hasNextPage: pageInfo.hasNextPage === true,
+    endCursor: typeof pageInfo.endCursor === "string" ? pageInfo.endCursor : null,
+  };
 }
 
 /** Whether a gh error is "the label does not exist in the repo" (vs a real fault). */
@@ -875,9 +1068,109 @@ export class GhCliClient implements GitHubClient {
       "--repo",
       this.repo,
       "--json",
-      "mergeStateStatus",
+      // `reviewDecision` + `headRefOid` ride along free on the same read (issue #43): they
+      // are what turn an opaque BLOCKED into a typed cause and anchor every hosted-review
+      // observation to the commit the reviewer actually saw.
+      "mergeStateStatus,reviewDecision,headRefOid",
     ]);
-    return { state: parseMergeStateStatus(out) };
+    return parseMergeStatusSnapshot(out);
+  }
+
+  /**
+   * Every review thread on a PR, fully paginated (issue #43). Fails **typed**, never by
+   * exception: a missing GraphQL permission is an operator-owned defect and a rate limit is a
+   * defer, and the merge gate's response to those two differs — collapsing both into a throw
+   * would lose the distinction exactly where it decides whether a human gets paged.
+   */
+  async readReviewThreads(prNumber: number): Promise<ReviewThreadsRead> {
+    const { owner, name } = splitRepo(this.repo);
+    const threads: ReviewThread[] = [];
+    let headSha: string | null = null;
+    let after: string | null = null;
+    for (let page = 0; page < REVIEW_THREAD_MAX_PAGES; page += 1) {
+      const args = [
+        "api",
+        "graphql",
+        "-f",
+        `query=${REVIEW_THREADS_QUERY}`,
+        "-f",
+        `owner=${owner}`,
+        "-f",
+        `name=${name}`,
+        "-F",
+        `number=${prNumber}`,
+        "-F",
+        `first=${REVIEW_THREAD_PAGE_SIZE}`,
+        "-F",
+        `comments=${REVIEW_THREAD_COMMENT_PAGE_SIZE}`,
+      ];
+      if (after) {
+        args.push("-f", `after=${after}`);
+      }
+      let out: string;
+      try {
+        out = await this.gh(args);
+      } catch (err) {
+        if (isGitHubRateLimitError(err)) {
+          return { kind: "unavailable", reason: "rate-limited", detail: "GitHub rate limit on reviewThreads" };
+        }
+        if (isPermissionError(err)) {
+          return {
+            kind: "unavailable",
+            reason: "permissions",
+            detail: "gh lacks the GraphQL scope to read pull-request review threads",
+          };
+        }
+        return { kind: "unavailable", reason: "error", detail: String(err).slice(0, 300) };
+      }
+      const parsed = parseReviewThreadsPage(out);
+      if (page === 0 && parsed.threads.length === 0 && parsed.headSha === null && out.trim().length === 0) {
+        return { kind: "unavailable", reason: "error", detail: "gh api graphql returned nothing" };
+      }
+      threads.push(...parsed.threads);
+      headSha = headSha ?? parsed.headSha;
+      if (!parsed.hasNextPage || !parsed.endCursor) {
+        return { kind: "threads", threads, headSha };
+      }
+      after = parsed.endCursor;
+    }
+    // The page cap ran out while GitHub still reported `hasNextPage: true`: the read is
+    // *incomplete*. Returning the threads gathered so far as `kind:"threads"` would let the
+    // gate treat "no unresolved thread on the pages I saw" as "no unresolved thread" and merge
+    // past a blocker sitting on an unread page — the exact fail-open this gate exists to prevent
+    // (issue #43). Fail closed instead: a typed `unavailable` the gate reads as "not clear".
+    return {
+      kind: "unavailable",
+      reason: "error",
+      detail: `review threads exceeded ${REVIEW_THREAD_MAX_PAGES} pages; read is incomplete`,
+    };
+  }
+
+  async replyToReviewThread(input: { threadId: string; body: string }): Promise<{ id: string }> {
+    const out = await this.gh([
+      "api",
+      "graphql",
+      "-f",
+      `query=${REPLY_THREAD_MUTATION}`,
+      "-f",
+      `threadId=${input.threadId}`,
+      "-f",
+      `body=${input.body}`,
+    ]);
+    try {
+      const id = (
+        JSON.parse(out) as { data?: { addPullRequestReviewThreadReply?: { comment?: { id?: unknown } } } }
+      )?.data?.addPullRequestReviewThreadReply?.comment?.id;
+      return { id: typeof id === "string" ? id : "" };
+    } catch {
+      return { id: "" };
+    }
+  }
+
+  async resolveReviewThread(threadId: string): Promise<void> {
+    // Idempotent at GitHub: resolving an already-resolved thread returns the thread rather
+    // than erroring, so a restart-driven repeat is harmless.
+    await this.gh(["api", "graphql", "-f", `query=${RESOLVE_THREAD_MUTATION}`, "-f", `threadId=${threadId}`]);
   }
 
   async mergePullRequest(prNumber: number, opts: MergeOptions): Promise<void> {

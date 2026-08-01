@@ -4,7 +4,7 @@ import {
   formatRalphQuestion,
   type EscalationQuestion,
 } from "../review/escalation";
-import { buildHealCardQuestion, formatHealCard } from "../review/escalation";
+import { legacyHealCardComment, legacyHealCardQuestion } from "../testing/legacy-cards";
 import { buildStuckCardQuestion } from "../executor/stuck";
 import { RalphAnswerService } from "./ralph-answer";
 import { formatRalphAnswer, parseRalphAnswer } from "./answer";
@@ -195,17 +195,19 @@ describe("RalphAnswerService (AC6 — review-maxed heal-cards flow through the s
       createdAt: "2026-02-05T00:00:00Z",
       labels: [LABEL_REVIEW_MAXED, "afk", "mode:tdd"],
     });
+    // A PRE-CUTOVER heal-card an operator was already mid-answer on: `ralph-answer` must keep
+    // serving it (ADR-0042 migration), even though no live path posts one any more.
     const healInput = {
       phase: 1 as const,
       attempts: 3,
-      worklist: { items: [{ severity: "P0" as const, title: "race on retry" }] },
+      blockers: [{ severity: "P0" as const, title: "race on retry" }],
     };
-    void github.postComment(20, formatHealCard(healInput));
+    void github.postComment(20, legacyHealCardComment(healInput));
     const service = new RalphAnswerService(github);
 
     const item = await service.next();
     expect(item!.label).toBe(LABEL_REVIEW_MAXED);
-    expect(item!.question.headline).toBe(buildHealCardQuestion(healInput).headline);
+    expect(item!.question.headline).toBe(legacyHealCardQuestion(healInput).headline);
 
     await service.serveOne(async () => "Provide guidance: widen the lock");
     const labels = github.issues.get(20)!.labels;

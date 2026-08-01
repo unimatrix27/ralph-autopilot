@@ -335,3 +335,95 @@ describe("buildSnapshot", () => {
     clockStore.close();
   });
 });
+
+/**
+ * The operator-facing master-triage band (ADR-0042). The point of the assertions below is what
+ * is *absent* as much as what is present: no prompt text, no credential, and no attention
+ * framing — master triage is the daemon working, not a page.
+ */
+describe("buildSnapshot — master triage (ADR-0042)", () => {
+  it("exposes a queued escalation's source, phase, attempt/budget and headline", async () => {
+    const store = openStore(MEMORY_DB);
+    const scoped = store.forRepo("owner/repo");
+    const run = scoped.upsertRun({ issueNumber: 7, mode: "tdd", branch: "ralph/7-x", prNumber: 70 });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 7,
+      runId: run.id,
+      source: "hosted-review",
+      phase: "merge",
+      lane: "merge",
+      signature: "hosted-review|merge|thread",
+      headline: "Hosted review has unresolved conversations",
+      sourceFacts: [{ kind: "review-maxed", phase: 0 }],
+    });
+
+    const [item] = buildSnapshot(store).masterTriage;
+    expect(item).toMatchObject({
+      repo: "owner/repo",
+      issueNumber: 7,
+      source: "hosted-review",
+      phase: "merge",
+      attempt: 1,
+      budget: 2,
+      running: false,
+      headline: "Hosted review has unresolved conversations",
+      latestConclusion: null,
+    });
+    // No route until a session is dispatched, and never a credential.
+    expect(item!.route).toBeNull();
+    expect(JSON.stringify(item)).not.toContain("configDir");
+    store.close();
+  });
+
+  it("reports a running intervention with its attempt number and latest conclusion", async () => {
+    const store = openStore(MEMORY_DB);
+    const scoped = store.forRepo("owner/repo");
+    const run = scoped.upsertRun({ issueNumber: 8, mode: "tdd", branch: "ralph/8-x" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 8,
+      runId: run.id,
+      source: "ci",
+      phase: "review-0",
+      lane: "ci",
+      signature: "ci|review-0|red",
+      headline: "CI never greened",
+    });
+    await scoped.recordMasterInterventionStarted({
+      issueNumber: 8,
+      runId: run.id,
+      attempt: 1,
+      phase: "review-0",
+      signature: "ci|review-0|red",
+    });
+    await scoped.recordMasterInterventionResolved({
+      issueNumber: 8,
+      runId: run.id,
+      attempt: 1,
+      phase: "review-0",
+      resolution: "resolved-and-continue",
+      rationale: "The failing check was a flaky fixture.",
+    });
+    // A second request re-opens the queue in the same phase.
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 8,
+      runId: run.id,
+      source: "ci",
+      phase: "review-0",
+      lane: "ci",
+      signature: "ci|review-0|red-again",
+      headline: "CI still not green",
+    });
+    await scoped.recordMasterInterventionStarted({
+      issueNumber: 8,
+      runId: run.id,
+      attempt: 2,
+      phase: "review-0",
+      signature: "ci|review-0|red-again",
+    });
+
+    const [item] = buildSnapshot(store).masterTriage;
+    expect(item).toMatchObject({ running: true, attempt: 2, budget: 2, phase: "review-0" });
+    expect(item!.latestConclusion).toBe("The failing check was a flaky fixture.");
+    store.close();
+  });
+});

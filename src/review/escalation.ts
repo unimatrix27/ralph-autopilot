@@ -1,24 +1,24 @@
 /**
- * The `escalate` / heal-card surface (CONTEXT: escalate, ralph-question,
- * heal-card; ADR-0004). When a fix agent hits a finding that implies a risky
- * structural change it **escalates** rather than applying it blind: it emits a
- * structured `ralph-question` whose schema is a forcing function for operator
- * attention. `stakes` is required — it translates the decision up to the
- * architecture/user level so the operator can rule without reloading the deep
- * technical context.
+ * The `ralph-question` surface (CONTEXT: escalate, ralph-question; ADR-0004). A structured
+ * question whose schema is a forcing function for operator attention: `stakes` is required
+ * because it translates the decision up to the architecture/user level, so the operator can
+ * rule without reloading the deep technical context.
  *
- * A `review-maxed` phase emits the same `ralph-question` shape as a **heal-card**
- * (CONTEXT: heal-card) so it flows through the one `ralph-answer` queue.
+ * **After the triage cutover (ADR-0042) there is exactly one author of these: the master's
+ * `ask_human`.** The review loop's heal-cards are gone — a maxed-out phase now enqueues master
+ * triage with its blockers as evidence, and no operator is paged for work the daemon is about
+ * to do itself. The shape is retained (and still parsed) for the master's questions, for the
+ * `escalate` tool's *internal* hand-off payload, and for reading back pre-cutover comments
+ * during adoption.
  *
- * Both render to a fenced comment GitHub stores verbatim; the daemon parses its
- * own comments back when rebuilding state.
+ * Renders to a fenced comment GitHub stores verbatim; the daemon parses its own comments back
+ * when rebuilding state.
  */
 
 import { z } from "zod";
 import { parseFencedPayload, renderFencedPayload } from "../core/fenced-payload";
 import { buildLaunchMarker } from "../github/marker";
 import type { Phase } from "../store/types";
-import type { Worklist } from "./worklist";
 
 const required = (label: string) => z.string().min(1, `${label} is required`);
 
@@ -349,114 +349,4 @@ export function buildEscalationDraftPr(input: EscalationDraftPrInput): { title: 
     marker,
   ].join("\n");
   return { title, body };
-}
-
-export interface HealCardInput {
-  phase: Phase;
-  /** The worklist that remained blocking when the phase maxed out. */
-  worklist: Worklist;
-  /** Number of fix attempts spent before maxing out. */
-  attempts: number;
-  /**
-   * `"infra"` when the maxout was a daemon-side container infrastructure fault that survived its
-   * retries (issue #220), not a code/correctness blocker — selects the honest infra heal-card
-   * (fix the box & re-enable) over the correctness/quality one. Absent for a normal maxout.
-   */
-  cause?: "infra";
-}
-
-/**
- * A `review-maxed` phase emits a heal-card: a `ralph-question` whose decision is
- * "how should we get this PR's remaining {CI|correctness|quality} blockers
- * resolved". Phase 0 maxout is a *CI* concern (issue #41); phase 1 a *correctness*
- * concern; phase 2 a *quality* one. A `cause: "infra"` maxout is none of those — it is a
- * container infrastructure fault, surfaced honestly so the operator fixes the box and re-runs
- * rather than chasing a non-existent code defect (issue #220).
- */
-export function buildHealCardQuestion({ phase, worklist, attempts, cause }: HealCardInput): EscalationQuestion {
-  if (cause === "infra") {
-    return buildInfraHealCardQuestion(phase, worklist, attempts);
-  }
-  const concern = phase === 0 ? "CI" : phase === 1 ? "correctness" : "quality";
-  const feature =
-    phase === 0
-      ? "Phase-0 CI gate (harness-owned merge)"
-      : `Phase-${phase} ${phase === 1 ? "normal" : "behaviour-conserving"} review`;
-  const blockers = worklist.items
-    .filter((i) => i.severity === "P0" || i.severity === "P1" || i.severity === "escalate")
-    .map((i) => `[${i.severity}] ${i.title}${i.detail ? ` — ${i.detail}` : ""}`);
-  const standPreamblePhase0 = `The fix agent spent its ${attempts} attempt(s) and CI is still not green:`;
-  const standPreamble = `The fix agent spent its ${attempts} attempt(s) and the phase-${phase} review still reports blockers:`;
-  const stakes =
-    phase === 0
-      ? "CI is red (or never reached a terminal state): the harness will not merge a PR whose checks are not green."
-      : phase === 1
-        ? "Correctness is unverified: merging now risks shipping behaviourally-wrong code to master."
-        : "Behaviour is verified correct; only structural quality remains. The PR is mergeable but below the thermo-nuclear bar.";
-  return {
-    headline:
-      phase === 0
-        ? "CI gate maxed out (could not get checks green)"
-        : `Review maxed out on ${concern} (phase ${phase})`,
-    feature,
-    whereWeStand: [
-      phase === 0 ? standPreamblePhase0 : standPreamble,
-      ...blockers.map((b) => `- ${b}`),
-    ].join("\n"),
-    decision:
-      phase === 0
-        ? "How should the failing CI checks be resolved?"
-        : `How should the remaining phase-${phase} ${concern} blockers be resolved?`,
-    options: [
-      "Provide guidance and re-enable the run (heal) so the fix agent retries with it injected",
-      "Accept the PR as-is and merge manually",
-      "Close the PR and re-scope the issue",
-    ],
-    stakes,
-    recommendation:
-      "Answer with concrete guidance on the listed blockers so the daemon resumes the fix agent from its WIP branch.",
-  };
-}
-
-/**
- * The honest heal-card for a persistent container infrastructure fault (issue #220): the review
- * never completed, so there is no code/correctness verdict to act on. The decision is "fix the box
- * and re-run", and re-enabling resumes from the WIP branch and re-runs the review on the existing
- * PR (the run status, phase marker, and resume context are the same as any review-maxed heal).
- */
-function buildInfraHealCardQuestion(phase: Phase, worklist: Worklist, attempts: number): EscalationQuestion {
-  const blockers = worklist.items
-    .filter((i) => i.severity === "P0" || i.severity === "P1" || i.severity === "escalate")
-    .map((i) => `- [${i.severity}] ${i.title}${i.detail ? `: ${i.detail}` : ""}`);
-  return {
-    headline: `Review blocked by a container infrastructure fault (phase ${phase})`,
-    feature: `Phase-${phase} review (container dispatch)`,
-    whereWeStand: [
-      `The review/fix container failed to produce a result after ${attempts} ${attempts === 1 ? "retry" : "retries"} — ` +
-        "a daemon-side infrastructure fault, not a code defect:",
-      ...blockers,
-    ].join("\n"),
-    decision: `The container could not run phase-${phase} review. How do you want to proceed?`,
-    options: [
-      "Fix the container host (docker / credentials / disk), then re-enable to re-run the review from the existing PR",
-      "Accept the PR as-is and merge manually",
-      "Close the PR and re-scope the issue",
-    ],
-    stakes:
-      "No code defect is implied — the review never completed. The container host (docker / credentials / disk) " +
-      "likely needs attention. Re-enabling resumes from the WIP branch and re-runs the review; the PR is preserved.",
-    recommendation:
-      "Fix the container host, then re-enable: the run resumes from its WIP branch and re-runs the review. The prior " +
-      "failure was a daemon-side infrastructure fault, not something to fix in the code.",
-  };
-}
-
-/**
- * Render a heal-card to its `ralph-question` comment body. The review-maxed phase
- * survives a cold store via the hidden {@link buildPhaseMarker} the caller stamps on
- * the comment (the same marker a review-loop escalation carries), so the body itself
- * needs no phase encoding.
- */
-export function formatHealCard(input: HealCardInput): string {
-  return formatRalphQuestion(buildHealCardQuestion(input));
 }

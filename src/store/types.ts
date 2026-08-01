@@ -69,19 +69,72 @@ export type RunStatus =
   | "closed";
 
 /**
- * Which worker signal opened a master escalation (ADR-0041). `escalate` means the worker
- * wants a *decision* it cannot make; `stuck` means its execution budget is exhausted. Both
- * enter the same master queue — the distinction is evidence for the master, never a
- * different route.
+ * Which signal opened a master escalation (ADR-0041, extended by ADR-0042).
+ *
+ * The first two are **worker-origin**: `escalate` means the worker wants a *decision* it
+ * cannot make; `stuck` means its execution budget is exhausted. The rest are
+ * **harness-origin** — issue-scoped failures the daemon itself detects, which before the
+ * triage cutover each manufactured their own human-attention state:
+ *
+ *  - `review-maxed`  — a review phase (0 CI / 1 correctness / 2 quality) spent its fix attempts;
+ *  - `ci`            — the CI gate never greened (red past the budget, or never terminal);
+ *  - `rebase`        — rebase/sync preparation failed or exhausted its rounds;
+ *  - `merge`         — merge preparation failed (blocked/behind/dirty past the budget);
+ *  - `hosted-review`  — a GitHub-hosted reviewer (Codex) blocks the merge on unresolved threads;
+ *  - `run-wedged`    — a session/container wedged and survived the bounded mechanical cleanup;
+ *  - `session-failed`— an issue-run session threw past its deterministic retries;
+ *  - `anomaly`       — an issue-level reconciler/completeness anomaly with issue/run context.
+ *
+ * All enter the same master queue: the distinction is evidence for the master and the
+ * identity half of the normalized failure signature, never a different route.
  */
-export type MasterRequestSource = "escalate" | "stuck";
+export type MasterRequestSource =
+  | "escalate"
+  | "stuck"
+  | "review-maxed"
+  | "ci"
+  | "rebase"
+  | "merge"
+  | "hosted-review"
+  | "run-wedged"
+  | "session-failed"
+  | "anomaly";
+
+/** Every {@link MasterRequestSource}, in the ADR's order — the vocabulary tests iterate. */
+export const MASTER_REQUEST_SOURCES: readonly MasterRequestSource[] = [
+  "escalate",
+  "stuck",
+  "review-maxed",
+  "ci",
+  "rebase",
+  "merge",
+  "hosted-review",
+  "run-wedged",
+  "session-failed",
+  "anomaly",
+];
+
+/** Whether an untrusted string names a known {@link MasterRequestSource}. */
+export function isMasterRequestSource(value: unknown): value is MasterRequestSource {
+  return typeof value === "string" && (MASTER_REQUEST_SOURCES as readonly string[]).includes(value);
+}
 
 /**
- * The agent lane a master request came from — which session was interrupted (ADR-0041).
- * `impl`/`resume` are this slice's worker-origin lanes; `review`/`fix`/`master` are minted
- * now so the vocabulary does not have to change when the next slice triages review-maxed.
+ * Whether a source is **worker-origin** (a tool the agent itself called) rather than
+ * harness-origin (a failure the daemon detected). The distinction drives what evidence the
+ * master context leads with, never which queue the request enters.
  */
-export type MasterLane = "impl" | "resume" | "review" | "fix" | "master";
+export function isWorkerOriginSource(source: MasterRequestSource): boolean {
+  return source === "escalate" || source === "stuck";
+}
+
+/**
+ * The lane a master request came from — which piece of work was interrupted (ADR-0041,
+ * extended by ADR-0042). `impl`/`resume`/`review`/`fix`/`master` are agent lanes; `ci`,
+ * `merge` and `reconcile` are harness lanes with no agent session behind them (the CI gate,
+ * the integration flow, and the reconciler's own completeness pass).
+ */
+export type MasterLane = "impl" | "resume" | "review" | "fix" | "master" | "ci" | "merge" | "reconcile";
 
 /**
  * The five — and only five — terminal outcomes of one master intervention (ADR-0041):

@@ -188,10 +188,89 @@ export type MergeStateStatus =
   | "DRAFT"
   | "UNKNOWN";
 
-/** A single, non-blocking read of a PR's {@link MergeStateStatus}. */
+/**
+ * GitHub's `reviewDecision` for a PR: whether the repository's human-review policy is
+ * satisfied. Read alongside {@link MergeStateStatus} so a `BLOCKED` can be attributed to a
+ * missing/《changes requested》human review rather than mis-blamed on CI (issue #43).
+ */
+export type PullRequestReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED";
+
+/**
+ * A single, non-blocking read of a PR's {@link MergeStateStatus}. The two optional fields
+ * are what turn an opaque `BLOCKED` into a *typed* cause: `reviewDecision` distinguishes a
+ * missing human approval from a required check, and `headSha` anchors every hosted-review
+ * observation to the commit it actually saw. Optional because adapters that predate the
+ * hosted-review gate (and the merge-status fakes in older tests) supply neither; a consumer
+ * that needs them treats absence as "unknown", never as "satisfied".
+ */
 export interface MergeStatusSnapshot {
   state: MergeStateStatus;
+  /** GitHub's computed human-review verdict, or null/absent when it reports none. */
+  reviewDecision?: PullRequestReviewDecision | null;
+  /** The PR's head commit SHA at the time of the read. */
+  headSha?: string | null;
 }
+
+// ── GitHub-hosted review threads (issue #43) ─────────────────────────────────
+//
+// A repository ruleset can block merging on *unresolved conversations*, which flat
+// issue/review comments cannot model: they carry no thread identity, no resolved/outdated
+// state, and no resolver. The hosted-Codex gate needs all three, so the port grows a
+// thread-aware GraphQL read plus the two thread mutations (reply, resolve).
+
+/**
+ * Who authored a review thread. The distinction is load-bearing, not cosmetic: a
+ * `hosted-reviewer` thread may be replied to and resolved autonomously once a fix is pushed
+ * and verified, a `human` thread may **never** be auto-resolved, and an `unknown-bot`
+ * fails closed (it is neither safe to resolve nor safe to ignore).
+ */
+export type ReviewThreadAuthorType = "hosted-reviewer" | "human" | "ralph" | "unknown-bot";
+
+/** One comment inside a review thread, with the stable ids the gate keys idempotency on. */
+export interface ReviewThreadComment {
+  /** The stable GraphQL node id — what a reply mutation targets. */
+  id: string;
+  /** The REST database id, when GitHub reports one. */
+  databaseId?: number | null;
+  /** The author's login, e.g. `chatgpt-codex-connector`. */
+  author: string;
+  /** Whether GitHub reports the author as a `Bot` actor. */
+  authorIsBot: boolean;
+  body: string;
+  createdAt: string;
+}
+
+/** One PR review thread (GraphQL `reviewThreads`), with its resolution state. */
+export interface ReviewThread {
+  /** The stable thread node id — the idempotency key for reply + resolve. */
+  id: string;
+  isResolved: boolean;
+  isOutdated: boolean;
+  path?: string | null;
+  line?: number | null;
+  side?: "LEFT" | "RIGHT" | null;
+  /** The commit the thread is anchored to — the head the reviewer actually saw. */
+  reviewedSha?: string | null;
+  /** Login of whoever resolved the thread, when resolved. */
+  resolvedBy?: string | null;
+  /** Every comment in the thread, oldest first; never empty for a real thread. */
+  comments: ReviewThreadComment[];
+}
+
+/**
+ * The result of reading a PR's review threads. Deliberately a discriminated union rather
+ * than a throwing read: missing GraphQL permissions and a rate limit are *different*
+ * conditions with different policies (operator-owned defect vs. defer-and-retry), and
+ * collapsing both into an exception loses that distinction exactly where it matters — at
+ * the merge gate, which must fail closed with typed evidence rather than merge blind.
+ */
+export type ReviewThreadsRead =
+  | { kind: "threads"; threads: ReviewThread[]; headSha: string | null }
+  | {
+      kind: "unavailable";
+      reason: "permissions" | "rate-limited" | "error";
+      detail: string;
+    };
 
 /** Bounds for {@link GitHubClient.awaitChecks}: how long to wait and how often to poll. */
 export interface AwaitChecksOptions {
@@ -408,4 +487,24 @@ export interface GitHubClient {
    * absolute root current. Canonical decision records are **never** edited.
    */
   updateNodeComment(ref: IssueRef, commentId: number, body: string): Promise<void>;
+
+  /**
+   * Every review thread on a PR, oldest first, fully paginated (issue #43). The
+   * hosted-review merge gate reads this — not {@link listPullRequestComments} — because a
+   * flat comment carries no thread id, no `isResolved`/`isOutdated`, and no resolver, and
+   * the ruleset that blocks the merge is keyed on exactly those.
+   */
+  readReviewThreads(prNumber: number): Promise<ReviewThreadsRead>;
+
+  /**
+   * Reply to a review thread. Idempotency is the caller's (keyed on thread id + the
+   * disposition it already recorded), because GitHub has no natural-key reply mutation.
+   */
+  replyToReviewThread(input: { threadId: string; body: string }): Promise<{ id: string }>;
+
+  /**
+   * Mark a review thread resolved. Idempotent at the GitHub level: resolving an
+   * already-resolved thread is a no-op rather than an error.
+   */
+  resolveReviewThread(threadId: string): Promise<void>;
 }

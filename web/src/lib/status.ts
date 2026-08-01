@@ -25,9 +25,14 @@ export const STATUS_BY_STATE: Record<string, StatusMeta> = {
   // Automated waits (not human pauses).
   "awaiting-ci": { tone: "waiting", label: "Awaiting CI" },
   "awaiting-merge": { tone: "waiting", label: "Awaiting merge" },
+  // The only non-human pause state (ADR-0042): the daemon is adjudicating it itself, so it
+  // renders as running work, never as attention.
+  "master-triage": { tone: "running", label: "Master triage" },
   // Needs the operator.
   "awaiting-answer": { tone: "attention", label: "Awaiting answer" },
-  "review-maxed": { tone: "danger", label: "Review maxed" },
+  // Pre-cutover history only (ADR-0042): no live path produces this status, but a run row
+  // written before the cutover still renders — as history, not as an alarm.
+  "review-maxed": { tone: "danger", label: "Review maxed (legacy)" },
   "agent-stuck": { tone: "danger", label: "Agent stuck" },
   "daemon-anomaly": { tone: "danger", label: "Daemon anomaly" },
   // Terminal success.

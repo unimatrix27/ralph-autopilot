@@ -30,6 +30,7 @@ import type { RalphAnswer } from "../hitl/answer";
 import type { ResumePayload } from "../store/types";
 import type { EscalationQuestion } from "../review/escalation";
 import type { MasterPipelinePort } from "./engine";
+import { parseReviewPhaseKey } from "./harness-escalation";
 
 export interface ExecutorMasterPipelineDeps {
   executor: Executor;
@@ -75,11 +76,17 @@ export function masterBriefQuestion(input: {
 /** Build the executor-backed {@link MasterPipelinePort}. */
 export function createExecutorMasterPipeline(deps: ExecutorMasterPipelineDeps): MasterPipelinePort {
   return {
-    async continueRun({ run, issue, resolution, brief, conclusion }): Promise<void> {
+    async continueRun({ run, issue, resolution, brief, conclusion, phase }): Promise<void> {
       const question = masterBriefQuestion({ resolution, conclusion });
       const answer: RalphAnswer = { kind: "free-text", text: brief };
-      const context: ResumePayload = { question };
-      deps.logger.info("master.continue", { issue: issue.number, resolution });
+      // `phase`-presence is the resume dispatch axis (#9): a `review-N` request re-enters the
+      // review loop at exactly that phase with the brief injected as fix guidance, while an
+      // `impl`/`resume` request drives the implementation session. Carrying it is what makes
+      // "repair and resume the EXACT phase" (ADR-0042) true rather than aspirational — without
+      // it a maxed-out phase-2 review would restart the implementation and discard the review tail.
+      const reviewPhase = parseReviewPhaseKey(phase);
+      const context: ResumePayload = { question, ...(reviewPhase !== null ? { phase: reviewPhase } : {}) };
+      deps.logger.info("master.continue", { issue: issue.number, resolution, phase });
       await deps.executor.resume({ issue, mode: run.mode, run, answer, context });
     },
 

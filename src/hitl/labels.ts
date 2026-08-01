@@ -3,7 +3,8 @@
  * `ready-for-agent` for one of these; the `ralph-answer` CLI swaps it back to
  * `ready-for-agent` on answer, and the daemon resumes the run next tick.
  *
- * `awaiting-answer` (escalate) and `review-maxed` (heal-card) both carry an open
+ * `awaiting-answer` (a master question) and the pre-cutover `review-maxed` (heal-card,
+ * retired by ADR-0042 and adopted into `master-triage` on sight) both carry an open
  * `ralph-question` and flow through the same one-at-a-time answer queue. `agent-stuck`
  * joins them when it carries an open stuck-card (#86): answering re-admits a fresh run
  * with the operator's guidance rather than resuming a paused one.

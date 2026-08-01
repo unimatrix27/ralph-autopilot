@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { legacyHealCardComment } from "../testing/legacy-cards";
 import {
-  buildHealCardQuestion,
   buildPhaseMarker,
   evaluateEscalationBar,
-  formatHealCard,
   formatRalphQuestion,
   parseEscalationQuestion,
   parsePhaseMarker,
@@ -143,79 +142,25 @@ describe("evaluateEscalationBar — the escalation bar (issue #22)", () => {
   });
 });
 
-describe("heal-card", () => {
-  it("frames phase-1 maxout as a correctness concern", () => {
-    const q = buildHealCardQuestion({
+describe("heal-card retirement (ADR-0042)", () => {
+  it("exports no heal-card builder — a maxed-out phase enqueues master triage instead", async () => {
+    const mod = (await import("./escalation")) as Record<string, unknown>;
+    // The cutover removed the surface, not just its call sites: if these came back, some path
+    // could manufacture a human-attention state the master was supposed to adjudicate first.
+    expect(mod.buildHealCardQuestion).toBeUndefined();
+    expect(mod.formatHealCard).toBeUndefined();
+  });
+
+  it("still parses a pre-cutover heal-card comment, so an adopted issue keeps its evidence", () => {
+    const body = legacyHealCardComment({
       phase: 1,
       attempts: 3,
-      worklist: { items: [{ severity: "P0", title: "race on retry" }] },
+      blockers: [{ severity: "P0", title: "race on retry" }],
     });
-    expect(q.headline).toContain("correctness");
-    expect(q.whereWeStand).toContain("race on retry");
-    expect(q.stakes.toLowerCase()).toContain("correctness");
-  });
-
-  it("frames phase-2 maxout as a quality concern that is still mergeable", () => {
-    const q = buildHealCardQuestion({
-      phase: 2,
-      attempts: 3,
-      worklist: { items: [{ severity: "P1", title: "god object" }] },
-    });
-    expect(q.headline).toContain("quality");
-    expect(q.stakes.toLowerCase()).toContain("mergeable");
-  });
-
-  it("carries a blocker's detail so diagnostics reach the operator", () => {
-    const q = buildHealCardQuestion({
-      phase: 2,
-      attempts: 0,
-      worklist: {
-        items: [
-          {
-            severity: "P0",
-            title: "A review/fix agent did not return parseable JSON after 3 attempts",
-            detail: "Parser error: no parseable JSON object found. Last output tail: ...trailing prose",
-          },
-        ],
-      },
-    });
-    expect(q.whereWeStand).toContain("Parser error: no parseable JSON object found");
-    expect(q.whereWeStand).toContain("trailing prose");
-  });
-
-  it("renders to a valid ralph-question comment", () => {
-    const body = formatHealCard({
-      phase: 1,
-      attempts: 3,
-      worklist: { items: [{ severity: "P0", title: "boom" }] },
-    });
-    expect(body).toContain("```" + RALPH_QUESTION_FENCE);
-  });
-
-  it("frames a cause:'infra' maxout as an infrastructure fault, not a correctness/JSON problem (issue #220)", () => {
-    const q = buildHealCardQuestion({
-      phase: 1,
-      attempts: 2,
-      cause: "infra",
-      worklist: {
-        items: [
-          {
-            severity: "P0",
-            title: "A review/fix container failed to produce a result after repeated retries (daemon infra fault)",
-            detail: "Container failure: docker exited (code=137 signal=SIGKILL); stderr tail: OOM",
-          },
-        ],
-      },
-    });
-    expect(q.headline).toContain("infrastructure fault");
-    expect(q.headline).not.toContain("correctness");
-    // Carries the real docker detail and frames the action as "fix the box & re-run".
-    expect(q.whereWeStand).toContain("docker exited (code=137");
-    expect(q.stakes.toLowerCase()).toContain("no code defect");
-    expect(q.recommendation.toLowerCase()).toContain("re-enable");
-    // Never the misleading JSON guidance.
-    const all = `${q.headline}\n${q.whereWeStand}\n${q.stakes}\n${q.recommendation}`;
-    expect(all).not.toContain("parseable JSON");
+    const parsed = parseRalphQuestionComment(body);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.headline).toContain("correctness");
+    expect(parsed!.whereWeStand).toContain("race on retry");
   });
 });
 

@@ -12,6 +12,7 @@
  */
 
 import type { RecordedStreamEvent } from "../store/event-log";
+import { isMasterRequestSource } from "../store/types";
 import type { MasterLane, MasterRequestSource, MasterResolution } from "../store/types";
 
 /** A pending, unstarted master request — the head of the master queue for this issue. */
@@ -115,7 +116,11 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
       case "MasterTriageRequested":
         history.pending = {
           runId: str(data, "runId"),
-          source: str(data, "source") === "stuck" ? "stuck" : "escalate",
+          // Tolerant reader (ADR-0026): an unknown source from a future vocabulary folds to
+          // `escalate` rather than dropping the request — losing a queued escalation because
+          // a fact carries a name this build has not learned yet is the one outcome the
+          // completeness invariant forbids.
+          source: isMasterRequestSource(data.source) ? data.source : "escalate",
           phase: str(data, "phase"),
           lane: (str(data, "lane") || "impl") as MasterLane,
           signature: str(data, "signature"),

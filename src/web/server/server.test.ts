@@ -58,6 +58,7 @@ const ports: WebControlPlanePorts = {
     repos: ["owner/a", "owner/b"],
     reconcileIntervalSeconds: 30,
     needsYou: [],
+    masterTriage: [],
     fleet: [],
     funnel: { eligible: 0, inFlight: 0, awaitingCi: 0, awaitingMerge: 0, merged: 0 },
     activity: [],

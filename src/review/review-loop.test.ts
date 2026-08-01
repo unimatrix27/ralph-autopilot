@@ -19,6 +19,9 @@ import { LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "../hitl/labels";
 import { parseEscalationQuestion, RALPH_QUESTION_FENCE } from "./escalation";
 import { formatReviewComment, parseReviewComment } from "./review-comment";
 import { type MergeConfig, ReviewLoop, type ReviewLoopContext } from "./review-loop";
+import { HarnessMasterEscalation } from "../master/harness-escalation";
+import { HostedReviewGate } from "./hosted-gate";
+import { parseMasterRequestComment, RALPH_MASTER_REQUEST_FENCE } from "../master/request";
 import { gatingItems, type Worklist } from "./worklist";
 
 const BASE = "main";
@@ -68,6 +71,24 @@ describe("ReviewLoop", () => {
   });
   afterEach(() => store.close());
 
+  /**
+   * The master-triage requests the cutover (ADR-0042) enqueued on the issue thread, parsed.
+   * Replaces the old "a heal-card was posted" assertion: the same evidence now travels to a
+   * master session instead of to an operator.
+   */
+  function masterRequests(issueNumber = 3): ReturnType<typeof parseMasterRequestComment>[] {
+    return (github.comments.get(issueNumber) ?? [])
+      .filter((c) => c.body.includes(RALPH_MASTER_REQUEST_FENCE))
+      .map((c) => parseMasterRequestComment(c.body));
+  }
+
+  /** Every scrap of evidence in the enqueued master requests, joined — for `toContain` checks. */
+  function masterEvidence(issueNumber = 3): string {
+    return masterRequests(issueNumber)
+      .map((r) => JSON.stringify(r?.evidence ?? {}))
+      .join("\n");
+  }
+
   /** Seed an issue, its PR, a run + agent, and return a loop context. */
   function setup(): ReviewLoopContext {
     const issue = github.seed({ number: 3, title: "Review loop" });
@@ -101,6 +122,8 @@ describe("ReviewLoop", () => {
     merge?: Partial<MergeConfig>;
     /** Injected clock for the BEHIND re-rebase budget (#31); defaults to a real timer. */
     now?: () => number;
+    /** Wire the GitHub-hosted review gate (issue #43); absent → no hosted gate. */
+    hostedGate?: boolean;
   }): { loop: ReviewLoop; reviewAgent: ScriptedReviewAgent; fixAgent: ScriptedFixAgent } {
     const reviewAgent = new ScriptedReviewAgent(opts.review);
     const fixAgent = new ScriptedFixAgent(opts.fix ?? []);
@@ -116,6 +139,21 @@ describe("ReviewLoop", () => {
       baseBranch: BASE,
       merge: { ...mergeConfig, ...opts.merge },
       sleep: async () => {},
+      // Every exhaustion terminal goes through the real cutover door (ADR-0042), so these
+      // tests exercise the actual queue entry rather than a stand-in.
+      masterEscalation: new HarnessMasterEscalation({ store, github, logger: silent }),
+      ...(opts.hostedGate
+        ? {
+            hostedGate: new HostedReviewGate({
+              github,
+              store,
+              logger: silent,
+              sleep: async () => {},
+              polls: 2,
+              intervalSeconds: 0,
+            }),
+          }
+        : {}),
       ...(opts.now ? { now: opts.now } : {}),
     });
     return { loop, reviewAgent, fixAgent };
@@ -139,6 +177,7 @@ describe("ReviewLoop", () => {
       baseBranch: BASE,
       merge: mergeConfig,
       sleep: async () => {},
+      masterEscalation: new HarnessMasterEscalation({ store, github, logger: silent }),
     });
   }
 
@@ -208,11 +247,11 @@ describe("ReviewLoop", () => {
     const outcome = await loop.run(ctx);
 
     // A hung review never merges — it maxes out (heal-card), slot freed.
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.merges).toHaveLength(0);
     // A heal-card was posted so a human can look at why the session stalled.
-    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    expect(masterRequests()).toHaveLength(1);
   });
 
   it("surfaces unparseable agent output as review-maxed, not a fatal crash (#15)", async () => {
@@ -232,11 +271,11 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.merges).toHaveLength(0);
     // The PR was NOT closed and a heal-card was posted — the run is recoverable.
-    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    expect(masterRequests()).toHaveLength(1);
   });
 
   it("retries a transient container no-result (infra fault) and passes with no human (issue #220)", async () => {
@@ -305,8 +344,8 @@ describe("ReviewLoop", () => {
     const outcome = await loop.run(ctx);
 
     // Still review-maxed (status unchanged → resume-from-WIP preserves the PR), but via the infra path.
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.merges).toHaveLength(0);
     const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
     // Honest: names the infra fault + carries the real docker detail.
@@ -330,7 +369,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
     expect(reviewCalls).toBe(1); // no retry
   });
 
@@ -349,8 +388,8 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.merges).toHaveLength(0);
   });
 
@@ -360,29 +399,35 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
     expect(fixAgent.calls).toHaveLength(3); // never a 4th attempt
     expect(store.getFixAttempts(ctx.runId, 1)).toBe(3);
   });
 
-  it("phase-1 maxout sets review-maxed + a heal-card and never enters phase 2", async () => {
+  it("phase-1 exhaustion enqueues master triage (no heal-card, no question) and never enters phase 2", async () => {
     const ctx = setup();
     const { loop, reviewAgent } = wire({ review: [blocked], maxFixAttempts: 3 });
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
-    // The run status the reconciler's per-tick diff projects the `review-maxed` label
-    // from (issue #82, ADR-0027) — the loop sets no label imperatively.
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
+    // The projected state is `master-triage` — the daemon is working on it, nobody is paged.
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.addedLabels.some((l) => l.label === LABEL_REVIEW_MAXED)).toBe(false);
-    // Heal-card recorded as an open question.
-    const questions = store.listOpenQuestions();
-    expect(questions).toHaveLength(1);
-    expect(questions[0]!.kind).toBe("heal-card");
-    // A ralph-question comment was posted.
+    // NO heal-card: no operator question is indexed and none is posted (ADR-0042).
+    expect(store.listOpenQuestions()).toHaveLength(0);
     const comments = github.comments.get(3) ?? [];
-    expect(comments.some((c) => c.body.includes("```" + RALPH_QUESTION_FENCE))).toBe(true);
+    expect(comments.some((c) => c.body.includes("```" + RALPH_QUESTION_FENCE))).toBe(false);
+    // …but the `ReviewMaxed` fact survives as history, ahead of the request.
+    const stream = store.readIssueStream(3).map((e) => e.type);
+    expect(stream).toContain("ReviewMaxed");
+    expect(stream.indexOf("ReviewMaxed")).toBeLessThan(stream.indexOf("MasterTriageRequested"));
+    // …and exactly one master request carries the blockers as its evidence.
+    const requests = masterRequests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.source).toBe("review-maxed");
+    expect(requests[0]!.phase).toBe("review-1");
+    expect(masterEvidence()).toContain("race on retry");
     // Phase 2 was never reviewed.
     expect(reviewAgent.calls.every((c) => c.phase === 1)).toBe(true);
     // And no merge.
@@ -486,11 +531,210 @@ describe("ReviewLoop", () => {
 
     // Healable (review-maxed), NOT agent-stuck: the merge was never fired, the PR never
     // closed — the reviewed work is preserved on origin for a human to heal.
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(github.merges).toHaveLength(0);
     expect(github.closedPulls).toHaveLength(0);
     expect((await github.findPullRequestForBranch(BRANCH))!.state).toBe("OPEN");
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
+  });
+
+  // ── GitHub-hosted Codex review gate (issue #43 / #3430) ────────────────────
+
+  /** A hosted Codex review thread on the PR's current head. */
+  function codexThread(over: Record<string, unknown> = {}) {
+    return {
+      id: "PRRT_codex",
+      isResolved: false,
+      isOutdated: false,
+      path: "src/review/review-loop.ts",
+      line: 1204,
+      side: "RIGHT" as const,
+      reviewedSha: "head1",
+      resolvedBy: null,
+      comments: [
+        {
+          id: "PRRC_codex",
+          author: "chatgpt-codex-connector",
+          authorIsBot: true,
+          body: "P0: the merge poll can burn its whole budget on a conversation blocker.",
+          createdAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+      ...over,
+    };
+  }
+
+  it("reproduces #3430: green CI + clean reviews + unresolved hosted threads captures the threads at once", async () => {
+    const ctx = setup();
+    const { loop } = wire({
+      review: [clean],
+      hostedGate: true,
+      // A generous CI budget: the point is that NONE of it is spent.
+      merge: { ciTimeoutMinutes: 60, pollIntervalSeconds: 30 },
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setCiGreen(ctx.prNumber);
+    github.setReadChecks(ctx.prNumber, { state: "green", failures: [] });
+    // GitHub says BLOCKED — but only because the hosted reviewer has an open conversation.
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", reviewDecision: "APPROVED", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [codexThread()], "head1");
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
+    // The CI poll budget was NOT burnt: one merge-status read, then straight to the threads.
+    expect(github.mergeStatusReads.filter((n) => n === ctx.prNumber)).toHaveLength(1);
+    // The evidence names the ACTUAL finding, not a generic "merge blocked" / CI heal card.
+    const requests = masterRequests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.source).toBe("hosted-review");
+    expect(masterEvidence()).toContain("burn its whole budget on a conversation blocker");
+    expect(masterEvidence()).toContain("PRRT_codex");
+    // No merge, no human question.
+    expect(github.merges).toHaveLength(0);
+    expect(store.listOpenQuestions()).toHaveLength(0);
+  });
+
+  it("refuses to merge a mergeable PR while a hosted conversation is unresolved", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [codexThread()], "head1");
+
+    const outcome = await loop.run(ctx);
+
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+  });
+
+  it("merges once the hosted threads are resolved — the gate is not a permanent block", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [codexThread({ isResolved: true })], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+    expect(github.merges).toHaveLength(1);
+  });
+
+  it("never auto-resolves a human thread — it blocks the merge and reaches the master instead", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", headSha: "head1" });
+    github.setReviewThreads(
+      ctx.prNumber,
+      [
+        codexThread({
+          id: "PRRT_human",
+          comments: [
+            {
+              id: "PRRC_human",
+              author: "alice",
+              authorIsBot: false,
+              body: "I would rather we kept the old adapter.",
+              createdAt: "2026-01-01T00:00:00Z",
+            },
+          ],
+        }),
+      ],
+      "head1",
+    );
+
+    expect(await loop.run(ctx)).toEqual({ kind: "master-triage", phase: 0 });
+    expect(github.resolvedThreads).toEqual([]);
+    expect(github.merges).toHaveLength(0);
+    expect(masterRequests()[0]!.source).toBe("merge");
+    expect(masterEvidence()).toContain("human-review policy");
+  });
+
+  it("fails closed (no merge) when the review threads cannot be read for permissions", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "BLOCKED", headSha: "head1" });
+    github.setReviewThreadsUnavailable(ctx.prNumber, "permissions", "missing pull_requests: read");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "master-triage", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    expect(masterEvidence()).toContain("permissions");
+  });
+
+  it("defers on a rate-limited thread read — no escalation, the poll simply continues", async () => {
+    const ctx = setup();
+    const { loop } = wire({
+      review: [clean],
+      hostedGate: true,
+      merge: { ciTimeoutMinutes: 1, pollIntervalSeconds: 30 },
+    });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // BLOCKED once (thread read rate-limited → keep polling), then CLEAN with no threads.
+    github.setMergeStatusSequence(ctx.prNumber, [
+      { state: "BLOCKED", headSha: "head1" },
+      { state: "CLEAN", headSha: "head1" },
+    ]);
+    github.setReviewThreadsUnavailable(ctx.prNumber, "rate-limited", "API rate limit exceeded");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+    // A rate limit never enqueued a master request.
+    expect(masterRequests()).toHaveLength(0);
+  });
+
+  it("does not re-admit resolved, outdated or old-head threads after a repair", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head2" });
+    github.setReviewThreads(
+      ctx.prNumber,
+      [
+        codexThread({ id: "PRRT_fixed", isResolved: true }),
+        codexThread({ id: "PRRT_stale", isOutdated: true }),
+        codexThread({ id: "PRRT_old", reviewedSha: "head1" }),
+      ],
+      "head2",
+    );
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+  });
+
+  it("waits for the hosted reviewer to observe the current head before merging (issue #43)", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // CI is green on head2, but the hosted reviewer has so far only looked at the PREVIOUS head.
+    // A single classify() read would find an empty head2 worklist and merge immediately — the
+    // exact "an empty read is the reviewer being happy" antipattern the design forbids.
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head2" });
+    github.setReviewThreadSequence(ctx.prNumber, [
+      // First observation: an unresolved conversation still anchored to head1 → the reviewer has
+      // NOT yet observed head2, so the bounded wait must keep looking rather than merge.
+      { kind: "threads", threads: [codexThread({ id: "PRRT_old", reviewedSha: "head1" })], headSha: "head2" },
+      // The reviewer then posts a P0 on head2. observe() re-reads, sees the current head, and gates.
+      { kind: "threads", threads: [codexThread({ reviewedSha: "head2" })], headSha: "head2" },
+    ]);
+
+    const outcome = await loop.run(ctx);
+
+    // It observed the new head and caught the finding — no merge, escalated as a hosted blocker.
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    expect(masterRequests()[0]!.source).toBe("hosted-review");
+  });
+
+  it("merges without stalling when the repo has no hosted reviewer (issue #43)", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // Green CI, hosted gate wired, but the reviewer has nothing outstanding on this head — the
+    // bounded observation must resolve to "clean" and merge, never stall on an empty read.
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+    expect(github.merges).toHaveLength(1);
   });
 
   it("a fix agent can escalate instead of applying a risky structural change", async () => {
@@ -562,7 +806,7 @@ describe("ReviewLoop", () => {
     const { loop } = wire({ review: [duplicated], maxFixAttempts: 3 });
 
     const outcome = await loop.run(ctx);
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
 
     // A phase-1 ralph-review comment was posted to the PR (not the issue), carrying
     // the deterministically deduped worklist — the review + bot-comment copies of
@@ -733,7 +977,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(fixAgent.calls).toHaveLength(3); // bounded fix loop, no 4th attempt
     expect(fixAgent.calls.every((c) => c.phase === 0)).toBe(true);
     // Review was skipped entirely and nothing merged.
@@ -741,8 +985,8 @@ describe("ReviewLoop", () => {
     expect(github.merges).toHaveLength(0);
     // A review-maxed (ci) heal-card was surfaced; the run status (the reconciler diff's
     // label source, #82) is review-maxed, set with no imperative addLabel.
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
-    expect(store.listOpenQuestions()[0]!.kind).toBe("heal-card");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
+    expect(masterRequests()[0]!.source).toBe("ci");
   });
 
   it("a CI timeout maxes out immediately without a fix attempt", async () => {
@@ -752,7 +996,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(fixAgent.calls).toHaveLength(0);
     expect(reviewAgent.calls).toHaveLength(0);
   });
@@ -802,7 +1046,7 @@ describe("ReviewLoop", () => {
     expect(fixAgent.calls).toHaveLength(3); // full budget spent before the reconfirm
     expect(github.readCheckPolls).toContain(ctx.prNumber); // the single reconfirm read happened
     expect(reviewAgent.calls.length).toBeGreaterThan(0); // review ran after the rescue
-    expect(store.getRunByIssue(3)!.status).not.toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).not.toBe("master-triage");
   });
 
   it("re-reads CI once before maxing on a timeout hard-stop too (green-in-window rescue, AC4)", async () => {
@@ -829,10 +1073,10 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.resumeAfterCi(ctx, { state: "red", failures: ["build"] });
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(fixAgent.calls).toHaveLength(3); // the full budget, no early max
     expect(reviewAgent.calls).toHaveLength(0); // review never ran on red CI
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
   });
 
   // The off-slot CI park re-admits a run via resumeAfterCi (the poller's seeded
@@ -849,7 +1093,7 @@ describe("ReviewLoop", () => {
 
       const outcome = await loop.resumeAfterCi(ctx, { state: "red", failures: ["build"] });
 
-      expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+      expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
       // Exactly the configured budget of fix attempts ran — never fewer.
       expect(fixAgent.calls).toHaveLength(maxFixAttempts);
       expect(fixAgent.calls.every((c) => c.phase === 0)).toBe(true);
@@ -943,9 +1187,9 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
     expect(github.merges).toHaveLength(0);
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
   });
 
   it("a branch that did not move merges without re-awaiting CI", async () => {
@@ -974,7 +1218,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(github.merges).toHaveLength(0);
   });
 
@@ -1012,12 +1256,12 @@ describe("ReviewLoop", () => {
     const outcome = await loop.run(ctx);
 
     // Fail loud: the resolution did not reach origin — surface it, do not merge a conflicting PR.
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(github.merges).toHaveLength(0);
     expect(worktrees.rebaseVerifyCalls).toHaveLength(1);
     // Verified against the base it was DISPATCHED against, not origin's current base.
     expect(worktrees.rebaseVerifyCalls[0]!.dispatchBaseSha).toBe("base-1");
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     // The existing not-landed heal-card, exactly as today — it names the not-landed failure, NOT a
     // base-advance race.
     const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
@@ -1052,7 +1296,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     // The head is recorded REGARDLESS of the verify verdict: the push happened, so the heal-card's
     // own recommended "re-enable to retry" can hard-sync rather than dead-end on the #255 guard (#21).
     expect(store.getRunByIssue(3)!.runnerPushedSha).toBe("beefbeefbeefbeefbeefbeefbeefbeefbeefbeef");
@@ -1090,11 +1334,11 @@ describe("ReviewLoop", () => {
 
     // Parked HEALABLE (review-maxed + heal-card, PR preserved) — NOT propagated to withFailureGuard,
     // which would terminalize agent-stuck and auto-close the reviewed PR (the orphaning #273 fixes).
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.merges).toHaveLength(0);
     // A heal-card explaining the divergence was surfaced (resume-from-WIP re-runs the resolve).
-    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    expect(masterRequests()).toHaveLength(1);
     const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
     expect(body).toContain("diverged");
   });
@@ -1139,14 +1383,14 @@ describe("ReviewLoop", () => {
 
     // Healable, not orphaned: review-maxed (phase 0), PR preserved (never merged; the loop returns
     // cleanly rather than throwing into the executor's terminalize-and-close-PR guard).
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     expect(github.merges).toHaveLength(0);
     // The fix `failed` before anything landed — the daemon never verified.
     expect(worktrees.rebaseVerifyCalls).toHaveLength(0);
     // An honest heal-card surfaced (resume-from-WIP re-runs the resolve): it names the real push
     // failure and carries its detail, and is NOT the misleading "fix your JSON" card.
-    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    expect(masterRequests()).toHaveLength(1);
     const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
     expect(body).toContain("rebase-conflict resolution container reported a failure");
     expect(body).toContain("no net diff");
@@ -1191,7 +1435,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(fixCalls).toBe(3); // initial dispatch + maxContainerRetries re-dispatches
     expect(github.merges).toHaveLength(0);
     expect(worktrees.rebaseVerifyCalls).toHaveLength(0);
@@ -1275,11 +1519,11 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.run(ctx);
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(github.merges).toHaveLength(0);
     // Exactly the bounded number of fix dispatches (3), then the bound halts a 4th.
     expect(fixAgent.calls.filter((c) => c.rebaseConflict)).toHaveLength(3);
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     // The heal-card names the base-advance RACE and explicitly NOT a failed / no-op push.
     const body = (github.comments.get(3) ?? []).map((c) => c.body).join("\n");
     expect(body).toContain("base branch advanced");
@@ -1323,7 +1567,7 @@ describe("ReviewLoop", () => {
 
     const outcome = await loop.resumeAfterCi(ctx, { state: "green", failures: [] });
 
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 1 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 1 });
     expect(github.merges).toHaveLength(0);
   });
 
@@ -1405,15 +1649,15 @@ describe("ReviewLoop", () => {
     const outcome = await loop.runIntegration(ctx);
 
     // Healable (review-maxed), NOT agent-stuck: the merge never fired, the PR is preserved.
-    expect(outcome).toEqual({ kind: "review-maxed", phase: 0 });
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
     expect(github.merges).toHaveLength(0);
     expect((await github.findPullRequestForBranch(BRANCH))!.state).toBe("OPEN");
-    expect(store.getRunByIssue(3)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(3)!.status).toBe("master-triage");
     // It re-rebased (didn't park on the first BEHIND) before the budget elapsed.
     expect(worktrees.rebased).toHaveLength(2);
     // A heal-card was opened, and the posted card body names the hot base (an off-daemon merge
     // kept landing), not a phantom code defect.
-    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
+    expect(masterRequests()).toHaveLength(1);
     const bodies = [...github.comments.values()].flat().map((c) => c.body);
     expect(bodies.some((b) => b.includes("base kept advancing"))).toBe(true);
   });

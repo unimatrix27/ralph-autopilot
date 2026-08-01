@@ -393,8 +393,6 @@ export type {
   ContainerSweeper,
   DispatchOptions,
 } from "./container/container-execution";
-export { recordTerminalResult } from "./container/record-result";
-export type { TerminalRunRecorder, TerminalRunRef } from "./container/record-result";
 // The real in-container runner + its daemon-side adapter, telemetry→store fold, and docker port
 // (ADR-0038, epic #182 slice 3/5; issue #185).
 export { runContainerRunner } from "./container/runner";
@@ -563,8 +561,6 @@ export {
   parseEscalationQuestion,
   parseRalphQuestionComment,
   formatRalphQuestion,
-  buildHealCardQuestion,
-  formatHealCard,
   evaluateEscalationBar,
   DESIGN_RESOLVABLE_GUIDANCE,
   REQUIRES_CODE_CONTEXT_GUIDANCE,
@@ -574,7 +570,6 @@ export {
 } from "./review/escalation";
 export type {
   EscalationQuestion,
-  HealCardInput,
   EscalationBarVerdict,
   EscalationBarFailure,
   EscalationBarFailureKind,

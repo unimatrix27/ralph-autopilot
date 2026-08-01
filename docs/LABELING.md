@@ -59,23 +59,39 @@ machine from the store (see the runbooks for safe recovery):
 
 - `awaiting-ci`, `awaiting-merge` — automated in-flight states (parked on CI / queued
   for integration).
-- `master-triage` — an automated in-flight state, **not** a request for you. A worker
-  handed its decision up to a **master** escalation (ADR-0041): the work is checkpointed
-  on the issue branch and a fresh highest-tier session is adjudicating it. Nothing is
-  waiting on you; if the master concludes only a human can decide, it will post a real
-  `ralph-question` and swap to `awaiting-answer`. Removing this label by hand takes the
-  issue out of the master queue and re-admits it as ordinary work, discarding the
-  adjudication in progress.
+- `master-triage` — the **only** non-human pause state, and **not** a request for you
+  (ADR-0041, ADR-0042). Since the triage cutover *every* issue-scoped failure lands here
+  first: a worker `escalate`/`stuck`, a review phase that spent its fix attempts, a CI gate
+  that never greened, an exhausted rebase, a merge preparation that never became mergeable,
+  an unresolved GitHub-hosted (Codex) review conversation, a wedged session, or an
+  issue-level reconciler anomaly. The work is checkpointed on the issue branch and a fresh
+  highest-tier session is adjudicating it. Nothing is waiting on you; if the master concludes
+  only a human can decide, it will post a real `ralph-question` and swap to `awaiting-answer`.
+  Removing this label by hand takes the issue out of the master queue and re-admits it as
+  ordinary work, discarding the adjudication in progress.
 - `awaiting-answer` — a **master** escalation asked you a question; answer it with
   `ralph-answer` (which performs the label swap itself). Your answer resumes the master's
   adjudication, not the original worker.
-- `review-maxed`, `agent-stuck`, `daemon-anomaly` — human-attention states. Fix the
-  cause, then re-arm by swapping back to `ready-for-agent` (for `agent-stuck` after a
-  manual branch force-push: do **not** re-arm — see the legacy issue 255 guard note in the
-  runbooks; reopen and merge the PR by hand instead). Since ADR-0041 a worker no longer
-  reaches `agent-stuck` on its own for an impl run: it goes to `master-triage` first, so an
-  `agent-stuck` there means a master adjudicated and concluded nothing further helps (or the
-  two-intervention budget was exhausted). Read the card it left before re-arming.
+- `agent-stuck`, `daemon-anomaly` — the two human-attention states left. Fix the cause, then
+  re-arm by swapping back to `ready-for-agent` (for `agent-stuck` after a manual branch
+  force-push: do **not** re-arm — see the legacy issue 255 guard note in the runbooks; reopen
+  and merge the PR by hand instead).
+
+  Since ADR-0042 **only a completed master adjudication selects `agent-stuck`** — no worker,
+  review loop, executor guard or reconciler path can project it. Seeing it means a master
+  investigated and concluded nothing further helps, or the two-interventions-per-phase budget
+  was exhausted. It always left a card explaining what was tried; read it before re-arming. It
+  is *not* answerable through `ralph-answer`.
+
+  `daemon-anomaly` is now **operator-owned only**: an issue-level anomaly the daemon can scope
+  to a run goes to `master-triage` instead. What is left is a broken master path (an invalid
+  tier-1 route — a master cannot repair the master), genuinely unclassifiable issue state, or a
+  host/supervisor fault. The reason names the operator action required.
+
+- `review-maxed` — **retired** (ADR-0042). No path applies it any more; a maxed-out review
+  phase enqueues master triage with its blockers as evidence. If you still see one, it is a
+  pre-cutover park the reconciler will adopt into `master-triage` on its next tick — leave it
+  alone.
 
 Success has **no label**: a finished issue is simply *merged + closed*.
 

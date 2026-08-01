@@ -15,13 +15,13 @@ import { MEMORY_DB, openStore, type Store } from "../store/store";
 import { Executor } from "../executor/executor";
 import { EscalationCheckpointer } from "../hitl/escalation-checkpoint";
 import { ResumingAgentRunner } from "../testing/fake-agent";
+import { legacyHealCardQuestion } from "../testing/legacy-cards";
 import { FakeGitHub } from "../testing/fake-github";
 import { FakeWorktreeManager } from "../testing/fake-worktree";
 import { seedRun } from "../testing/seed-run";
 import { ScriptedFixAgent, ScriptedReviewAgent } from "../testing/fake-review-agents";
 import { RalphAnswerService } from "../hitl/ralph-answer";
 import {
-  buildHealCardQuestion,
   buildPhaseMarker,
   formatRalphQuestion,
   type EscalationQuestion,
@@ -368,10 +368,12 @@ describe("startup reconciliation — cold store (AC2, AC4)", () => {
     github.seed({ number: 12, title: "Heal cold", labels: [LABEL_REVIEW_MAXED, "afk", "mode:tdd"] });
     const pr = github.openPullRequest(branch, prBody(12, branch));
     github.setCiGreen(pr.number);
-    const healCard = buildHealCardQuestion({
+    // A PRE-CUTOVER heal-card comment: the bytes an older build wrote and the migration
+    // contract requires still parse (ADR-0042). No live path posts one.
+    const healCard = legacyHealCardQuestion({
       phase: 1,
       attempts: 2,
-      worklist: { items: [{ severity: "P0", title: "race on retry" }] },
+      blockers: [{ severity: "P0", title: "race on retry" }],
     });
     void github.postComment(12, `${formatRalphQuestion(healCard)}\n${buildPhaseMarker(1)}`);
 
