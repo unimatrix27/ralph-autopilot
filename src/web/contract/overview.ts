@@ -120,6 +120,41 @@ export type ActivityItem = z.infer<typeof activityItemSchema>;
  * stays populated even while a filter is applied; every section is already narrowed
  * to `repo` when one was requested.
  */
+/**
+ * One queued/running master triage in the overview (ADR-0042). It sits in its own band, NOT in
+ * "Needs you": master triage is the daemon working, and putting it in the attention band would
+ * page an operator for exactly the work the cutover exists to keep off their desk.
+ *
+ * Everything here is derived state — the failure source, the intervention number against its
+ * ceiling, the dispatched model, and the master's own latest conclusion. Deliberately no prompt
+ * text and no credentials: `model` is a model name and the account is identified by id upstream.
+ */
+export const masterTriageItemSchema = z
+  .object({
+    repo: repoSlug,
+    issue: issueNumber,
+    /** ISO-8601 instant the run entered master triage. */
+    since: z.string().nullable(),
+    /** Which failure source opened it (`review-maxed`, `ci`, `merge`, `hosted-review`, …). */
+    source: z.string().nullable(),
+    /** The run-phase key the two-per-phase budget is counted against. */
+    phase: z.string().nullable(),
+    /** The intervention in flight, or the next one that would run. 1-based. */
+    attempt: z.number().int().nonnegative(),
+    /** The binding ceiling per run phase. */
+    budget: z.number().int().positive(),
+    /** True while a master session is running; false while it waits for a slot or the lease. */
+    running: z.boolean(),
+    /** The model the master was dispatched on (tier-1 route), or null before dispatch. */
+    model: z.string().nullable(),
+    /** The master's latest recorded conclusion, or null before its first resolution. */
+    latestConclusion: z.string().nullable(),
+    /** The escalation's one-line headline. */
+    summary: z.string(),
+  })
+  .strict();
+export type MasterTriageItem = z.infer<typeof masterTriageItemSchema>;
+
 export const overviewResponseSchema = z
   .object({
     /** ISO-8601 instant this view was projected (the snapshot time). */
@@ -135,6 +170,11 @@ export const overviewResponseSchema = z
     reconcileIntervalSeconds: z.number().int().positive(),
     /** The attention band, pre-sorted most-urgent-first (triage order). */
     needsYou: z.array(needsYouItemSchema),
+    /**
+     * Autonomous adjudication in progress (ADR-0042) — visible, never an alarm. Oldest park
+     * first, so the one that has waited longest for the global master lease reads first.
+     */
+    masterTriage: z.array(masterTriageItemSchema),
     /** Running agents with phase + elapsed. */
     fleet: z.array(fleetAgentSchema),
     /** The pipeline funnel counts. */

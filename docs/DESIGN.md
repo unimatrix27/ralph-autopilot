@@ -338,14 +338,19 @@ a forever loop, takes the typed answer, writes a `ralph-answer` comment, and swa
 the label back. The daemon sees the swap next tick and **resumes, not restarts**
 the agent from its WIP branch with the answer injected. The resume **dispatches on
 where the pause came from** (legacy issue 9): an impl-agent `escalate` resumes the impl/fix
-session, while a **review-origin** pause — a `review-maxed` heal-card *or* a
-review-loop `escalate` — re-enters the **build-flow review** ([ADR-0017](adr/0017-single-concurrency-integration-flow.md))
-at the phase it paused on, with the answer injected as fix guidance, and hands back
-off to `awaiting-merge` for the integration flow to land — instead of re-running the
-impl prompt against a PR that is already built. The phase survives a cold store in a
-hidden `ralph-phase` marker on the `ralph-question` comment, so a rehydrated
-review-origin pause re-enters at the right phase too. `review-maxed` heal-cards flow
-through the same answer queue. ([ADR-0007](adr/0007-two-tool-ui.md))
+session, while a **review-origin** pause re-enters the **build-flow review**
+([ADR-0017](adr/0017-single-concurrency-integration-flow.md)) at the phase it paused on, with the
+answer injected as fix guidance, and hands back off to `awaiting-merge` for the integration flow
+to land — instead of re-running the impl prompt against a PR that is already built. The phase
+survives a cold store in a hidden `ralph-phase` marker on the `ralph-question` comment.
+([ADR-0007](adr/0007-two-tool-ui.md))
+
+Since **ADR-0042** the *entry* to this path has changed, though the resume mechanism has not.
+`escalate` no longer reaches a human at all (ADR-0041) and a maxed-out review phase no longer
+posts a heal-card: both enqueue master triage. The same resume-not-restart machinery now carries
+the **master's brief** into the exact phase that was interrupted — a `review-N` master request
+re-enters review phase N, everything else drives the implementation session. A `ralph-question`
+exists only when a master chose `ask-human`, and answering it resumes the *master*.
 
 ## 7. State & UI
 
@@ -406,19 +411,46 @@ ships it atomically. ([ADR-0029](adr/0029-embedded-web-control-plane.md),
 ```
 needs-triage ──► needs-info ──► (triage skill) ──► ready-for-agent + afk + mode:* ──► [GATE]
                                                           │
+                        every issue-scoped failure ───────┤  (escalate · stuck · review maxout ·
+                                                          │   ci · rebase · merge · hosted-review ·
+                                                          ▼   session wedge · issue anomaly)
+                                                    master-triage        [daemon working — no page]
+                                                          │
                           ┌───────────────────────────────┼───────────────────────────────┐
-                          ▼ (escalate)                     ▼ (stuck)         ▼ (review maxout)
-                    awaiting-answer                   agent-stuck         review-maxed
-                          │  ◄── ralph-answer ──────────────┴───────────────────┘ (heal)
-                          ▼ (resume)
-                    ready-for-agent ──► … ──► PR merged + issue closed   [SUCCESS — no label]
+                          ▼ (master ask-human)            ▼ (master terminal)              ▼ (resolved)
+                    awaiting-answer                   agent-stuck                    ready-for-agent
+                          │  ◄── ralph-answer ── resumes the MASTER                        │
+                          └───────────────────────────────────────────────────────────────►┘
+                                             … ──► PR merged + issue closed   [SUCCESS — no label]
 ```
 
-Retired: `needs-human` (superseded by the three precise states). `hitl` excludes
-an issue from the gate. `ready-for-human` is a triage outcome, not a loop state.
+**`master-triage` is the only non-human pause/queue state** (ADR-0042). It is visible,
+daemon-owned, excluded from ordinary admission and restart-recoverable. Only two states mean a
+human is wanted: `awaiting-answer` (exactly one structured `ralph-question`, which only the
+master's `ask_human` creates) and the terminal `agent-stuck` (only a completed master
+adjudication selects it; it is *not* answerable through `ralph-answer`).
 
-`daemon-anomaly` is the daemon-side human-attention label, surfaced from two paths
-that converge on the same state. The reconciler labels an issue it could not even
+Retired: `needs-human` (superseded by the precise states); `review-maxed` **as a durable label**
+— it is now an event in history and evidence in master context, and no path posts a heal-card
+(ADR-0042). `hitl` excludes an issue from the gate. `ready-for-human` is a triage outcome, not a
+loop state.
+
+`daemon-anomaly` is the daemon-side **operator-owned** human-attention label. Since ADR-0042 an
+issue-level anomaly with a concrete issue *and* run behind it enqueues master triage instead of
+paging — the `AnomalyDetected` fact is preserved in the same commit, so the anomaly stays readable
+as history and in the master's context. The label is retained for exactly the cases a master
+cannot help with, and it must name the operator action required:
+
+  - **a broken/unavailable master path itself** — an invalid or non-tools-capable tier-1 route.
+    A master cannot repair the master, and enqueuing one would hide a config defect behind a queue
+    that never drains;
+  - **unclassifiable issue state** — no classification means no scope to hand a master and no
+    evidence to hand it with; "fail visible" is the whole point;
+  - **host-wide and supervisor/self-update anomalies** — no issue worktree to scope an
+    adjudication to, and the master may not restart services, mutate supervisor state or repair
+    host resources. These live in the anomaly log/journal and never reach the issue classifier.
+
+Historically it was surfaced from two paths that converge on the same state. The reconciler labels an issue it could not even
 *claim* after `maxClaimFailures` consecutive ticks (a git/gh fault, not an agent
 stuck on the task — legacy issue 28); the completeness pass (§9a) labels any island it
 cannot classify (legacy issue 27). Like the three escalation states it excludes the issue
@@ -752,6 +784,84 @@ pre-dispatch, and a stale image fails with one precise, actionable error naming 
 capability — never a generic no-result → review-maxed cascade. The onboarding smoke test gates
 on the same label.
 
-Deliberately **out of scope**: automatic triage of `review-maxed`, CI/merge/rebase failures
-and daemon anomalies (the next slice); direct master merge/close; host recovery; persistent
-conversational memory; parallel master sessions.
+Deliberately out of scope *for §13*: automatic triage of `review-maxed`, CI/merge/rebase failures
+and daemon anomalies — **delivered by §13a below**; direct master merge/close; host recovery;
+persistent conversational memory; parallel master sessions.
+
+## 13a. The triage cutover — every issue-scoped failure is adjudicated first (issue #43)
+
+[ADR-0042](adr/0042-master-triage-cutover.md) finishes what §13 started. §13 routed the two
+*worker* exits through a master; everything else the daemon itself detected still manufactured a
+human-attention state on its own authority — a heal-card, a `review-maxed` label, an
+`agent-stuck` terminal with the PR auto-closed, a `daemon-anomaly`. Each of those is a
+*diagnosable issue-scoped fault* with a branch, a PR, a transcript and a hierarchy behind it, and
+each of them spent the system's scarcest resource to say so.
+
+### 13a.1 One door
+
+`master/harness-escalation.ts` is the single entry every harness-origin source goes through:
+review exhaustion (phases 0/1/2), CI, rebase/sync, merge preparation, the hosted-review gate,
+session/container wedging after the existing bounded cleanup, executor session failures, and
+issue-level reconciler anomalies with issue+run context.
+
+Three properties are load-bearing:
+
+1. **The source fact is preserved, not replaced.** `ReviewMaxed` / `RunStuck` / `AnomalyDetected`
+   keep their exact schema (ADR-0024/0026) and stay in the stream as history;
+   `MasterTriageRequested` is appended in the **same commit**, so the latest projection is
+   `master-triage` and no reader — live consumer, notification sink, or a crash between two
+   writes — can observe the intermediate human-facing state.
+2. **Exactly one request per (phase, signature).** The reconciler re-detects a standing anomaly
+   every tick and a retried gate can fail identically; idempotence lives at the door rather than
+   at nine call sites.
+3. **It never posts a human question.** `ask_human` remains the master's alone.
+
+Cheap deterministic retries still run first — the bounded fix loop, the container re-dispatch
+budget, the rebase rounds, the CI poll budget — and the master receives what survived them.
+Usage-limit and GitHub rate-limit conditions keep their defer/rotation semantics: a cap is a wait
+that resolves itself, so routing it here would burn the two-per-phase budget on nothing.
+
+### 13a.2 The GitHub-hosted review gate
+
+A repository ruleset can block merging on unresolved conversations. Before this, a hosted-Codex
+thread on a PR with green CI and clean Ralph reviews read as `mergeStateStatus = BLOCKED`, the
+merge gate spent its whole CI polling budget waiting for a check that was never going to change,
+and it emitted a CI heal-card naming the wrong cause (issue #3430).
+
+So the hosted reviewer is modelled as what it is: a first-class integration gate, distinct from CI
+and from phase-1/phase-2 review.
+
+  - `GitHubClient` grows thread-aware GraphQL reads (`reviewThreads`: stable thread/comment ids,
+    author/type, body, path/line/side, `isResolved`, `isOutdated`, reviewed head, replies,
+    resolver) plus reply and resolve mutations. Flat comments are not sufficient and are not used.
+  - `BLOCKED` is **classified into typed causes before any retry** — hosted-review conversations,
+    human-review policy, required status checks, behind/conflict, unknown ruleset. Only a
+    *pending* required check may spend the CI budget.
+  - Findings are normalized into a durable worklist (thread id, latest-comment id/hash, reviewed
+    head, severity when stated, path/line, the finding verbatim, evidence) and the **actual
+    findings** are injected — never a generic "merge blocked".
+  - A bot finding is never accepted *or* dismissed because a bot raised it: a reasoned-invalid
+    disposition must persist its own rationale and verification, both in the reply body.
+  - Reply and resolve happen only after the fix or disposition is pushed and verified on the
+    relevant head, idempotently by thread id, recorded as append-only facts. A restart between
+    observation / worklist / fix / reply / resolution / re-review reconstructs exactly one pending
+    action and repeats no mutation.
+  - A **human** thread is never auto-resolved; an **unclassifiable bot** identity fails closed.
+  - The merge command is unreachable until CI, internal review, hosted review, human-review policy,
+    head freshness and mergeability are simultaneously satisfied on one stable head.
+
+The hosted failure signature is built from **thread identity + latest finding content +
+verification result**, so a push that changes only the head SHA is the same failure and the
+§13.6 budget still binds.
+
+### 13a.3 Migration
+
+On reconcile, an issue carrying a pre-cutover `review-maxed` or a non-master `agent-stuck` has its
+run/phase/evidence preserved, one idempotent master request appended, and moves to `master-triage`
+— the retired label stripped on the same tick. Deliberately *not* adopted: a live unanswered
+`ralph-question` (that is a real question a human is being asked) and an `agent-stuck` a master
+already adjudicated (that decision stands). Pre-cutover heal-card comments still parse, so an
+adopted issue carries its evidence and a mid-flight `ralph-answer` is not stranded.
+
+Drain starts no master session: the queue is durable on GitHub and in the event log, so the next
+normal startup services it.

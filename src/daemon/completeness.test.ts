@@ -19,11 +19,19 @@ import { evaluateGate } from "../core/admission";
 import type { Issue, IssueState } from "../github/types";
 import type { RunStatus } from "../store/types";
 import {
+  anomalyEnqueuesMaster,
   classifyIssueState,
   isNonTerminalStatus,
+  OPERATOR_OWNED_ANOMALIES,
   type Classification,
   type IssueSnapshot,
 } from "./completeness";
+import {
+  LABEL_AGENT_STUCK,
+  LABEL_AWAITING_ANSWER,
+  LABEL_MASTER_TRIAGE,
+  LABEL_REVIEW_MAXED,
+} from "../core/labels";
 
 /** Representative label sets spanning the daemon's whole label vocabulary. */
 const LABEL_SETS: Record<string, string[]> = {
@@ -497,5 +505,86 @@ describe("classifyIssueState — healthy states are not false-flagged (AC1)", ()
     expect(
       classifyIssueState({ ...base, issueState: "CLOSED", runStatus: "closed" }),
     ).toEqual({ kind: "terminal" });
+  });
+});
+
+/**
+ * The triage cutover's completeness enumeration (ADR-0042, issue #43). After the cutover every
+ * folded issue state must be exactly one of: actively progressing, durably queued for a master,
+ * awaiting a concrete human answer, terminal after a master, or a loud operator-owned anomaly.
+ * There is no sixth arm, and in particular there is no "parked on a heal-card" arm any more.
+ */
+describe("the post-cutover lifecycle enumeration (ADR-0042)", () => {
+  const base: IssueSnapshot = {
+    issueNumber: 1,
+    issueState: "OPEN",
+    labels: [],
+    runStatus: null,
+    inFlight: false,
+    wedged: false,
+    gateEligible: false,
+    resumable: false,
+    answered: false,
+    masterUnroutable: false,
+  };
+
+  it("classifies a queued master triage as in-flight — the daemon is working, nobody is paged", () => {
+    expect(
+      classifyIssueState({ ...base, runStatus: "master-triage", labels: [LABEL_MASTER_TRIAGE] }),
+    ).toEqual({ kind: "in-flight" });
+  });
+
+  it("classifies a master triage the daemon cannot route as a loud operator-owned anomaly", () => {
+    expect(
+      classifyIssueState({
+        ...base,
+        runStatus: "master-triage",
+        labels: [LABEL_MASTER_TRIAGE],
+        masterUnroutable: true,
+      }),
+    ).toEqual({ kind: "anomaly", reason: "master-route-unconfigured" });
+  });
+
+  it("classifies a terminal-after-master `agent-stuck` as awaiting-human", () => {
+    expect(classifyIssueState({ ...base, runStatus: "agent-stuck", labels: [LABEL_AGENT_STUCK] })).toEqual({
+      kind: "awaiting-human",
+    });
+  });
+
+  it("classifies a master `ask-human` pause as awaiting-human", () => {
+    expect(
+      classifyIssueState({ ...base, runStatus: "awaiting-answer", labels: [LABEL_AWAITING_ANSWER] }),
+    ).toEqual({ kind: "awaiting-human" });
+  });
+
+  it("still classifies a pre-cutover `review-maxed` park, so migration is never a silent island", () => {
+    expect(classifyIssueState({ ...base, runStatus: "review-maxed", labels: [LABEL_REVIEW_MAXED] })).toEqual({
+      kind: "awaiting-human",
+    });
+  });
+
+  it("keeps the master path's own defects operator-owned — a master cannot repair a master", () => {
+    expect(anomalyEnqueuesMaster("master-route-unconfigured", true)).toBe(false);
+    expect(anomalyEnqueuesMaster("unclassified", true)).toBe(false);
+  });
+
+  it("routes every OTHER issue-scoped anomaly to a master when there is context to adjudicate", () => {
+    for (const reason of [
+      "run-wedged-past-lifetime",
+      "running-row-not-in-flight",
+      "paused-run-unresumable",
+      "paused-run-label-missing",
+      "answered-pause-stranded",
+      "paused-label-missing-run",
+      "non-terminal-run-on-closed-issue",
+    ] as const) {
+      expect(anomalyEnqueuesMaster(reason, true), reason).toBe(true);
+      // …and never without an issue + run to scope it to.
+      expect(anomalyEnqueuesMaster(reason, false), `${reason} without context`).toBe(false);
+    }
+  });
+
+  it("names every operator-owned anomaly exactly once (the boundary is one list, not a habit)", () => {
+    expect(new Set(OPERATOR_OWNED_ANOMALIES).size).toBe(OPERATOR_OWNED_ANOMALIES.length);
   });
 });

@@ -105,6 +105,22 @@ describe("overview contract", () => {
         powerActionSurface: "attention" as const,
       },
     ],
+    // Autonomous adjudication in progress (ADR-0042) — visible, deliberately NOT in `needsYou`.
+    masterTriage: [
+      {
+        repo: "owner/a",
+        issue: 31,
+        since: "2026-06-20T23:00:00.000Z",
+        source: "hosted-review",
+        phase: "merge",
+        attempt: 1,
+        budget: 2,
+        running: true,
+        model: "claude-fable-5",
+        latestConclusion: null,
+        summary: "Merge gated by the GitHub-hosted review",
+      },
+    ],
     fleet: [
       {
         repo: "owner/a",

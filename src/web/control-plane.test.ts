@@ -4,11 +4,10 @@ import { parseConfig, resolveTargets } from "../config/load";
 import type { RalphConfig } from "../config/schema";
 import { MEMORY_DB, openStore, type Store } from "../store/store";
 import { seedRun } from "../testing/seed-run";
+import { legacyHealCardComment } from "../testing/legacy-cards";
 import { FakeGitHub } from "../testing/fake-github";
 import {
-  buildHealCardQuestion,
   buildPhaseMarker,
-  formatHealCard,
   formatRalphQuestion,
   type EscalationQuestion,
 } from "../review/escalation";
@@ -438,7 +437,7 @@ function seedHealCard(github: FakeGitHub, number: number, createdAt: string, pha
   github.seed({ number, title: `Maxed ${number}`, createdAt, labels: [LABEL_REVIEW_MAXED, "afk", "mode:tdd"] });
   void github.postComment(
     number,
-    formatHealCard({ phase, attempts: 3, worklist: { items: [{ severity: "P0", title: "race on retry" }] } }) +
+    legacyHealCardComment({ phase, attempts: 3, blockers: [{ severity: "P0", title: "race on retry" }] }) +
       "\n" +
       buildPhaseMarker(phase),
   );

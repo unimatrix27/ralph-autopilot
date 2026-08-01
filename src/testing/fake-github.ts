@@ -26,6 +26,8 @@ import type {
   ParentEdge,
   PrComment,
   PullRequest,
+  ReviewThread,
+  ReviewThreadsRead,
 } from "../github/types";
 
 export interface SeedIssue extends Partial<Omit<Issue, "number">> {
@@ -128,6 +130,22 @@ export class FakeGitHub implements GitHubClient {
   >();
   /** Comment threads on nodes outside {@link repo} (local ones live in `comments`). */
   private readonly foreignComments = new Map<string, PrComment[]>();
+  /** Queued one-shot {@link postComment} failures, newest last (see {@link failNextComment}). */
+  private readonly commentFailures: string[] = [];
+  /** Seeded review threads per PR (issue #43). */
+  private readonly reviewThreads = new Map<number, ReviewThread[]>();
+  private readonly reviewThreadHeads = new Map<number, string | null>();
+  private readonly reviewThreadQueue = new Map<number, ReviewThreadsRead[]>();
+  private readonly reviewThreadFailures = new Map<number, ReviewThreadsRead>();
+  private readonly threadMutationFailures: string[] = [];
+  private reviewThreadPageSize = 100;
+  /** Every {@link readReviewThreads} call, for "never burnt the budget" assertions. */
+  readonly reviewThreadReads: number[] = [];
+  /** Every reply posted to a review thread, in order. */
+  readonly threadReplies: Array<{ threadId: string; body: string; id: string }> = [];
+  /** Every thread resolved, in order — asserts resolution is idempotent by thread id. */
+  readonly resolvedThreads: string[] = [];
+  private nextThreadReplyId = 1;
   private nextPrNumber = 1001;
   private nextCommentId = 5001;
 
@@ -236,7 +254,20 @@ export class FakeGitHub implements GitHubClient {
     return { ...pr };
   }
 
+  /**
+   * Make the next {@link postComment} throw once. Models a partial GitHub write (a rate limit
+   * or a transient 5xx landing between two durable effects), which the cutover's callers must
+   * survive without losing the escalation.
+   */
+  failNextComment(message = "postComment failed"): void {
+    this.commentFailures.push(message);
+  }
+
   async postComment(issueNumber: number, body: string): Promise<{ id: number }> {
+    const failure = this.commentFailures.shift();
+    if (failure) {
+      throw new Error(failure);
+    }
     const comment: PrComment = { id: this.nextCommentId++, author: "ralph-autopilot", body };
     const existing = this.comments.get(issueNumber) ?? [];
     existing.push(comment);
@@ -577,6 +608,100 @@ export class FakeGitHub implements GitHubClient {
    */
   setMergeStatusSequence(prNumber: number, snapshots: MergeStatusSnapshot[]): void {
     this.mergeStatusQueue.set(prNumber, [...snapshots]);
+  }
+
+  // ── hosted review threads (issue #43) ──────────────────────────────────────
+
+  /**
+   * Test helper: seed a PR's review threads. Pagination is modelled by
+   * {@link setReviewThreadPageSize} — the fake pages internally exactly as the GraphQL
+   * adapter does, so a test that seeds more threads than one page exercises the paging.
+   */
+  setReviewThreads(prNumber: number, threads: ReviewThread[], headSha: string | null = null): void {
+    this.reviewThreads.set(prNumber, threads.map((t) => ({ ...t, comments: [...t.comments] })));
+    this.reviewThreadHeads.set(prNumber, headSha);
+  }
+
+  /** Test helper: script a sequence of thread reads — each read returns the next, last repeating. */
+  setReviewThreadSequence(prNumber: number, reads: ReviewThreadsRead[]): void {
+    this.reviewThreadQueue.set(prNumber, [...reads]);
+  }
+
+  /** Test helper: make the next thread read fail with a typed reason. */
+  setReviewThreadsUnavailable(prNumber: number, reason: "permissions" | "rate-limited" | "error", detail = ""): void {
+    this.reviewThreadFailures.set(prNumber, { kind: "unavailable", reason, detail });
+  }
+
+  /** Test helper: how many threads one internal page holds (models GraphQL pagination). */
+  setReviewThreadPageSize(size: number): void {
+    this.reviewThreadPageSize = Math.max(1, size);
+  }
+
+  async readReviewThreads(prNumber: number): Promise<ReviewThreadsRead> {
+    this.reviewThreadReads.push(prNumber);
+    const failure = this.reviewThreadFailures.get(prNumber);
+    if (failure) {
+      this.reviewThreadFailures.delete(prNumber);
+      return failure;
+    }
+    const queued = this.reviewThreadQueue.get(prNumber);
+    if (queued && queued.length > 0) {
+      return queued.length > 1 ? queued.shift()! : queued[0]!;
+    }
+    // Page through the seeded threads the way the adapter does, then hand back the union —
+    // so a fake read of 3 pages is indistinguishable from a real one.
+    const all = this.reviewThreads.get(prNumber) ?? [];
+    const pages: ReviewThread[] = [];
+    for (let i = 0; i < all.length; i += this.reviewThreadPageSize) {
+      pages.push(...all.slice(i, i + this.reviewThreadPageSize));
+    }
+    return {
+      kind: "threads",
+      threads: pages.map((t) => ({ ...t, comments: [...t.comments] })),
+      headSha: this.reviewThreadHeads.get(prNumber) ?? null,
+    };
+  }
+
+  async replyToReviewThread(input: { threadId: string; body: string }): Promise<{ id: string }> {
+    const failure = this.threadMutationFailures.shift();
+    if (failure) {
+      throw new Error(failure);
+    }
+    const id = `PRRC_reply_${this.nextThreadReplyId++}`;
+    this.threadReplies.push({ threadId: input.threadId, body: input.body, id });
+    for (const threads of this.reviewThreads.values()) {
+      const thread = threads.find((t) => t.id === input.threadId);
+      if (thread) {
+        thread.comments.push({
+          id,
+          author: "ralph-autopilot",
+          authorIsBot: true,
+          body: input.body,
+          createdAt: new Date(0).toISOString(),
+        });
+      }
+    }
+    return { id };
+  }
+
+  async resolveReviewThread(threadId: string): Promise<void> {
+    const failure = this.threadMutationFailures.shift();
+    if (failure) {
+      throw new Error(failure);
+    }
+    this.resolvedThreads.push(threadId);
+    for (const threads of this.reviewThreads.values()) {
+      const thread = threads.find((t) => t.id === threadId);
+      if (thread) {
+        thread.isResolved = true;
+        thread.resolvedBy = "ralph-autopilot";
+      }
+    }
+  }
+
+  /** Test helper: make the next thread reply/resolve mutation throw once (a partial write). */
+  failNextThreadMutation(message = "thread mutation failed"): void {
+    this.threadMutationFailures.push(message);
   }
 
   /** Mark a PR merged and close the issue its body says it `Closes`. */

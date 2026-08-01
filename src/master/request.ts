@@ -30,6 +30,7 @@ import { buildLaunchMarker } from "../github/marker";
 import type { GitHubClient, Issue } from "../github/types";
 import type { Logger } from "../log/logger";
 import type { ScopedStore } from "../store/store";
+import { isMasterRequestSource } from "../store/types";
 import type { ComplexityTier, MasterLane, MasterRequestSource, Mode } from "../store/types";
 import type { WorktreeManager } from "../executor/worktree";
 import type { EscalationQuestion } from "../review/escalation";
@@ -134,7 +135,10 @@ export function parseMasterRequestComment(body: string): MasterRequestPayload | 
       typeof v.phase !== "string" ||
       typeof v.signature !== "string" ||
       typeof v.issueNumber !== "number" ||
-      (v.source !== "escalate" && v.source !== "stuck") ||
+      // Every source in the vocabulary parses, worker- and harness-origin alike (ADR-0042).
+      // A pre-cutover comment only ever carries `escalate`/`stuck`, which are still members,
+      // so old durable evidence keeps parsing unchanged.
+      !isMasterRequestSource(v.source) ||
       typeof v.evidence !== "object" ||
       v.evidence === null
     ) {

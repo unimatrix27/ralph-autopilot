@@ -50,7 +50,7 @@ Before changing behaviour, read the relevant design doc — they are authoritati
 background:
 
 - **`CONTEXT.md`** — the glossary. Terms like *admission, eligibility gate, escalate,
-  worklist, heal-card, completeness invariant, island, resume-not-restart* mean something
+  worklist, master-triage, hosted-review gate, completeness invariant, island, resume-not-restart* mean something
   precise here. Use these names; the `_Avoid_` lists are enforced.
 - **`docs/DESIGN.md`** — the architecture of record, section by section (§1 shape, §2 gate,
   §3 execution, §4 review loop, §5 merge, §6 HITL, §9 label state machine, §9a completeness).
@@ -93,7 +93,10 @@ One pass through the system, mapped to modules (all under `src/`):
    (ADR-0014). Order: pre-review rebase onto base → **Phase 0** CI gate (`gh pr checks`
    before review) → **Phase 1** normal review → **Phase 2** behaviour-conserving thermo →
    rebase-aware **merge** (`gh pr merge --squash`). Each phase allows ≤3 **fix attempts**;
-   maxout → `review-maxed` + heal-card. **Review rubrics are hardcoded** in
+   maxout → a **master triage request** (ADR-0042: `review-maxed` is an event in history, never
+   a durable label, and heal-cards are retired). The pre-merge gate also runs the GitHub-hosted
+   (Codex) review gate — `hosted-review.ts` / `hosted-gate.ts` — which types a `BLOCKED` merge
+   state before spending any CI budget on it. **Review rubrics are hardcoded** in
    `review/prompts.ts` and target-independent (ADR-0012). `sdk-agents.ts` are the real SDK
    review/fix runners; `worklist.ts` is the deduped, severity-ranked finding list.
 
@@ -140,8 +143,10 @@ redaction), **`projection/`** (the pure `snapshot.ts` projection the web read AP
   downgrade). `src/index.ts` is the curated public surface; export new public API there.
 - **Labels are the protocol.** State transitions are label swaps the reconciler observes next
   tick (`core/labels.ts`, `hitl/labels.ts`, `daemon/completeness.ts` `LABEL_DAEMON_ANOMALY`).
-  The human-attention states are `agent-stuck`, `awaiting-answer`, `review-maxed`, and
-  `daemon-anomaly`; success is *merged + issue closed* (no success label). See DESIGN §9.
+  The only non-human pause state is `master-triage`; the human-attention states are
+  `awaiting-answer` (a question only a master may ask) and `agent-stuck` (a terminal only a
+  completed master adjudication may select), plus an operator-owned `daemon-anomaly`. Success is
+  *merged + issue closed* (no success label). See DESIGN §9 / §13a.
 - **No-deferral rule.** Agent output contracts have nowhere to record a hedge: either it
   matters → `escalate`, or it doesn't → do it. Don't add "deferred items" fields.
 

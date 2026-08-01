@@ -374,4 +374,33 @@ describe("master scheduling in the reconcile tick (ADR-0041)", () => {
       expect(foldMasterHistory(store.readIssueStream(3)).interventions).toHaveLength(1);
     });
   });
+
+  /**
+   * The drain contract (ADR-0042). A drain must not START a master session — the daemon is on
+   * its way out, and a fresh tier-1 session would either be killed mid-adjudication or hold the
+   * process open past its deadline. The queue is durable (a `MasterTriageRequested` fact plus the
+   * `master-triage` label on GitHub), so nothing is lost by simply not starting: the next normal
+   * startup re-folds the queue and services it.
+   */
+  describe("drain", () => {
+    it("starts no master session while draining, and preserves the queue durably", async () => {
+      await seedQueued(3, "queued master");
+      agent.push(resolvedOutcome);
+      const { reconciler } = wire();
+
+      // The drain pump feeds ONLY the merge worker (the orchestrator stops calling `tick`).
+      reconciler.serviceMergeWorker();
+      await reconciler.awaitInFlight();
+      expect(agent.sessions).toHaveLength(0);
+
+      // The request is still queued and still visible on GitHub — nothing was consumed.
+      expect(foldMasterHistory(store.readIssueStream(3)).pending).not.toBeNull();
+      expect(store.getRunByIssue(3)!.status).toBe("master-triage");
+
+      // After a normal startup the very next tick adjudicates it.
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+      expect(agent.sessions).toHaveLength(1);
+    });
+  });
 });

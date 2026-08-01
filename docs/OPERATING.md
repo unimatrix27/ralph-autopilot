@@ -134,7 +134,7 @@ Either of these begins a drain:
 On a drain the daemon logs `daemon.draining` with the issues still in flight,
 stops all new pickups and resumes, waits for the in-flight runs to finish, and
 exits `0` once the in-flight set empties. Paused runs (`awaiting-answer` /
-`review-maxed`) are **not** resumed during a drain — they stay paused for a
+`master-triage`) are **not** resumed or started during a drain — they stay parked for a
 human, which is a clean state, not an abandonment.
 
 ### The drain timeout (a stalled drain)
@@ -206,26 +206,54 @@ What this means for operating the daemon:
   contradictory state the sweeper cannot mechanically remediate — are the residue that
   needs you.
 
-## 4a. Master escalation: what `master-triage` means for you (ADR-0041)
+## 4a. Master escalation: what `master-triage` means for you (ADR-0041, ADR-0042)
 
-Since [ADR-0041](adr/0041-master-escalation-complexity-1-adjudication.md), a worker agent's
-`escalate` and `stuck` no longer page you. They hand the decision **up to a master** — a
-fresh, highest-tier session that investigates independently and resolves it if it can. What
-changes operationally:
+Since [ADR-0041](adr/0041-master-escalation-complexity-1-adjudication.md) a worker agent's
+`escalate` and `stuck` no longer page you, and since
+[ADR-0042](adr/0042-master-triage-cutover.md) **neither does anything else that is
+issue-scoped**: a review phase that spent its fix attempts, a CI gate that never greened, an
+exhausted rebase, a merge preparation that never became mergeable, an unresolved GitHub-hosted
+(Codex) review conversation, a wedged session, or an issue-level reconciler anomaly. All of them
+hand the problem **up to a master** — a fresh, highest-tier session that investigates
+independently and resolves it if it can. What changes operationally:
 
 - **`master-triage` is not a "needs you" state.** It is an automated in-flight state, like
   `awaiting-ci` and `awaiting-merge`: the work is checkpointed on the issue branch and a
   master is (or shortly will be) adjudicating it. Do not remove the label by hand — that
-  takes the issue out of the master queue and discards the adjudication in progress.
+  takes the issue out of the master queue and discards the adjudication in progress. The
+  overview page shows a **Master triage** band with the source, the attempt against its
+  two-per-phase ceiling, the model, and the master's latest conclusion; you are notified only
+  for `awaiting-answer`, a terminal `agent-stuck`, or a genuine operator-owned anomaly.
+- **`review-maxed` and its heal-cards are gone.** A maxed-out review phase records the
+  exhaustion as an *event* and enqueues master triage with the remaining blockers as evidence.
+  There is nothing to answer. If your repo still carries a pre-cutover `review-maxed` label,
+  the reconciler adopts it into `master-triage` on its next tick, preserving the run, the
+  phase and the card already on the thread; a question you were already mid-answer on stays
+  answerable.
+- **A blocked merge names its real cause.** GitHub reporting `BLOCKED` is classified before
+  anything is retried: unresolved hosted-Codex conversations, human-review policy, a required
+  check, behind/conflict, or an unknown ruleset restriction. An unresolved-conversation blocker
+  never spends the CI polling budget, and the actual findings — thread, file, line, the
+  reviewer's own words — reach the agent. Ralph replies to and resolves a hosted thread only
+  after the fix is pushed and verified, once per thread; it **never** auto-resolves a
+  human-authored thread, and an unrecognised bot identity fails closed with no merge.
 - **You will get fewer, better questions.** A `ralph-question` now only ever comes from a
   master that concluded a human decision is genuinely required — a product/priority call, a
   contradiction of standing design authority, or an external blocker. Answer it with
   `ralph-answer` exactly as before; your answer resumes the **master's** adjudication, not the
   original worker's session.
-- **`agent-stuck` now means more.** A worker cannot reach it on its own for an impl run any
-  more. When you see it, either a master adjudicated and concluded nothing further helps, or
-  the two-interventions-per-phase budget was exhausted. Either way it left a card explaining
-  what was tried — read it before re-arming.
+- **`agent-stuck` now means more.** *Nothing* can reach it except a completed master
+  adjudication — not a worker, not the review loop, not the executor's failure guard, not the
+  reconciler (enforced by a source-scan test, not by convention). When you see it, either a
+  master concluded nothing further helps, or the two-interventions-per-phase budget was
+  exhausted. Either way it left a card explaining what was tried — read it before re-arming. It
+  is not answerable through `ralph-answer`.
+- **`daemon-anomaly` is now operator-owned only.** An issue-level anomaly the daemon can scope
+  to a run and a branch goes to `master-triage` instead. What still reaches you is a broken
+  master path (an invalid or non-tools-capable tier-1 route — a master cannot repair the
+  master), genuinely unclassifiable issue state, or a host/supervisor/self-update fault, which
+  has no issue worktree to adjudicate against and which the master may not touch. The reason
+  names the operator action required.
 - **Issues get promoted to `complexity:1` by the daemon.** The first master escalation
   permanently promotes the issue, and tier 1 then governs every later lane (impl, resume,
   review, fix, master). Seeing `complexity:1` appear on an issue you labelled `complexity:3`

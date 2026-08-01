@@ -187,12 +187,22 @@ from `agent.tiers["1"]` and **fails closed** — there is no cheaper master.
 _Avoid_: supervisor (that is the ops wrapper), orchestrator, senior agent, reviewer.
 
 **Master triage**:
-The projected, **non-human** state of an issue queued for (or undergoing) master
-escalation — run status and daemon-owned label `master-triage`. It excludes the issue
-from ordinary admission and classifies as *in-flight*: the daemon is working, nobody is
-being paged. Distinct from every [[stuck-budget]] / [[review-maxed]] / `awaiting-answer`
-state, all of which mean "a human must look".
-_Avoid_: pending, queued-for-human, escalated (bare).
+The **only** non-human pause/queue state for autonomous adjudication (ADR-0042) — run status
+and daemon-owned label `master-triage`. It excludes the issue from ordinary admission,
+classifies as *in-flight*, and is restart-recoverable: the daemon is working, nobody is being
+paged. Since the triage cutover **every** issue-scoped failure lands here first — worker
+`escalate`/`stuck`, review exhaustion, CI, rebase, merge preparation, the [[hosted-review-gate]],
+session wedging and issue-level anomalies. The only states that still mean "a human must look"
+are `awaiting-answer` (one structured question the master asked), a terminal `agent-stuck` (a
+completed master adjudication), and an operator-owned `daemon-anomaly`.
+_Avoid_: pending, queued-for-human, escalated (bare), "waiting on us".
+
+**Master request source**:
+Which failure opened a master escalation, and the identity half of the [[failure-signature]].
+Worker-origin: `escalate`, `stuck`. Harness-origin (ADR-0042): `review-maxed`, `ci`, `rebase`,
+`merge`, `hosted-review`, `run-wedged`, `session-failed`, `anomaly`. The distinction is evidence
+for the master, never a different route.
+_Avoid_: reason, category, error type.
 
 **Master intervention / loop budget**:
 One numbered master session within a run phase. At most **two** per phase; a third
@@ -220,9 +230,9 @@ bypass), `ask-human` (the ONLY path to a [[ralph-question]] in this slice), and
 one per intervention; there is no "deferred" arm.
 
 **ralph-master-request**:
-The fenced comment carrying a queued escalation's durable evidence — source
-(`escalate` | `stuck`), lane, phase, normalized signature, and the worker's payload,
-recommendation, attempted fixes and uncertainty. GitHub is the source of truth for the
+The fenced comment carrying a queued escalation's durable evidence — the
+[[master-request-source]], lane, phase, normalized signature, and the payload: what stopped the
+work, what was already tried, what is uncertain, and (worker-origin) its recommendation. GitHub is the source of truth for the
 master queue, so a lost store rebuilds the escalation from this comment plus the
 `master-triage` label. Not a human-facing question.
 
@@ -328,13 +338,30 @@ One review→fix cycle inside a phase. Each phase allows at most three. A phase
 passes the instant a review returns no `P0`/`P1` blockers.
 
 **Review-maxed**:
-The state when a phase exhausts its three fix attempts still blocked. Surfaces a
-heal-card and stops (Phase-1 maxout never enters Phase 2).
+The **event** recorded when a phase exhausts its three fix attempts still blocked. Since
+ADR-0042 it is history and master-context evidence, not a durable operator-action label and
+not a separate resume protocol: the exhaustion enqueues [[master-triage]] in the same durable
+transition, so the projected state is `master-triage`. Phase-1 exhaustion still never enters
+Phase 2. _Avoid_: "the run is parked on review-maxed", "answer the review-maxed" — nobody is
+being asked anything.
 
 **Heal-card**:
-A `ralph-question`-shaped escalation emitted on `review-maxed` (or any paused run)
-that a human answer can re-enable. To *heal* a run is to answer it so the daemon
-resumes the agent with that guidance injected.
+_Retired (ADR-0042)._ The `ralph-question`-shaped card a `review-maxed` phase used to post for
+an operator. No code path emits one; the builders are gone, not merely unused. Pre-cutover
+cards still *parse* so an adopted issue keeps its evidence, and `ralph-answer` still serves one
+an operator was already mid-answer on. _Avoid_: "heal the review", "post a heal-card" — a
+maxed-out phase escalates to the [[master]] now. "Heal" survives only for the `agent-stuck`
+re-admission path a human drives.
+
+**Hosted review gate**:
+The GitHub-hosted reviewer (Codex) as a **first-class integration gate**, distinct from CI and
+from Ralph's own phase-1/phase-2 reviews (ADR-0042). A repository ruleset can block merging on
+unresolved conversations, so the harness reads PR `reviewThreads` over GraphQL — stable thread
+ids, author type, `isResolved`/`isOutdated`, the reviewed head — classifies a `BLOCKED` merge
+state into a *typed cause* before spending any CI budget on it, and injects the actual findings.
+A hosted-reviewer thread may be replied to and resolved once a fix is pushed and verified; a
+human thread never is; an unclassifiable bot fails closed. _Avoid_: "the bot comments", "merge
+blocked" — name the thread and the finding.
 
 **Stuck budget / agent-stuck**:
 The bounded-effort escape: a worker self-stops after too many fix iterations on the same
@@ -342,7 +369,7 @@ failure, too many edits without a green build, or self-judged futility. Since AD
 worker `stuck` is a *signal*, not a terminal: it preserves the WIP and enters
 [[master-triage]] as a distinct master-request source ("execution budget exhausted"). Only
 the [[master]] projects the terminal `agent-stuck` for a worker-origin path. Distinct from
-`review-maxed` (which has a PR).
+`review-maxed`, which is a review-phase exhaustion rather than a worker self-stop.
 
 **Completeness invariant**:
 The structural guarantee that no work is *silently* lost. Each tick the reconciler

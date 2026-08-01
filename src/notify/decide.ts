@@ -13,9 +13,13 @@
  * see in the UI):
  *   - a new **escalation** ← `Escalated { kind: "escalate" }` (an impl/fix agent paused
  *     for a decision — `awaiting-answer`),
- *   - a new **heal** ← `Escalated { kind: "heal-card" }` or `ReviewMaxed` (a review phase
- *     exhausted its fix attempts — both surface a heal-card),
- *   - a new **stuck** ← `RunStuck` (an agent bounded out — `agent-stuck`),
+ *   - a legacy **heal** ← `Escalated { kind: "heal-card" }` or a bare `ReviewMaxed`. After the
+ *     triage cutover (ADR-0042) no live path emits either without a `MasterTriageRequested` in
+ *     the same commit, which silences the whole batch — so this now only fires for pre-cutover
+ *     history being replayed,
+ *   - a new **stuck** ← `MasterStuck` (a completed master adjudication concluded nothing further
+ *     helps — the ONE path to a terminal `agent-stuck` after ADR-0042), or a pre-cutover
+ *     `RunStuck` that was not superseded by a master request in the same commit,
  *   - a new **anomaly** ← `AnomalyDetected` (the completeness invariant flagged an island
  *     — `daemon-anomaly`, the no-silent-loss guarantee, so it pages at max severity).
  *
@@ -85,6 +89,14 @@ function planNotification(ev: RecordedLogEvent, at: string, facts: BatchFacts): 
     return null;
   }
   const where = `${ref.repo}#${ref.issueNumber}`;
+  // The triage cutover (ADR-0042): every harness-origin failure now commits its source fact
+  // (`ReviewMaxed` / `RunStuck` / `AnomalyDetected`) in the SAME batch as the
+  // `MasterTriageRequested` that supersedes it. Those source facts are history, not attention —
+  // the daemon is about to adjudicate them itself — so the whole batch is silent. Notifying here
+  // would page the operator for precisely the work the cutover exists to keep off their desk.
+  if (facts.masterTriageIssues.has(issueKey(ref))) {
+    return null;
+  }
   if (ev.type !== "AnomalyDetected" && facts.anomalyIssues.has(issueKey(ref))) {
     // Claim parks can commit `RunStuck` and `AnomalyDetected` together. The issue's
     // visible human-attention surface is the daemon anomaly, so page only the max signal.
@@ -118,6 +130,14 @@ function planNotification(ev: RecordedLogEvent, at: string, facts: BatchFacts): 
     case "AnomalyDetected": {
       return build("anomaly", ref, at, `Daemon anomaly on ${where}`, text(ev.data, "reason"));
     }
+    case "MasterStuck": {
+      // The ONE path to a terminal `agent-stuck` after the cutover (ADR-0041/0042): a completed
+      // master adjudication concluded nothing further helps. That IS operator attention.
+      return build("stuck", ref, at, `Master concluded stuck on ${where}`, text(ev.data, "reason"));
+    }
+    case "MasterTriageRequested":
+      // Queued for autonomous adjudication — visible in the UI, never a notification.
+      return null;
     default:
       return null; // RunStarted/FixAttempted/Merged/AnomalyCleared/transcripts/… do not notify.
   }
@@ -130,23 +150,32 @@ interface BatchFacts {
   answeredReviewMaxed: Set<number>;
   /** Issues that carry an anomaly fact in this batch; anomaly pages suppress lower-severity siblings. */
   anomalyIssues: Set<string>;
+  /**
+   * Issues whose batch carries a `MasterTriageRequested` (ADR-0042). Everything else in that
+   * batch is the superseded source fact, so the whole batch is silent: master triage is a
+   * daemon-owned queue state, and paging on it would defeat the cutover's entire purpose.
+   */
+  masterTriageIssues: Set<string>;
 }
 
 function batchFacts(events: RecordedLogEvent[]): BatchFacts {
   const answeredEscalations = new Set<number>();
   const answeredReviewMaxed = new Set<number>();
   const anomalyIssues = new Set<string>();
+  const masterTriageIssues = new Set<string>();
   const answerAllByStream = new Set<string>();
   const answerByComment = new Set<string>();
   const answerAnyByStream = new Set<string>();
 
   for (const ev of events) {
-    if (ev.type !== "AnomalyDetected") {
+    const ref = parseIssueStreamId(ev.streamId);
+    if (ref === null) {
       continue;
     }
-    const ref = parseIssueStreamId(ev.streamId);
-    if (ref !== null) {
+    if (ev.type === "AnomalyDetected") {
       anomalyIssues.add(issueKey(ref));
+    } else if (ev.type === "MasterTriageRequested") {
+      masterTriageIssues.add(issueKey(ref));
     }
   }
 
@@ -187,7 +216,7 @@ function batchFacts(events: RecordedLogEvent[]): BatchFacts {
     }
   }
 
-  return { answeredEscalations, answeredReviewMaxed, anomalyIssues };
+  return { answeredEscalations, answeredReviewMaxed, anomalyIssues, masterTriageIssues };
 }
 
 /** Build a request, filling a tolerant fallback body when the event carried no text. */

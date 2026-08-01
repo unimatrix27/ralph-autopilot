@@ -142,7 +142,7 @@ export interface FixAgentRunner {
 /**
  * Thrown by a runner when an agent's final message cannot be parsed/validated as the
  * required structured output even after the bounded re-prompt budget — the review
- * loop catches it and maxes the phase out gracefully (review-maxed + heal-card)
+ * loop catches it and maxes the phase out gracefully (master triage, ADR-0042)
  * rather than crashing into `agent-stuck` with a closed PR. The class now lives with
  * the structured-session substrate it is thrown from (shared with the auto-mode
  * classifier); re-exported here so the review layer keeps its import path.

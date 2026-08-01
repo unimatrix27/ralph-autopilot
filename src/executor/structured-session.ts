@@ -25,7 +25,7 @@ import { ClaudeSessionBackend } from "../providers/claude-backend";
  * Thrown by {@link runStructuredSession} when an agent's final message cannot be
  * parsed/validated as the required structured output even after the bounded
  * re-prompt budget. A *contract* failure, not a fault: callers catch it and degrade
- * gracefully (the review loop maxes the phase out with a heal-card; the auto-mode
+ * gracefully (the review loop maxes the phase out into master triage; the auto-mode
  * pass leaves the issue unmoded) rather than letting the raw `SyntaxError` crash the
  * run. The trigger in the wild is a prose-/code-heavy task whose agent leaks markdown
  * backticks into the JSON body, producing invalid JSON (e.g. #15, the dedup-comment-
@@ -37,7 +37,7 @@ export class AgentOutputParseError extends Error {
     readonly attempts: number,
     /** The last parser/validation error message. */
     readonly lastError: string,
-    /** The tail of the final unparseable message, surfaced on the heal-card. */
+    /** The tail of the final unparseable message, surfaced as master-request evidence. */
     readonly rawTail: string,
   ) {
     super(`agent produced unparseable structured output after ${attempts} attempt(s): ${lastError}`);

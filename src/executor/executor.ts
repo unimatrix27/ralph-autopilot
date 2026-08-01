@@ -40,6 +40,7 @@ import { RunAbortRegistry } from "./run-abort-registry";
 import type { WorktreeManager } from "./worktree";
 import type { ReviewLoop, ReviewLoopContext, ReviewLoopOutcome } from "../review/review-loop";
 import { recordAgentStuck, recordFinishedWithoutPr } from "./stuck";
+import { harnessEvidence, type MasterEscalationPort } from "../master/harness-escalation";
 
 /** An issue the gate admitted, with its resolved mode. */
 export interface PickedIssue {
@@ -126,6 +127,14 @@ export interface ExecutorDeps {
    * is what the impl-only slices and most unit tests exercise.
    */
   masterTriage?: MasterTriageRequester;
+  /**
+   * The harness-origin door to the master queue (ADR-0042, the triage cutover). Wired ⇒ every
+   * issue-scoped failure this executor detects — a session that threw past its retries, a
+   * crash-orphan with no live PR, a clean session that opened none — becomes a durable master
+   * triage request instead of a terminal `agent-stuck`. Absent (legacy unit fixtures) ⇒ the
+   * pre-cutover terminals, which is why this stays optional rather than required.
+   */
+  masterEscalation?: MasterEscalationPort;
 }
 
 /** Default impl-session heartbeat cadence (issue #42); overridable per deps. */
@@ -685,21 +694,48 @@ export class Executor {
    * survive the restart (AC3).
    */
   async discardOrphan(run: Run, issue: Issue | null): Promise<void> {
-    const { store, github, worktrees } = this.deps;
+    const { store, github } = this.deps;
     const log = this.deps.logger.child({ issue: run.issueNumber, branch: run.branch ?? "" });
 
     if (issue && issue.state === "OPEN") {
-      // A swept orphan can already carry `daemon-anomaly` (the completeness pass flagged
-      // it a running-row-not-in-flight island before this terminalized it). Seed
-      // `agent-stuck` inline rather than relocating it to the reconciler diff (issue #82):
-      // the diff yields the state label to a standing `daemon-anomaly` (the #28 claim-park
-      // keeps it as the sole surface), so it would NOT introduce `agent-stuck` here — the
-      // label would never appear and `daemon-anomaly` would never clear. The inline seed is
-      // exactly the signal that distinguishes a swept orphan (→ `agent-stuck`, clears the
-      // stale anomaly) from a claim-park (→ `daemon-anomaly` stays). The diff maintains the
-      // label from the projection thereafter.
+      // The triage cutover (ADR-0042): a session/container that wedged and survived the
+      // bounded mechanical cleanup is an issue-scoped fault a master can usually diagnose —
+      // it holds a branch, a run and a transcript. So it enqueues master triage instead of
+      // being terminalized to `agent-stuck` and left for an operator. The `RunStuck` fact is
+      // preserved in the same commit, so the wedge stays readable in history.
+      const escalated = await this.deps.masterEscalation?.escalate({
+        issueNumber: run.issueNumber,
+        runId: run.id,
+        source: "run-wedged",
+        lane: "impl",
+        phase: MASTER_WORKER_PHASE,
+        branch: run.branch,
+        prNumber: run.prNumber,
+        issue,
+        sourceFacts: [{ kind: "run-stuck", reason: "orphaned run with no live PR" }],
+        evidence: harnessEvidence({
+          headline: "An orphaned run was swept with no live pull request to re-drive",
+          detail: `orphan-discarded hadPr=${run.prNumber !== null}`,
+          attemptedFixes:
+            "The reconciler's orphan sweep re-read the branch and GitHub and found no open PR to " +
+            "re-enter the review loop with; the session that owned this run is gone.",
+          uncertainty:
+            "Whether any work survives on the branch, and whether the original session failed for a " +
+            "reason that will recur.",
+        }),
+        logger: log,
+      });
+      if (escalated) {
+        // The run parks on the master queue: no span close, no `agent-stuck` label, and the
+        // worktree teardown below still runs (the master re-attaches from the branch).
+        log.warn("orphan.to-master", { hadPr: run.prNumber !== null });
+        await this.pruneWorktree(run, log);
+        return;
+      }
+      // No master wired (legacy fixtures): seed `agent-stuck` inline rather than relocating it
+      // to the reconciler diff (issue #82) — the diff yields the state label to a standing
+      // `daemon-anomaly` (the #28 claim-park rule), so it would never introduce `agent-stuck`.
       await github.addLabel(run.issueNumber, LABEL_AGENT_STUCK);
-      // The open-issue orphan bounded out → `agent-stuck` (RunStuck), surfaced for a human.
       await store.recordRunStuck({ runId: run.id, issueNumber: run.issueNumber, reason: "" });
     }
     // The closed-issue orphan needs no status write (issue #81): the `RunEnded { closed }`
@@ -720,12 +756,74 @@ export class Executor {
     });
     log.warn("orphan.discarded", { issueState: issue?.state ?? "GONE", hadPr: run.prNumber !== null });
 
-    if (run.worktreePath) {
-      try {
-        await worktrees.remove(run.worktreePath);
-      } catch (err) {
-        log.warn("worktree.remove-failed", { error: String(err) });
+    await this.pruneWorktree(run, log);
+  }
+
+  /**
+   * Route a mid-run session failure to the master queue (ADR-0042). Returns true when the
+   * escalation landed — the caller then leaves the PR OPEN and skips every `agent-stuck`
+   * effect, because a master adjudicating a run whose PR was auto-closed is adjudicating a
+   * corpse. Returns false when no master is wired, so the legacy terminal still runs.
+   *
+   * Fully guarded: an escalation that itself throws must never mask the original error, and
+   * must never leave the run stranded on `running` — a false return falls through to the
+   * pre-cutover terminal, which is exactly the right fallback.
+   */
+  private async escalateFailureToMaster(
+    ctx: { issueNumber: number; runId: number; branch: string; log: Logger },
+    error: unknown,
+  ): Promise<boolean> {
+    const escalation = this.deps.masterEscalation;
+    if (!escalation) {
+      return false;
+    }
+    const { issueNumber, runId, branch, log } = ctx;
+    try {
+      const issue = await this.deps.github.getIssue(issueNumber);
+      if (!issue || issue.state !== "OPEN") {
+        // A closed issue has nothing left to adjudicate — fall through to the ordinary
+        // terminal, which records the span-closing fact.
+        return false;
       }
+      const prNumber = this.deps.store.getRunByIssue(issueNumber)?.prNumber ?? null;
+      await escalation.escalate({
+        issueNumber,
+        runId,
+        source: "session-failed",
+        lane: "impl",
+        phase: MASTER_WORKER_PHASE,
+        branch,
+        prNumber,
+        issue,
+        sourceFacts: [{ kind: "run-stuck", reason: "executor session failed" }],
+        evidence: harnessEvidence({
+          headline: "The issue-run session failed mid-run",
+          detail: String(error).slice(0, 400),
+          attemptedFixes:
+            "The session's own retries and the container runner's bounded re-dispatches were " +
+            "already spent; this is what surfaced after them.",
+          uncertainty:
+            "Whether the fault is in the change under construction, the workspace, or the box.",
+        }),
+        logger: log,
+      });
+      log.warn("executor.failure-to-master", { issue: issueNumber, error: String(error).slice(0, 200) });
+      return true;
+    } catch (err) {
+      log.error("executor.failure-escalation-failed", { error: String(err) });
+      return false;
+    }
+  }
+
+  /** Remove a discarded run's worktree so none survives the restart (AC3). Best-effort. */
+  private async pruneWorktree(run: Run, log: Logger): Promise<void> {
+    if (!run.worktreePath) {
+      return;
+    }
+    try {
+      await this.deps.worktrees.remove(run.worktreePath);
+    } catch (err) {
+      log.warn("worktree.remove-failed", { error: String(err) });
     }
   }
 
@@ -797,10 +895,14 @@ export class Executor {
       issueTitle: issue.title,
     });
     const anomalyReason = `claim-failed-after-${failures}-attempts`;
-    // The terminal status is event-sourced (issue #83): append the `RunStuck` fact so the
-    // run row reads back `agent-stuck` from the projection. The same commit also appends
-    // `AnomalyDetected`, because `daemon-anomaly` is the on-issue human surface.
-    await store.recordRunStuckWithAnomaly({ runId: run.id, issueNumber, reason: "", anomalyReason });
+    // Deliberately NOT `agent-stuck` (ADR-0042): that terminal is now reachable only through a
+    // completed master adjudication, and a claim park never started a run for a master to
+    // adjudicate — the daemon could not even mutate the issue's labels, which is an
+    // operator-owned GitHub-access condition the master (which needs the same access) cannot
+    // repair. So the span closes effect-neutrally (`closed`, issue #81 — terminal and
+    // re-admittable, no daemon state label) and `daemon-anomaly` remains the sole on-issue
+    // human surface, naming the operator action required.
+    await store.recordClaimParked({ runId: run.id, issueNumber, anomalyReason });
     store.appendLog({
       runId: run.id,
       issueNumber,
@@ -973,7 +1075,32 @@ export class Executor {
       // the terminal is immediate and readable on the issue, rather than leaving the
       // row `running` for the generic next-tick orphan sweep to bare-label as a crash.
       log.warn("agent.no-pr", { ok: result.ok });
-      await recordFinishedWithoutPr(store, github, { issueNumber: issue.number, runId });
+      // The triage cutover (ADR-0042): a clean session that produced nothing is a fault worth
+      // diagnosing (usually a backgrounded build the single-shot session never waited for),
+      // not a terminal. It enqueues master triage; `RunStuck` rides along as history.
+      const escalatedNoPr = await this.deps.masterEscalation?.escalate({
+        issueNumber: issue.number,
+        runId,
+        source: "session-failed",
+        lane: resume ? "resume" : "impl",
+        phase: MASTER_WORKER_PHASE,
+        branch,
+        issue,
+        sourceFacts: [{ kind: "run-stuck", reason: "session finished without opening a PR" }],
+        evidence: harnessEvidence({
+          headline: "The implementation session ended cleanly but opened no pull request",
+          detail: "session-finished-without-pr",
+          attemptedFixes:
+            "The session reported no escalate, no self-stop and no error, yet no PR exists on its " +
+            "branch. The dominant cause is a long build/test launched in the background that the " +
+            "single-shot session never waited for, so nothing was committed or pushed.",
+          uncertainty: "Whether any work survives on the branch, and what the session actually did.",
+        }),
+        logger: log,
+      });
+      if (!escalatedNoPr) {
+        await recordFinishedWithoutPr(store, github, { issueNumber: issue.number, runId });
+      }
       return { runId, branch, worktreePath, prNumber: null };
     }
 
@@ -1048,8 +1175,9 @@ export class Executor {
     ctx: { issue: Issue; runId: number; prNumber: number; log: Logger },
   ): Promise<void> {
     const { issue, runId, prNumber, log } = ctx;
-    // Only the two park outcomes carry a durable hand-off; `review-maxed` /
-    // `escalated` (and `merged`) already set their terminal state in the loop.
+    // Only the two park outcomes carry a durable hand-off; `master-triage` (the exhaustion
+    // terminal after the ADR-0042 cutover) / `escalated` (and `merged`) already set their
+    // terminal state in the loop.
     if (kind !== "awaiting-ci" && kind !== "awaiting-merge") {
       return;
     }
@@ -1281,10 +1409,20 @@ export class Executor {
     const { store, github } = this.deps;
     const { issueNumber, runId, branch, log } = ctx;
 
-    // The one non-negotiable: get the run off `running`. A terminal `agent-stuck`
-    // row no longer holds the issue — re-labelling `ready-for-agent` re-admits it.
-    // The status fact is `RunStuck` (issue #81); awaited so its append settles before the
-    // read-back below, guarded so a transient append fault cannot mask the original error.
+    // The triage cutover (ADR-0042): an issue-run session that threw past its deterministic
+    // retries is a *diagnosable issue-scoped fault*, not a verdict that the work is
+    // impossible — so it enqueues a master triage request rather than terminalizing to
+    // `agent-stuck` and closing the PR. Only a completed master adjudication may reach that
+    // terminal now. The `RunStuck` fact is still appended (in the same commit as the request)
+    // so the failure stays readable as history; the projected status is `master-triage`.
+    if (await this.escalateFailureToMaster(ctx, error)) {
+      return;
+    }
+
+    // No master wired (legacy fixtures): the one non-negotiable is still to get the run off
+    // `running`. The status fact is `RunStuck` (issue #81); awaited so its append settles
+    // before the read-back below, guarded so a transient append fault cannot mask the
+    // original error.
     try {
       await store.recordRunStuck({ runId, issueNumber, reason: "" });
     } catch (err) {

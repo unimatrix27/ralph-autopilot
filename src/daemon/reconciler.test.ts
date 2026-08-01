@@ -518,7 +518,9 @@ describe("Reconciler", () => {
     expect(claimCalls).toBe(2);
     expect(github.issues.get(4)!.labels).toContain(LABEL_DAEMON_ANOMALY);
     expect(github.issues.get(4)!.labels).not.toContain(LABEL_READY);
-    expect(store.getRunByIssue(4)!.status).toBe("agent-stuck");
+    // NOT `agent-stuck` (ADR-0042): that terminal is master-only now. A claim park closes its
+    // span effect-neutrally and leaves `daemon-anomaly` as the sole operator-owned surface.
+    expect(store.getRunByIssue(4)!.status).toBe("closed");
     const anomaly = store
       .tailLog(store.getRunByIssue(4)!.id)
       .find((e) => e.event === "daemon-anomaly");

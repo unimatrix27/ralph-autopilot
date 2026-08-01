@@ -3,6 +3,7 @@ import {
   NEEDS_YOU_STATES,
   type ActivityItem,
   type FleetAgent,
+  type MasterTriageItem,
   type NeedsYouItem,
   type NeedsYouState,
   type PipelineFunnel,
@@ -55,6 +56,7 @@ export function OverviewPage() {
             Showing <span className="text-foreground">{scope}</span>.
           </p>
           <NeedsYouBand items={data.needsYou} now={now} reconcileIntervalSeconds={data.reconcileIntervalSeconds} catalog={data.powerActions} />
+          <MasterTriageBand items={data.masterTriage} now={now} />
           <div className="grid gap-6 lg:grid-cols-2">
             <FleetSummary agents={data.fleet} now={now} />
             <PipelineFunnelCard funnel={data.funnel} />
@@ -63,6 +65,59 @@ export function OverviewPage() {
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Autonomous adjudication in progress (ADR-0042). Deliberately its own band, styled as
+ * information rather than alarm: a queued or running master triage means the daemon is working
+ * on a failure it used to page a human for, so showing it in "Needs you" would re-create exactly
+ * the false alarm the triage cutover removes. What an operator wants here is only "is it moving,
+ * and how much budget is left" — the source, the attempt against its ceiling, the model, and the
+ * master's own latest conclusion.
+ */
+function MasterTriageBand({ items, now }: { items: MasterTriageItem[]; now: number }) {
+  if (items.length === 0) {
+    return null;
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          Master triage
+          <Badge variant="running">{items.length}</Badge>
+        </CardTitle>
+        <CardDescription>
+          A highest-tier master is adjudicating these autonomously. No action is needed — it resolves them, or asks
+          you one specific question if it cannot.
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ul className="space-y-3">
+          {items.map((item) => (
+            <li key={`${item.repo}#${item.issue}`} className="rounded-md border p-3 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <RepoIssue repo={item.repo} issue={item.issue} />
+                <Badge variant={item.running ? "running" : "waiting"}>{item.running ? "adjudicating" : "queued"}</Badge>
+                {item.source && <Badge variant="outline">{item.source}</Badge>}
+                <span className="text-xs text-muted-foreground">
+                  attempt {item.attempt}/{item.budget}
+                  {item.phase ? ` · ${item.phase}` : ""}
+                  {item.model ? ` · ${item.model}` : ""}
+                </span>
+                {item.since && (
+                  <span className="ml-auto text-xs text-muted-foreground">{formatWaited(item.since, now)}</span>
+                )}
+              </div>
+              <p className="mt-1 text-muted-foreground">{item.summary}</p>
+              {item.latestConclusion && (
+                <p className="mt-1 text-xs text-muted-foreground">Latest: {item.latestConclusion}</p>
+              )}
+            </li>
+          ))}
+        </ul>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -84,7 +139,10 @@ function NeedsYouBand({
           Needs you
           {items.length > 0 && <Badge variant="attention">{items.length}</Badge>}
         </CardTitle>
-        <CardDescription>Escalations, review-maxed, stuck agents, and anomalies — triage-ordered by urgency.</CardDescription>
+        <CardDescription>
+          Questions the master asked you, terminal stuck runs, and operator-owned anomalies — triage-ordered by
+          urgency. Master triage is <em>not</em> here: the daemon is working on those itself.
+        </CardDescription>
       </CardHeader>
       <CardContent>
         {items.length === 0 ? (

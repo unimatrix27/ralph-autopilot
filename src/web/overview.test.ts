@@ -11,6 +11,7 @@ function emptySnapshot(): RuntimeSnapshot {
     runningAgents: [],
     backlog: { eligible: [], blocked: [], paused: [], manualHolds: [], modingCandidates: [], noProvider: [] },
     awaitingAnswer: [],
+    masterTriage: [],
     reviewMaxed: [],
     agentStuck: [],
     awaitingCi: [],
@@ -272,5 +273,77 @@ describe("activitySummary", () => {
     expect(activitySummary("daemon-anomaly", { reason: "x" })).toBe("Anomaly: x");
     expect(activitySummary("orphan-worktree-pruned", null)).toBe("Orphan worktree pruned");
     expect(activitySummary("some-future-event", null)).toBe("some-future-event");
+  });
+});
+
+/**
+ * The master-triage band on the overview API (ADR-0042): visible, ordered oldest-first, and
+ * deliberately NOT in "Needs you" — the daemon is working on these.
+ */
+describe("snapshotToOverview — master triage (ADR-0042)", () => {
+  const triage = (over: Record<string, unknown> = {}) => ({
+    repo: "owner/a",
+    issueNumber: 31,
+    headline: "Merge gated by the hosted review",
+    since: "2026-06-20T23:00:00.000Z",
+    source: "hosted-review" as const,
+    lane: "merge" as const,
+    phase: "merge",
+    attempt: 1,
+    budget: 2,
+    running: true,
+    route: { provider: "claude" as const, model: "claude-fable-5", account: "c1" },
+    latestConclusion: null,
+    ...over,
+  });
+
+  it("surfaces source, attempt/budget, model and conclusion — and never the account id", () => {
+    const view = snapshotToOverview({ ...emptySnapshot(), masterTriage: [triage()] }, {});
+    expect(view.masterTriage).toEqual([
+      {
+        repo: "owner/a",
+        issue: 31,
+        since: "2026-06-20T23:00:00.000Z",
+        source: "hosted-review",
+        phase: "merge",
+        attempt: 1,
+        budget: 2,
+        running: true,
+        model: "claude-fable-5",
+        latestConclusion: null,
+        summary: "Merge gated by the hosted review",
+      },
+    ]);
+    // The account id is a server-side identity; it must not cross the wire here.
+    expect(JSON.stringify(view.masterTriage)).not.toContain("c1");
+  });
+
+  it("keeps master triage OUT of the Needs-you band", () => {
+    const view = snapshotToOverview({ ...emptySnapshot(), masterTriage: [triage()] }, {});
+    expect(view.needsYou).toEqual([]);
+  });
+
+  it("orders oldest park first, and falls back to an honest summary", () => {
+    const view = snapshotToOverview(
+      {
+        ...emptySnapshot(),
+        masterTriage: [
+          triage({ issueNumber: 2, since: "2026-06-21T00:00:00.000Z", headline: "", running: false }),
+          triage({ issueNumber: 1, since: "2026-06-20T00:00:00.000Z", headline: "" }),
+        ],
+      },
+      {},
+    );
+    expect(view.masterTriage.map((m) => m.issue)).toEqual([1, 2]);
+    expect(view.masterTriage[0]!.summary).toBe("Master adjudicating");
+    expect(view.masterTriage[1]!.summary).toBe("Queued for master adjudication");
+  });
+
+  it("narrows by repo like every other section", () => {
+    const view = snapshotToOverview(
+      { ...emptySnapshot(), masterTriage: [triage(), triage({ repo: "owner/b", issueNumber: 44 })] },
+      { repo: "owner/a" },
+    );
+    expect(view.masterTriage.map((m) => m.issue)).toEqual([31]);
   });
 });

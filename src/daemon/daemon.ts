@@ -38,6 +38,8 @@ import type { RouteWorld, RoutingSource } from "../providers/resolve";
 import { EscalationCheckpointer } from "../hitl/escalation-checkpoint";
 import { MasterTriageRequester } from "../master/request";
 import { MasterEngine } from "../master/engine";
+import { HarnessMasterEscalation } from "../master/harness-escalation";
+import { HostedReviewGate } from "../review/hosted-gate";
 import { MasterLease } from "../master/lease";
 import { ContainerMasterAgentRunner } from "../master/container-master-runner";
 import { createExecutorMasterPipeline } from "../master/pipeline";
@@ -541,6 +543,15 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
       escalationMode: "master",
       capabilities,
     });
+    // The triage cutover (ADR-0042). ONE escalation door shared by the review loop, the
+    // executor and the reconciler, so every issue-scoped failure source enqueues master triage
+    // through the same idempotent, evidence-preserving path — and none of them can invent a
+    // human-attention state of its own.
+    const masterEscalation = new HarnessMasterEscalation({ store: scopedStore, github, logger });
+    // The GitHub-hosted review gate (issue #43): a first-class integration gate distinct from
+    // CI and from Ralph's own reviews. Wired here so the merge path types a `BLOCKED` before it
+    // spends any CI polling budget on it.
+    const hostedGate = new HostedReviewGate({ github, store: scopedStore, logger });
     const reviewLoop = new ReviewLoop({
       store: scopedStore,
       github,
@@ -559,6 +570,8 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
       worktrees,
       baseBranch,
       merge: target.merge,
+      masterEscalation,
+      hostedGate,
     });
     // Master escalation (ADR-0041). Wiring the requester CHANGES what a worker `escalate` and
     // `stuck` mean for this target: both become internal escalations to the master rather than a
@@ -576,6 +589,7 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
       reviewLoop,
       escalation,
       masterTriage,
+      masterEscalation,
       heartbeatMs: target.agent.heartbeatSeconds * 1000,
       // On a graceful drain, a Codex session killed by the terminal SIGINT (its CLI
       // shares the daemon's process group, ADR-0033) must be left resumable, not
@@ -627,6 +641,7 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
         // waits as `no-provider` (kept `ready-for-agent`), re-resolved automatically next tick.
         routing,
         routeWorld,
+        masterEscalation,
         // Master escalation (ADR-0041): the queue is serviced before fresh admission, on the
         // ordinary cap, under the ONE process-wide lease every reconciler shares (so masters
         // are globally serialized and can never race the decision ledger).

@@ -8,7 +8,8 @@
  * label (`awaiting-answer`, `review-maxed`, or `agent-stuck`) back to
  * `ready-for-agent`. The daemon sees the swap next tick and either resumes the paused
  * agent (`awaiting-answer` / `review-maxed`) or re-admits a fresh run with the
- * guidance injected (`agent-stuck`, #86). `review-maxed` heal-cards and `agent-stuck`
+ * guidance injected (`agent-stuck`, #86). Pre-cutover `review-maxed` heal-cards (retired by
+ * ADR-0042, but still answerable while one is mid-flight) and `agent-stuck`
  * stuck-cards flow through this exact path — same queue, same one-at-a-time loop.
  */
 

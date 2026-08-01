@@ -100,6 +100,37 @@ export type AnomalyReason =
   | "unclassified";
 
 /**
+ * The anomaly reasons that are **operator-owned** and therefore must NOT enqueue a master
+ * triage request (issue #43). Two members, for two different reasons:
+ *
+ *  - `master-route-unconfigured` — the master path *itself* is broken. Enqueuing a master to
+ *    fix the master is a deadlock dressed as a recovery, and it would hide a config defect
+ *    behind a queue that never drains.
+ *  - `unclassified` — the daemon does not understand this state at all. Without a
+ *    classification there is no scope to hand a master and no evidence to hand it *with*;
+ *    "fail visible" is the whole point of the reason existing.
+ *
+ * Everything else here is an issue-scoped fault with a concrete run and branch behind it, so
+ * it goes to the master (ADR-0042). Host-wide and supervisor/self-update anomalies never reach
+ * this classifier at all — they have no issue scope and live in the anomaly log/journal.
+ */
+export const OPERATOR_OWNED_ANOMALIES: readonly AnomalyReason[] = [
+  "master-route-unconfigured",
+  "unclassified",
+];
+
+/**
+ * Whether an anomaly is issue-scoped enough to hand to a master (ADR-0042). Pure and total,
+ * so the issue-vs-host boundary is one testable predicate rather than a condition repeated at
+ * every call site. `hasContext` is the caller's answer to "is there an issue AND a run row to
+ * scope the adjudication to" — without both there is nothing for a master to work on, so even
+ * an issue-scoped reason stays operator-owned.
+ */
+export function anomalyEnqueuesMaster(reason: AnomalyReason, hasContext: boolean): boolean {
+  return hasContext && !OPERATOR_OWNED_ANOMALIES.includes(reason);
+}
+
+/**
  * The verdict for one issue/run: a legitimate {@link IssueClass}, or an anomaly to
  * surface. The non-anomaly arm derives from `IssueClass` so the class vocabulary is
  * spelled exactly once — adding a fifth class is a single edit the compiler enforces.

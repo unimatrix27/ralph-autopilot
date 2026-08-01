@@ -95,6 +95,13 @@ export interface MasterPipelinePort {
     resolution: Extract<MasterResolution, "resolved-and-continue" | "redispatch-tier-1">;
     brief: string;
     conclusion: string;
+    /**
+     * The run-phase key the intervention was counted against (`impl`, `review-1`, …). The
+     * executor-backed port turns a `review-N` key back into the review phase so the hand-back
+     * re-enters exactly the phase that was interrupted (ADR-0042); any other key resumes the
+     * implementation session, exactly as before.
+     */
+    phase: string;
   }): Promise<void>;
   /**
    * Re-run ONE typed harness gate. Re-running a gate is never bypassing it: the CI gate runs
@@ -490,6 +497,7 @@ export class MasterEngine {
           resolution: "resolved-and-continue",
           brief: outcome.guidance,
           conclusion: outcome.conclusion,
+          phase,
         });
         return;
       case "redispatch-tier-1":
@@ -500,6 +508,7 @@ export class MasterEngine {
           resolution: "redispatch-tier-1",
           brief: outcome.brief,
           conclusion: outcome.conclusion,
+          phase,
         });
         return;
       case "retry-pipeline":

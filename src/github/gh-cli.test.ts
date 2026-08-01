@@ -216,7 +216,11 @@ describe("GhCliClient.readMergeStatus (merge-race gate, #25)", () => {
     };
     const client = new GhCliClient("owner/repo", { logger: new Logger({ write: () => {} }), exec });
 
-    expect(await client.readMergeStatus(42)).toEqual({ state: "BLOCKED" });
+    expect(await client.readMergeStatus(42)).toEqual({
+      state: "BLOCKED",
+      reviewDecision: null,
+      headSha: null,
+    });
     expect(argv[0]).toEqual([
       "pr",
       "view",
@@ -224,7 +228,9 @@ describe("GhCliClient.readMergeStatus (merge-race gate, #25)", () => {
       "--repo",
       "owner/repo",
       "--json",
-      "mergeStateStatus",
+      // `reviewDecision` + `headRefOid` ride along on the same read (issue #43): they turn
+      // an opaque BLOCKED into a typed cause and anchor the hosted-review observation.
+      "mergeStateStatus,reviewDecision,headRefOid",
     ]);
   });
 });

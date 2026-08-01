@@ -6,6 +6,13 @@ import type { AgentRunContext, AgentRunner, AgentRunResult } from "../executor/a
 import { EscalationCheckpointer } from "../hitl/escalation-checkpoint";
 import { RalphAnswerService } from "../hitl/ralph-answer";
 import { LABEL_AWAITING_ANSWER, LABEL_READY, LABEL_REVIEW_MAXED } from "../hitl/labels";
+import { LABEL_COMPLEXITY_1, LABEL_MASTER_TRIAGE } from "../core/labels";
+import { HarnessMasterEscalation } from "../master/harness-escalation";
+import { MasterEngine } from "../master/engine";
+import { MasterLease } from "../master/lease";
+import { createExecutorMasterPipeline } from "../master/pipeline";
+import { FakeMasterAgent } from "../testing/fake-master-agent";
+import type { AgentSettings } from "../config/schema";
 import { scanPausedRuns } from "../hitl/resume";
 import { LABEL_DAEMON_ANOMALY } from "./completeness";
 import { FakeGitHub } from "../testing/fake-github";
@@ -160,22 +167,43 @@ const mergeConfig: MergeConfig = {
 };
 
 const blocked: Worklist = { items: [{ severity: "P0", title: "correctness bug on the retry path" }] };
+
+/** The binding tier-1 profile (ADR-0041 §8): `complexity:1` → claude / claude-fable-5. */
+function tierOneAgentSettings(): AgentSettings {
+  return {
+    wallClockSeconds: 3600,
+    heartbeatSeconds: 30,
+    model: "opus",
+    effort: "xhigh",
+    mcpServers: [],
+    mcpServerDefs: {},
+    settingSources: ["project"],
+    provider: "claude",
+    types: {},
+    tiers: { "1": { routes: [{ provider: "claude", model: "claude-fable-5" }] } },
+  };
+}
 const clean: Worklist = { items: [{ severity: "nit", title: "tidy a local" }] };
 
 /**
- * Issue #9: a `review-maxed` heal must re-enter the BUILD-flow review (`runReview`)
- * at the stored phase with the operator's guidance injected — NOT re-run the impl
- * prompt (which would discard the review tail) and NOT silently wedge (the heal-card
- * stores enough resume context that `findResumableRuns` returns the run once
- * answered). It hands back off to `awaiting-merge`; the integration flow lands it.
+ * The triage cutover (ADR-0042, issue #43): a review phase that exhausts its fix attempts no
+ * longer posts a heal-card or parks on `review-maxed`. It enqueues a **master triage request**;
+ * a fresh tier-1 master adjudicates; its `resolved-and-continue` re-enters the BUILD-flow review
+ * (`runReview`) at the *exact* stored phase with the master's brief injected where the operator's
+ * answer used to go — NOT the impl prompt (which would discard the review tail), and never a
+ * human question.
+ *
+ * This is the end-to-end replacement for issue #9's `review-maxed` heal loop: the resume-not-restart
+ * mechanism is unchanged, but the decider is the master rather than an operator.
  */
-describe("review-maxed heal → ralph-answer → resume re-enters the review loop (issue #9)", () => {
+describe("review exhaustion → master triage → repair-and-resume the exact phase (ADR-0042)", () => {
   let store: Store;
   let github: FakeGitHub;
   let worktrees: FakeWorktreeManager;
   let impl: PrOpeningAgentRunner;
   let reviewAgent: ScriptedReviewAgent;
   let fixAgent: ScriptedFixAgent;
+  let masterAgent: FakeMasterAgent;
   let reconciler: Reconciler;
 
   beforeEach(() => {
@@ -184,7 +212,7 @@ describe("review-maxed heal → ralph-answer → resume re-enters the review loo
     worktrees = new FakeWorktreeManager();
     impl = new PrOpeningAgentRunner(github);
     // Phase 1 blocks long enough to max out (3 reviews at maxFixAttempts=2), then
-    // once more on resume (one guided fix), then clean so the heal lands a merge.
+    // once more on the master-driven resume (one guided fix), then clean so it merges.
     reviewAgent = new ScriptedReviewAgent([blocked, blocked, blocked, blocked, clean, clean]);
     fixAgent = new ScriptedFixAgent();
     const reviewLoop = new ReviewLoop({
@@ -197,8 +225,31 @@ describe("review-maxed heal → ralph-answer → resume re-enters the review loo
       worktrees,
       baseBranch: "main",
       merge: mergeConfig,
+      masterEscalation: new HarnessMasterEscalation({ store, github, logger: silent }),
     });
     const executor = new Executor({ store, github, worktrees, agentRunner: impl, logger: silent, reviewLoop });
+    masterAgent = new FakeMasterAgent([
+      {
+        outcome: {
+          resolution: "resolved-and-continue",
+          conclusion: "The review rubric is right: the retry path really does double-fire on a 429.",
+          rationale: "The fix is local and behaviour-preserving; the phase can finish with it stated.",
+          guidance: "Guard the retry on the idempotency key before re-dispatching.",
+        },
+        decisions: [],
+      },
+    ]);
+    const masterEngine = new MasterEngine({
+      store,
+      github,
+      agent: masterAgent,
+      pipeline: createExecutorMasterPipeline({ executor, github, logger: silent }),
+      logger: silent,
+      targetRepo: "owner/repo",
+      baseBranch: "main",
+      routing: () => ({ agent: tierOneAgentSettings(), providers: {} }),
+      routeWorld: { acquireAccount: () => ({ id: "claude-a", provider: "claude", configDir: "~/.claude" }) },
+    });
     reconciler = new Reconciler({
       store,
       github,
@@ -208,70 +259,64 @@ describe("review-maxed heal → ralph-answer → resume re-enters the review loo
       budget: budgetFor(() => reconciler.activeCount(), 2), cap: 2,
       priorityLabels: [],
       targetRepo: "owner/repo",
+      masterEngine,
+      masterLease: new MasterLease(),
     });
   });
   afterEach(() => store.close());
 
-  it("resumes the review loop (correct phase + guidance) ending at awaiting-merge, not the impl prompt, then lands the merge", async () => {
+  it("queues master triage instead of a heal-card, then resumes phase 1 with the master's brief and merges", async () => {
     github.seed({ number: 11, title: "Heal me" });
 
-    // Tick 1: impl opens the PR; the review loop parks the pre-review CI wait
-    // off-slot (ADR-0022 stage 1) before any review runs.
+    // Tick 1: impl opens the PR; the review loop parks the pre-review CI wait off-slot.
     await reconciler.tick();
     await reconciler.awaitInFlight();
     expect(store.getRunByIssue(11)!.status).toBe("awaiting-ci");
 
-    // Tick 2: the CI poller reads CI (none → terminal) and re-admits into review,
-    // which maxes out phase 1 → review-maxed + heal-card.
+    // Tick 2: the CI poller re-admits into review; phase 1 exhausts its fix attempts →
+    // master triage, NOT `review-maxed` and NOT a heal-card.
     await reconciler.tick();
     await reconciler.awaitInFlight();
-    expect(store.getRunByIssue(11)!.status).toBe("review-maxed");
+    expect(store.getRunByIssue(11)!.status).toBe("master-triage");
+    expect(store.listOpenQuestions()).toHaveLength(0);
+    // The `ReviewMaxed` fact still exists as history, ahead of the request.
+    const stream = store.readIssueStream(11).map((e) => e.type);
+    expect(stream).toContain("ReviewMaxed");
+    expect(stream.indexOf("ReviewMaxed")).toBeLessThan(stream.indexOf("MasterTriageRequested"));
 
-    // Tick 3 (effect): the `review-maxed` label is a level-triggered effect of the
-    // review-maxed status (issue #82, ADR-0027) — the maxout set the status in its
-    // session; the next tick's desired-vs-actual diff applies the label (the accepted
-    // ≤1-tick latency) so ralph-answer can queue it.
-    await reconciler.tick();
-    await reconciler.awaitInFlight();
-    expect(github.issues.get(11)!.labels).toContain(LABEL_REVIEW_MAXED);
-    expect(store.listOpenQuestions().some((q) => q.kind === "heal-card")).toBe(true);
     const implRunsAfterMaxout = impl.runs.length; // exactly one impl pass
-    const reviewCallsAfterMaxout = reviewAgent.calls.length; // phase-1 maxout reviews
-
-    // The heal-card carries the maxed-out phase so the resume re-enters review there.
+    const reviewCallsAfterMaxout = reviewAgent.calls.length;
+    // The exhausted phase is preserved so the master's hand-back re-enters it exactly.
     expect(store.getResumeContext(store.getRunByIssue(11)!.id)!.context.phase).toBe(1);
 
-    // Operator answers the heal-card via the GitHub-only CLI: review-maxed → ready.
-    const answerService = new RalphAnswerService(github);
-    await answerService.serveOne(async () => "1"); // "Provide guidance and re-enable the run (heal)"
-    expect(github.issues.get(11)!.labels).toContain(LABEL_READY);
-
-    // Tick 3: the run is NOT wedged — it resumes into the review loop and ends at
-    // awaiting-merge. A heal carries operator guidance, so it runs the gate inline
-    // (no second CI park) and goes straight through review.
+    // Tick 3 (effect): the daemon-owned `master-triage` label lands, `review-maxed` never does,
+    // and the issue was permanently promoted to complexity:1.
     await reconciler.tick();
     await reconciler.awaitInFlight();
+    expect(github.issues.get(11)!.labels).toContain(LABEL_MASTER_TRIAGE);
+    expect(github.issues.get(11)!.labels).not.toContain(LABEL_REVIEW_MAXED);
+    expect(github.issues.get(11)!.labels).toContain(LABEL_COMPLEXITY_1);
 
-    // The impl agent was NOT re-run: a heal is a review re-entry, not a fresh impl pass.
+    // …and that same tick serviced the master queue: one fresh tier-1 session ran and its
+    // `resolved-and-continue` re-entered phase 1 with the brief injected.
+    expect(masterAgent.sessions).toHaveLength(1);
+    expect(masterAgent.sessions[0]!.route?.model).toBe("claude-fable-5");
+
+    // The impl agent was NOT re-run: a master hand-back is a review re-entry.
     expect(impl.runs.length).toBe(implRunsAfterMaxout);
-    // The review loop re-ran (more review passes happened on resume).
     expect(reviewAgent.calls.length).toBeGreaterThan(reviewCallsAfterMaxout);
     // Re-attached the WIP branch — resume, not restart (no second worktree create).
     expect(worktrees.attached.map((a) => a.branch)).toContain("ralph/11-heal-me");
     expect(worktrees.created.filter((c) => c.branch === "ralph/11-heal-me")).toHaveLength(1);
-    // The fix agent during the RESUMED phase 1 received the operator's guidance.
+    // The fix agent on the RESUMED phase 1 received the MASTER's brief as guidance.
     const guidedFix = fixAgent.calls.find((c) => c.guidance);
     expect(guidedFix).toBeDefined();
     expect(guidedFix!.phase).toBe(1);
-    expect(guidedFix!.guidance).toContain("Provide guidance and re-enable the run");
-    // The build flow handed off — awaiting-merge, NOT merged in one shot (ADR-0017).
-    // The merge worker leases by status (not the label), and the `awaiting-merge` label
-    // is a level-triggered reconciler effect of that status (issue #82, ADR-0027) applied
-    // by the per-tick diff (exercised by the #82 reconciler tests).
+    expect(guidedFix!.guidance).toContain("Guard the retry on the idempotency key");
+    // The build flow handed off — awaiting-merge, no human ever asked.
     expect(store.getRunByIssue(11)!.status).toBe("awaiting-merge");
-    expect(github.merges).toHaveLength(0);
-    // The open heal-card question was marked answered (not left wedged).
     expect(store.listOpenQuestions()).toHaveLength(0);
+    expect(github.merges).toHaveLength(0);
 
     // Tick 4: the single-concurrency merge worker integrates the awaiting-merge run.
     await reconciler.tick();

@@ -78,14 +78,18 @@ import { rehydrateRunsFromGitHub } from "./rehydrate";
 import { projectBacklog } from "./backlog";
 import { parseBlockedBy } from "../github/blocked";
 import {
+  anomalyEnqueuesMaster,
   classifyIssueState,
   isNonTerminalStatus,
   isSpanClosed,
   LABEL_DAEMON_ANOMALY,
   LABEL_DAEMON_ANOMALY_CREATE,
+  type AnomalyReason,
   type Classification,
   type IssueSnapshot,
 } from "./completeness";
+import { harnessEvidence, type MasterEscalationPort } from "../master/harness-escalation";
+import { ADOPTED_LABELS, hasMasterAdjudication, planAdoption } from "../master/adoption";
 
 /**
  * Human-attention labels other than `daemon-anomaly` — the paused/terminal labels
@@ -356,6 +360,12 @@ export interface ReconcilerDeps {
    * degraded mode, it is a different design).
    */
   masterLease?: MasterLease;
+  /**
+   * The harness-origin door to the master queue (ADR-0042). Wired ⇒ issue-level anomalies with
+   * a run behind them, and pre-cutover `review-maxed` / non-master `agent-stuck` states adopted
+   * at startup, become durable master triage requests instead of operator-facing labels.
+   */
+  masterEscalation?: MasterEscalationPort;
   /** Usage-limit guard settings; when `enabled`, the meter gates new admissions. */
   usageLimit?: UsageLimitSettings;
   /**
@@ -953,6 +963,12 @@ export class Reconciler {
       await this.serviceCiPoller();
     }
 
+    // Adopt any pre-cutover `review-maxed` / non-master `agent-stuck` park BEFORE the queue is
+    // serviced (ADR-0042 migration): they were parked by a build whose servicing code no
+    // longer exists, so an unadopted one is acted on by nothing. Idempotent — a second pass
+    // over an adopted issue appends nothing.
+    await this.adoptPreCutoverStates(issues);
+
     // Master escalation outranks fresh admission (ADR-0041): a run that has already been
     // worked, checkpointed, and handed up is worth more than one not yet started. Serviced
     // BEFORE `admit` computes open slots — and awaited far enough that the slot it takes is
@@ -1529,6 +1545,15 @@ export class Reconciler {
     const hasLabel = labels.includes(LABEL_DAEMON_ANOMALY);
 
     if (classification.kind === "anomaly") {
+      // The triage cutover (ADR-0042): an issue-level anomaly with a concrete issue AND run
+      // behind it is a diagnosable fault, so it enqueues master triage instead of paging an
+      // operator. The `AnomalyDetected` fact is preserved in the same commit, so the anomaly
+      // stays readable as history and in the master's context. Attempted BEFORE the label, so
+      // a successfully-queued anomaly never flashes `daemon-anomaly` at an operator for work
+      // the daemon is about to do itself.
+      if (await this.escalateAnomalyToMaster(issueNumber, classification.reason, run)) {
+        return;
+      }
       if (hasLabel) {
         return; // already surfaced; the label persists as the standing signal.
       }
@@ -1568,6 +1593,160 @@ export class Reconciler {
         event: "daemon-anomaly-cleared",
         data: { class: classification.kind },
       });
+    }
+  }
+
+  /**
+   * Adopt every pre-cutover human-attention park into the master queue (ADR-0042 migration).
+   *
+   * Cheap by construction: it only looks at issues carrying `review-maxed` or `agent-stuck`,
+   * which after the cutover is a set that shrinks to empty and stays there. Each adoption
+   * preserves the run, the maxed-out phase and the heal/stuck-card evidence, appends ONE
+   * idempotent master request, and strips the retired label so the issue converges to exactly
+   * one daemon state label on this tick rather than over several.
+   *
+   * A partial GitHub failure is safe: the request fact is what the queue reads, so a failed
+   * label strip simply leaves the retired label for the next tick's diff to remove.
+   */
+  private async adoptPreCutoverStates(issues: readonly Issue[]): Promise<void> {
+    const escalation = this.deps.masterEscalation;
+    if (!escalation) {
+      return;
+    }
+    const candidates = issues.filter((i) =>
+      i.labels.some((l) => ADOPTED_LABELS.includes(l) || l === LABEL_AWAITING_ANSWER),
+    );
+    for (const issue of candidates) {
+      const run = this.deps.store.getRunByIssue(issue.number);
+      if (!run) {
+        continue; // no run to adopt; the completeness pass surfaces it as its own island.
+      }
+      const events = this.deps.store.readIssueStream(issue.number);
+      const history = foldMasterHistory(events);
+      const plan = planAdoption({
+        issue,
+        run,
+        healPhase: this.deps.store.getResumeContext(run.id)?.context.phase ?? null,
+        masterAdjudicated: hasMasterAdjudication(events),
+        masterQueued: history.pending !== null || history.inProgress !== null,
+        // An outstanding master question is a live question by construction; for a
+        // worker-origin pause the resume scan already told us whether it is answered.
+        unansweredQuestion: this.deps.store.listOpenQuestions().some((q) => q.issueNumber === issue.number),
+      });
+      if (!plan) {
+        continue;
+      }
+      try {
+        await escalation.escalate({
+          issueNumber: issue.number,
+          runId: run.id,
+          source: plan.source,
+          lane: plan.kind === "review-maxed" ? "review" : "impl",
+          phase: plan.phase,
+          branch: run.branch,
+          prNumber: run.prNumber,
+          issue,
+          evidence: harnessEvidence({
+            headline: plan.headline,
+            detail: plan.detail,
+            attemptedFixes:
+              "This run was parked by a pre-cutover build, which posted a heal/stuck card and waited " +
+              "for an operator. That servicing path no longer exists; the card and its evidence are " +
+              "still on the issue thread above.",
+            uncertainty:
+              "Whether the original blocker still holds — the base branch has very likely moved since.",
+          }),
+          logger: this.deps.logger,
+        });
+        await this.stripAdoptedLabels(issue);
+        this.deps.logger.warn("master.adopted-pre-cutover", { issue: issue.number, kind: plan.kind });
+      } catch (err) {
+        this.deps.logger.warn("master.adoption-failed", { issue: issue.number, error: String(err) });
+      }
+    }
+  }
+
+  /** Remove the retired pre-cutover labels from an adopted issue. Best-effort, idempotent. */
+  private async stripAdoptedLabels(issue: Issue): Promise<void> {
+    for (const label of ADOPTED_LABELS) {
+      if (!issue.labels.includes(label)) {
+        continue;
+      }
+      try {
+        await this.deps.github.removeLabel(issue.number, label);
+      } catch (err) {
+        this.deps.logger.warn("master.adoption-label-strip-failed", {
+          issue: issue.number,
+          label,
+          error: String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * Enqueue master triage for an issue-level anomaly (ADR-0042). Returns true when the
+   * request landed (or was already queued), so the caller skips the operator-facing label.
+   *
+   * Three conditions keep an anomaly operator-owned instead:
+   *  - the master escalation door is not wired at all (legacy fixtures, drain);
+   *  - the reason is one of {@link OPERATOR_OWNED_ANOMALIES} — a broken master route cannot
+   *    be repaired by the master, and an unclassifiable state has no scope to hand it;
+   *  - there is no run row, so there is no branch, no PR and no transcript to adjudicate.
+   *
+   * Host-wide and supervisor/self-update anomalies never reach here: they are not issue-scoped
+   * and are surfaced through the anomaly log/journal, which no master may touch.
+   */
+  private async escalateAnomalyToMaster(
+    issueNumber: number,
+    reason: AnomalyReason,
+    run: Run | null,
+  ): Promise<boolean> {
+    const escalation = this.deps.masterEscalation;
+    if (!escalation || !run || !anomalyEnqueuesMaster(reason, true)) {
+      return false;
+    }
+    // A run already parked on the master queue (or being adjudicated) must not be re-queued by
+    // the anomaly pass — the escalation door dedupes by (phase, signature), and this second
+    // guard keeps the common case free of a GitHub read.
+    if (run.status === "master-triage") {
+      return false;
+    }
+    try {
+      const issue = await this.deps.github.getIssue(issueNumber);
+      if (!issue || issue.state !== "OPEN") {
+        return false;
+      }
+      const result = await escalation.escalate({
+        issueNumber,
+        runId: run.id,
+        source: "anomaly",
+        lane: "reconcile",
+        phase: "reconcile",
+        branch: run.branch,
+        prNumber: run.prNumber,
+        issue,
+        sourceFacts: [{ kind: "anomaly", reason }],
+        evidence: harnessEvidence({
+          headline: `The reconciler classified this run as an island: ${reason}`,
+          detail: `reconciler-anomaly: ${reason}`,
+          attemptedFixes:
+            "The completeness pass ran its ordinary reconciliation (orphan sweep, resume re-arm, " +
+            `label repair) and the state still classifies as \`${reason}\` with run status ` +
+            `\`${run.status}\`.`,
+          uncertainty:
+            "Whether the run can be re-driven from what is actually on GitHub, or whether the " +
+            "state is genuinely unrecoverable.",
+        }),
+        logger: this.deps.logger,
+      });
+      this.deps.logger.warn("daemon.anomaly-to-master", { issue: issueNumber, reason, result: result.kind });
+      return true;
+    } catch (err) {
+      // A failed escalation must never swallow the anomaly: fall through to the label so the
+      // island stays visible, and the next tick retries the escalation.
+      this.deps.logger.warn("daemon.anomaly-escalation-failed", { issue: issueNumber, error: String(err) });
+      return false;
     }
   }
 

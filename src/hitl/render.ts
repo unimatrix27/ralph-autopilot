@@ -11,7 +11,9 @@ import type { OpenQuestionItem } from "./queue";
 /** The operator-facing tag for each answerable label — what the question is. */
 const LABEL_TAG: Record<OpenQuestionItem["label"], string> = {
   [LABEL_AWAITING_ANSWER]: "escalation",
-  [LABEL_REVIEW_MAXED]: "review-maxed / heal-card",
+  // Pre-cutover only (ADR-0042): no path applies this label any more; the reconciler adopts
+  // any survivor into `master-triage`. Rendered so a legacy park is still readable.
+  [LABEL_REVIEW_MAXED]: "review-maxed / heal-card (legacy)",
   [LABEL_AGENT_STUCK]: "agent-stuck / stuck-card",
 };
 

@@ -16,7 +16,8 @@ const STATUS_META: Record<RunStatusWire, { label: string; variant: BadgeVariant 
   running: { label: "Running", variant: "running" },
   "awaiting-answer": { label: "Awaiting answer", variant: "attention" },
   "agent-stuck": { label: "Agent stuck", variant: "danger" },
-  "review-maxed": { label: "Review maxed", variant: "danger" },
+  // Pre-cutover history only (ADR-0042); no live path produces it.
+  "review-maxed": { label: "Review maxed (legacy)", variant: "danger" },
   "awaiting-ci": { label: "Awaiting CI", variant: "waiting" },
   "awaiting-merge": { label: "Awaiting merge", variant: "waiting" },
   "master-triage": { label: "Master triage", variant: "running" },

@@ -223,6 +223,47 @@ export type MasterHumanQuestionRequested = Event<
  */
 export type MasterStuck = Event<"MasterStuck", { runId: string; attempt: number; reason: string }>;
 
+// ── GitHub-hosted review gate (issue #43) ────────────────────────────────────
+// Append-only dispositions of hosted-reviewer conversations. These are the facts that make
+// reply and resolution **idempotent across a restart**: a daemon that dies between pushing a
+// fix and replying, or between replying and resolving, re-folds these and reconstructs
+// exactly one pending gate action rather than repeating a mutation GitHub cannot undo.
+
+/**
+ * Ralph replied to a review thread. Keyed on `threadId` + the `commentHash` of the finding it
+ * was replying to, so a *new* finding on the same thread is a new reply while a re-run over
+ * the same finding is not.
+ */
+export type HostedReviewThreadReplied = Event<
+  "HostedReviewThreadReplied",
+  { runId: string; threadId: string; commentHash: string; headSha: string; replyId: string }
+>;
+/**
+ * Ralph resolved a review thread, and why. `disposition` records whether the finding was
+ * fixed or reasoned invalid — an agent may conclude a bot finding is wrong, but the
+ * rationale and its verification are persisted here rather than left implicit.
+ */
+export type HostedReviewThreadResolved = Event<
+  "HostedReviewThreadResolved",
+  {
+    runId: string;
+    threadId: string;
+    commentHash: string;
+    headSha: string;
+    disposition: "fixed" | "reasoned-invalid";
+    rationale: string;
+  }
+>;
+/**
+ * One hosted-review gate observation of a head: what the reviewer had said about *this*
+ * commit when the gate looked. Lets a restart tell "already observed this head, N threads
+ * open" from "never observed it", without re-running the bounded wait.
+ */
+export type HostedReviewObserved = Event<
+  "HostedReviewObserved",
+  { runId: string; headSha: string; unresolved: number; humanThreads: number; unknownBots: number }
+>;
+
 /** The discriminated union of every issue-stream event (ADR-0024 starter vocabulary). */
 export type IssueEvent =
   | RunStarted
@@ -249,7 +290,10 @@ export type IssueEvent =
   | MasterInterventionCompleted
   | DecisionPublished
   | MasterHumanQuestionRequested
-  | MasterStuck;
+  | MasterStuck
+  | HostedReviewThreadReplied
+  | HostedReviewThreadResolved
+  | HostedReviewObserved;
 
 /** Every issue-event `type` discriminant. */
 export type IssueEventType = IssueEvent["type"];
@@ -288,4 +332,7 @@ export const ISSUE_EVENT_TYPES = Object.keys({
   DecisionPublished: true,
   MasterHumanQuestionRequested: true,
   MasterStuck: true,
+  HostedReviewThreadReplied: true,
+  HostedReviewThreadResolved: true,
+  HostedReviewObserved: true,
 } satisfies Record<IssueEventType, true>) as IssueEventType[];
