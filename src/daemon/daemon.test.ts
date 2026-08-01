@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { parseConfig } from "../config/load";
 import type { RalphConfig } from "../config/schema";
 import { createLogger } from "../log/logger";
-import { buildRateLimitRecorder, buildUsageRouting, implProviderResetsAt } from "./daemon";
+import {
+  buildCloneAnomalySink,
+  buildRateLimitRecorder,
+  buildUsageRouting,
+  implProviderResetsAt,
+} from "./daemon";
+import { cloneSyncOperatorAction, type CloneSyncAnomalyReport } from "../executor/clone-sync";
+import type { RunLogInput } from "../store/types";
 import { UsageMeter } from "./usage-meter";
 
 const silent = createLogger({ write: () => {} });
@@ -245,5 +252,49 @@ describe("implProviderResetsAt — a disabled login's windows never shape the ET
     disabled.delete("c1");
     meter.record({ status: "allowed", rateLimitType: "five_hour", utilization: 10 }, "c1");
     expect(implProviderResetsAt(meter, 85, NOW)).toBeNull();
+  });
+});
+
+describe("buildCloneAnomalySink — a host-scoped clone refusal reaches the anomaly journal (issue #50)", () => {
+  const report: CloneSyncAnomalyReport = {
+    reason: "target-clone-dirty",
+    cloneDir: "/srv/clones/acme-widgets",
+    baseBranch: "master",
+    detail: "branch=master expected=master head=abc origin=def dirty=true",
+    action: cloneSyncOperatorAction("target-clone-dirty", {
+      cloneDir: "/srv/clones/acme-widgets",
+      baseBranch: "master",
+    }),
+  };
+
+  it("writes a repo-scoped, issue-less `daemon-anomaly` row carrying the reason AND the action", () => {
+    const rows: Array<Omit<RunLogInput, "repo">> = [];
+    buildCloneAnomalySink(REPO, silent, { appendLog: (input) => rows.push(input) })(report);
+
+    expect(rows).toHaveLength(1);
+    const row = rows[0]!;
+    expect(row.event).toBe("daemon-anomaly");
+    expect(row.level).toBe("error");
+    // No issue scope: this anomaly belongs to the host, not to any one issue — so the
+    // issue-scoped classifier (and the master queue behind it) must never see it.
+    expect(row.issueNumber).toBeNull();
+    expect(row.runId).toBeNull();
+    expect(row.data?.reason).toBe("target-clone-dirty");
+    // With no issue to comment on, the row is the ONLY place the operator action can live.
+    expect(String(row.data?.action)).toContain("/srv/clones/acme-widgets");
+    expect(row.data?.cloneDir).toBe("/srv/clones/acme-widgets");
+  });
+
+  it("logs the same precise reason + action on the structured error line", () => {
+    const lines: string[] = [];
+    const logger = createLogger({ write: (line) => lines.push(line) });
+    buildCloneAnomalySink(REPO, logger, { appendLog: () => undefined })(report);
+
+    expect(lines).toHaveLength(1);
+    const logged = JSON.parse(lines[0]!) as Record<string, unknown>;
+    expect(logged.event).toBe("daemon.target-clone-anomaly");
+    expect(logged.reason).toBe("target-clone-dirty");
+    expect(logged.repo).toBe(REPO);
+    expect(String(logged.action)).toContain("git -C /srv/clones/acme-widgets status");
   });
 });

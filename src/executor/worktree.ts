@@ -10,6 +10,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
+import { TargetCloneGate } from "./clone-sync";
 
 const execFileAsync = promisify(execFile);
 
@@ -205,6 +206,15 @@ export interface GitWorktreeOptions {
    * (the parallel-edit pileup). Complements the rebase-aware merge in #41.
    */
   baseBranch?: string;
+  /**
+   * The clone's serializing gate (issue #50). Worktree *preparation* (the base fetch plus
+   * `worktree add`) mutates the same clone the daemon also fast-forwards before resolving the
+   * content-keyed agent image; passing the SAME {@link TargetCloneGate} the
+   * {@link import("./clone-sync").TargetCloneSynchronizer} holds coalesces the two into one
+   * serialized path, so concurrent dispatches can never interleave on the clone's index and refs.
+   * Omitted → a private gate, which still serializes this manager's own concurrent creates.
+   */
+  gate?: TargetCloneGate;
 }
 
 export class GitWorktreeManager implements WorktreeManager {
@@ -212,19 +222,30 @@ export class GitWorktreeManager implements WorktreeManager {
   private readonly worktreeRoot: string;
   private readonly baseRef?: string;
   private readonly baseBranch?: string;
+  private readonly gate: TargetCloneGate;
 
   constructor(cloneDir: string, worktreeRoot: string, options: GitWorktreeOptions = {}) {
     this.cloneDir = resolve(cloneDir);
     this.worktreeRoot = resolve(worktreeRoot);
     this.baseRef = options.baseRef;
     this.baseBranch = options.baseBranch;
+    this.gate = options.gate ?? new TargetCloneGate();
   }
 
   private git(args: string[]): Promise<{ stdout: string; stderr: string }> {
     return execFileAsync("git", ["-C", this.cloneDir, ...args]);
   }
 
-  async create(branch: string, dirName: string): Promise<string> {
+  /**
+   * Prepare a worktree under the shared clone gate (issue #50). `create`/`attach` are the two
+   * paths that fetch into the clone and add a worktree to it; both must be exclusive with the
+   * base fast-forward and with each other. Nothing inside a prepared body may re-enter the gate.
+   */
+  create(branch: string, dirName: string): Promise<string> {
+    return this.gate.run(() => this.createUnlocked(branch, dirName));
+  }
+
+  private async createUnlocked(branch: string, dirName: string): Promise<string> {
     mkdirSync(this.worktreeRoot, { recursive: true });
     const path = resolve(this.worktreeRoot, dirName);
     // Fork the latest default branch: fetch it, then base the worktree on the
@@ -287,7 +308,11 @@ export class GitWorktreeManager implements WorktreeManager {
     await this.git(["worktree", "prune"]).catch(() => {});
   }
 
-  async attach(branch: string, dirName: string): Promise<string> {
+  attach(branch: string, dirName: string): Promise<string> {
+    return this.gate.run(() => this.attachUnlocked(branch, dirName));
+  }
+
+  private async attachUnlocked(branch: string, dirName: string): Promise<string> {
     mkdirSync(this.worktreeRoot, { recursive: true });
     const path = resolve(this.worktreeRoot, dirName);
     // A crash leaves the prior worktree registered at this path (teardown never

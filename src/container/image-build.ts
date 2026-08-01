@@ -182,6 +182,16 @@ export async function ensureTargetImage(
 /** The default path, relative to the target clone, of a target's container Dockerfile. */
 export const DEFAULT_AGENT_DOCKERFILE = ".ralph/agent.Dockerfile";
 
+/**
+ * Run `read` with the target clone **refreshed onto its base branch and held steady** for the
+ * whole of it (issue #50). Supplied by
+ * {@link import("../executor/clone-sync").TargetCloneSynchronizer.withSyncedClone}; the
+ * composition root wires the real one, tests inject a fake clone, and an absent one degrades to
+ * "read whatever is checked out" (the pre-#50 behaviour, kept only for the unit tests that have
+ * no clone at all).
+ */
+export type SyncedCloneScope = <T>(read: () => Promise<T>) => Promise<T>;
+
 /** Ports + identity {@link createTargetImageResolver} composes — all injected so it is unit-testable. */
 export interface TargetImageResolverDeps {
   /** `owner/repo` slug; namespaces the per-target image. */
@@ -194,6 +204,16 @@ export interface TargetImageResolverDeps {
   loadContract: () => AgentContract;
   /** Read the Dockerfile + manifests from the clone (real fs in prod; faked in tests). */
   sources: ManifestSources;
+  /**
+   * Refresh {@link contextDir} onto its base branch before the contract/manifests are read, and
+   * hold it for the whole resolve (issue #50). Without this the resolver reads a checkout that
+   * nothing ever advances: worktrees fork `origin/<base>` and stay current while the clone drifts
+   * arbitrarily far behind, so a merged base-pin bump keys — and runs — the OLD image forever.
+   * The scope also spans the build, so a fast-forward landing mid-resolve cannot key an image on
+   * a tree that never existed. A refusal (dirty / off-base / diverged clone) throws through, by
+   * design: building from a knowingly-stale tree is worse than failing the dispatch.
+   */
+  withSyncedClone?: SyncedCloneScope;
   /** Build / inspect images (real docker in prod; faked in tests). */
   builder: ImageBuilderDeps;
   /** Observe each ensure (for the daemon's log) — the resolved tag + whether a build actually ran. */
@@ -209,22 +229,29 @@ export interface TargetImageResolverDeps {
  * changed `depManifest` keys a new, absent tag → the deps layer rebuilds on the next dispatch.
  *
  * Pure over its injected ports (no direct fs/docker), so the wiring is unit-testable; the
- * composition root supplies the real fs/docker edges. Concurrency note: two near-simultaneous
- * dispatches that both miss the cache may both build the same tag — idempotent (same content-keyed
- * tag), just redundant; no lock is taken in this slice.
+ * composition root supplies the real fs/docker edges.
+ *
+ * Concurrency + freshness (issue #50): the whole body runs inside
+ * {@link TargetImageResolverDeps.withSyncedClone}, which fast-forwards the clone onto its base
+ * branch first and holds it until the resolve finishes. So the contract read, the manifest globs
+ * and the build context are all one consistent tree, and two near-simultaneous dispatches
+ * serialize instead of racing it — the second finds the first's content-keyed tag already built
+ * (an L2 hit) rather than redundantly rebuilding it.
  */
 export function createTargetImageResolver(deps: TargetImageResolverDeps): () => Promise<string> {
   const dockerfile = deps.dockerfile ?? DEFAULT_AGENT_DOCKERFILE;
-  return async () => {
-    const contract = deps.loadContract();
-    const input = resolveImageBuildInput(
-      { targetRepo: deps.targetRepo, contract, dockerfile, contextDir: deps.contextDir },
-      deps.sources,
-    );
-    const ensured = await ensureTargetImage(input, deps.builder);
-    deps.onEnsured?.(ensured);
-    return ensured.imageTag;
-  };
+  const withSyncedClone: SyncedCloneScope = deps.withSyncedClone ?? ((read) => read());
+  return () =>
+    withSyncedClone(async () => {
+      const contract = deps.loadContract();
+      const input = resolveImageBuildInput(
+        { targetRepo: deps.targetRepo, contract, dockerfile, contextDir: deps.contextDir },
+        deps.sources,
+      );
+      const ensured = await ensureTargetImage(input, deps.builder);
+      deps.onEnsured?.(ensured);
+      return ensured.imageTag;
+    });
 }
 
 // ---- real edge adapters (infra — smoke-tested at onboarding, not in the unit suite) ----

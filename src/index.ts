@@ -340,6 +340,29 @@ export {
 // ---- executor: worktree + impl agent -----------------------------------
 export { GitWorktreeManager, BranchDivergedError } from "./executor/worktree";
 export type { WorktreeManager, GitWorktreeOptions, RebaseResult, RebaseOptions } from "./executor/worktree";
+// The target clone's base-checkout refresh (issue #50): the clone is the worktree source AND the
+// agent image's build context, so it must be fast-forwarded before any content-keyed read of it.
+export {
+  TargetCloneSynchronizer,
+  TargetCloneGate,
+  TargetCloneAnomalyError,
+  planCloneSync,
+  cloneSyncOperatorAction,
+  assertCloneSafeGit,
+  cloneGitCli,
+  CLONE_SYNC_ANOMALIES,
+  CLONE_SYNC_GIT_COMMANDS,
+} from "./executor/clone-sync";
+export type {
+  CloneBaseState,
+  CloneSyncPlan,
+  CloneSyncResult,
+  CloneSyncAnomaly,
+  CloneSyncAnomalyReport,
+  CloneSyncContext,
+  CloneGit,
+  TargetCloneSyncDeps,
+} from "./executor/clone-sync";
 export { Executor } from "./executor/executor";
 export type { PickedIssue, ClaimedRun, ExecutorResult, ExecutorDeps } from "./executor/executor";
 export {
@@ -466,6 +489,7 @@ export type {
   ImageBuilderDeps,
   ManifestSources,
   ImageBuildArgs,
+  SyncedCloneScope,
 } from "./container/image-build";
 export {
   createGitCloner,
