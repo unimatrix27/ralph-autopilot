@@ -11,7 +11,17 @@
  */
 
 import type { Command } from "@event-driven-io/emmett";
-import type { Mode, Phase, PhaseRoute, QuestionKind, RunStatus } from "../types";
+import type {
+  ComplexityTier,
+  MasterLane,
+  MasterRequestSource,
+  MasterResolution,
+  Mode,
+  Phase,
+  PhaseRoute,
+  QuestionKind,
+  RunStatus,
+} from "../types";
 import type { IssueEvent, RunOutcome } from "./event-types";
 
 /**
@@ -139,6 +149,30 @@ export function evolve(state: IssueState, event: IssueEvent): IssueState {
       return { ...state, anomaly: event.data.reason };
     case "AnomalyCleared":
       return { ...state, anomaly: null };
+    case "MasterTriageRequested":
+      // The worker handed its decision up (ADR-0041): the run parks on the master queue.
+      // Automated in-flight, not a human pause — no question is indexed and no
+      // human-attention label is desired.
+      return { ...state, status: "master-triage" };
+    case "MasterInterventionStarted":
+      // The master session IS the `master-triage` state: the status (and therefore the
+      // durable label) is deliberately unchanged for the whole intervention, so a restart
+      // mid-session re-finds exactly one pending master task.
+      return { ...state, status: "master-triage" };
+    case "MasterStuck":
+      // The master adjudicated and concluded nothing further helps — the only worker-origin
+      // path to `agent-stuck` after this slice (ADR-0041).
+      return { ...state, status: "agent-stuck" };
+    case "ComplexityPromoted":
+    case "MasterResolutionSelected":
+    case "MasterInterventionCompleted":
+    case "DecisionPublished":
+    case "MasterHumanQuestionRequested":
+      // Visibility/provenance facts, never lifecycle transitions: the *resolution's own*
+      // facts move the status (`Escalated` for ask-human, `Resumed`/`RunStarted` for the
+      // continue/redispatch arms, `MasterStuck` for terminal-stuck). Keeping these
+      // status-neutral is what stops a resolution from being pinned twice.
+      return state;
     default:
       // Tolerant reader (ADR-0026): an unrecognised event type is ignored, not an error.
       return state;
@@ -175,6 +209,49 @@ export type EndRun = Command<"EndRun", { runId: string; outcome: RunOutcome }>;
 export type DetectAnomaly = Command<"DetectAnomaly", { reason: string }>;
 export type ClearAnomaly = Command<"ClearAnomaly", Record<string, never>>;
 
+// ── master escalation commands (ADR-0041) ────────────────────────────────────
+export type RequestMasterTriage = Command<
+  "RequestMasterTriage",
+  {
+    runId: string;
+    source: MasterRequestSource;
+    phase: string;
+    lane: MasterLane;
+    signature: string;
+    headline: string;
+    recommendation?: string;
+    prNumber?: number | null;
+  }
+>;
+export type PromoteComplexity = Command<
+  "PromoteComplexity",
+  { tier: ComplexityTier; from?: ComplexityTier | null }
+>;
+export type StartMasterIntervention = Command<
+  "StartMasterIntervention",
+  { runId: string; attempt: number; phase: string; signature: string }
+>;
+export type SelectMasterResolution = Command<
+  "SelectMasterResolution",
+  { runId: string; attempt: number; phase: string; resolution: MasterResolution; rationale: string }
+>;
+export type CompleteMasterIntervention = Command<
+  "CompleteMasterIntervention",
+  { runId: string; attempt: number; phase: string; resolution: MasterResolution }
+>;
+export type PublishDecision = Command<
+  "PublishDecision",
+  { runId: string; decisionId: string; key: string; scope: string; node: string; commentId: number }
+>;
+export type RequestHumanQuestion = Command<
+  "RequestHumanQuestion",
+  { runId: string; attempt: number; phase: string; headline: string }
+>;
+export type MarkMasterStuck = Command<
+  "MarkMasterStuck",
+  { runId: string; attempt: number; reason: string }
+>;
+
 /** Every issue command. */
 export type IssueCommand =
   | StartRun
@@ -191,7 +268,15 @@ export type IssueCommand =
   | RecordMerge
   | EndRun
   | DetectAnomaly
-  | ClearAnomaly;
+  | ClearAnomaly
+  | RequestMasterTriage
+  | PromoteComplexity
+  | StartMasterIntervention
+  | SelectMasterResolution
+  | CompleteMasterIntervention
+  | PublishDecision
+  | RequestHumanQuestion
+  | MarkMasterStuck;
 
 /** Guard: the action presupposes an active run, i.e. at least one `RunStarted`. */
 function requireRun(state: IssueState, action: string): void {
@@ -254,6 +339,31 @@ export function decide(command: IssueCommand, state: IssueState): IssueEvent | I
       return { type: "AnomalyDetected", data: command.data };
     case "ClearAnomaly":
       return { type: "AnomalyCleared", data: {} };
+    case "RequestMasterTriage":
+      requireRun(state, "request master triage");
+      return { type: "MasterTriageRequested", data: command.data };
+    case "PromoteComplexity":
+      // Promotion is an issue-level fact (the label is the issue's, not the run's), so it
+      // is legal with or without a run — exactly like an anomaly.
+      return { type: "ComplexityPromoted", data: command.data };
+    case "StartMasterIntervention":
+      requireRun(state, "start a master intervention");
+      return { type: "MasterInterventionStarted", data: command.data };
+    case "SelectMasterResolution":
+      requireRun(state, "select a master resolution");
+      return { type: "MasterResolutionSelected", data: command.data };
+    case "CompleteMasterIntervention":
+      requireRun(state, "complete a master intervention");
+      return { type: "MasterInterventionCompleted", data: command.data };
+    case "PublishDecision":
+      requireRun(state, "publish a decision");
+      return { type: "DecisionPublished", data: command.data };
+    case "RequestHumanQuestion":
+      requireRun(state, "request a human question");
+      return { type: "MasterHumanQuestionRequested", data: command.data };
+    case "MarkMasterStuck":
+      requireRun(state, "mark the run master-stuck");
+      return { type: "MasterStuck", data: command.data };
     default:
       return assertNeverCommand(command);
   }

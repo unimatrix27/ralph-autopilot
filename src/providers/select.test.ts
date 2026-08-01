@@ -275,10 +275,27 @@ describe("per-tier routing key (issue #278) — providerPreferenceList(agent, 'i
     expect(providerPreferenceList(agent, "impl", undefined, 3)).toEqual([{ provider: "zai" }]);
   });
 
-  it("a tier is impl-only: every other type ignores it", () => {
+  it("the GOVERNING tier 1 outranks agent.types on every lane (ADR-0041 amending ADR-0039)", () => {
+    // ADR-0039 shipped tiers as impl-only. ADR-0041 amends that for tier 1 ONLY: a master
+    // escalation permanently promotes its issue to `complexity:1`, and the promotion would be
+    // meaningless if the next review/fix session dropped back to a cheaper model.
     const agent = agentSettings({ ...TIERED, types: { ...TIERED.types, review: [{ provider: "openai" as const }] } });
-    expect(providerPreferenceList(agent, "review", undefined, 1)).toEqual([{ provider: "openai" }]);
-    expect(providerPreferenceList(agent, "autoMode", undefined, 1)).toEqual([{ provider: "claude" }]);
+    const tierOne = [{ provider: "claude", modelOverride: "claude-fable-5" }];
+    expect(providerPreferenceList(agent, "review", undefined, 1)).toEqual(tierOne);
+    expect(providerPreferenceList(agent, "fix", undefined, 1)).toEqual(tierOne);
+    expect(providerPreferenceList(agent, "autoMode", undefined, 1)).toEqual(tierOne);
+  });
+
+  it("a NON-governing tier stays impl-only: review/fix/autoMode ignore it (ADR-0014 uniformity)", () => {
+    const agent = agentSettings({
+      types: { impl: [{ provider: "zai" as const }], review: [{ provider: "openai" as const }] },
+      tiers: { "2": { routes: [{ provider: "claude" as const, model: "claude-opus-5" }] } },
+    });
+    expect(providerPreferenceList(agent, "impl", undefined, 2)).toEqual([
+      { provider: "claude", modelOverride: "claude-opus-5" },
+    ]);
+    expect(providerPreferenceList(agent, "review", undefined, 2)).toEqual([{ provider: "openai" }]);
+    expect(providerPreferenceList(agent, "autoMode", undefined, 2)).toEqual([{ provider: "claude" }]);
   });
 
   it("with no tiers configured at all the impl list is byte-identical to before", () => {
@@ -304,7 +321,11 @@ describe("per-tier routing key (issue #278) — providerPreferenceList(agent, 'i
     const all = allPreferenceLists(agent, "impl");
     // base (zai) + tier-1 routes; tier-3 has no routes and contributes nothing.
     expect(all).toEqual([{ provider: "zai" }, { provider: "claude", modelOverride: "claude-fable-5" }]);
-    // Non-impl types are unaffected by tiers.
-    expect(allPreferenceLists(agent, "review")).toEqual([{ provider: "claude" }]);
+    // Non-impl types pick up the GOVERNING tier's routes too (ADR-0041), so load-time
+    // validation still sees every provider a promoted issue can route review/fix at.
+    expect(allPreferenceLists(agent, "review")).toEqual([
+      { provider: "claude" },
+      { provider: "claude", modelOverride: "claude-fable-5" },
+    ]);
   });
 });

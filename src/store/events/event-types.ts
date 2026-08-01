@@ -27,7 +27,16 @@
  */
 
 import type { Event } from "@event-driven-io/emmett";
-import type { Mode, Phase, PhaseRoute, QuestionKind } from "../types";
+import type {
+  ComplexityTier,
+  MasterLane,
+  MasterRequestSource,
+  MasterResolution,
+  Mode,
+  Phase,
+  PhaseRoute,
+  QuestionKind,
+} from "../types";
 
 /**
  * How a run ended — the terminal disposition recorded by `RunEnded` (issue #80). A run
@@ -133,6 +142,87 @@ export type AnomalyDetected = Event<"AnomalyDetected", { reason: string }>;
 /** A previously-flagged anomaly cleared. */
 export type AnomalyCleared = Event<"AnomalyCleared", Record<string, never>>;
 
+// ── master escalation (ADR-0041, DESIGN §13) ─────────────────────────────────
+// New past-tense facts, minted (never repurposed) so `Escalated` / `ReviewMaxed` /
+// `RunStuck` keep their exact meaning and schema (ADR-0024/0026). A `master-triage`
+// projection is derived from these, exactly as every other status is derived.
+
+/**
+ * A worker handed its decision **up to the master** — the fact `master-triage` is projected
+ * from (ADR-0041). `source` distinguishes `escalate` (a decision the worker could not make)
+ * from `stuck` (its execution budget is exhausted); both enter the one master queue. `phase`
+ * is the run-phase key the two-intervention budget is counted against (the `phaseLabel`
+ * vocabulary — `impl`, `review-1`, …) and `lane` is the interrupted agent lane. `signature`
+ * is the **normalized failure signature** so a repeat is recognisable across a changed head
+ * SHA. The worker's `recommendation` rides along as *primary evidence*, never as an answer.
+ */
+export type MasterTriageRequested = Event<
+  "MasterTriageRequested",
+  {
+    runId: string;
+    source: MasterRequestSource;
+    phase: string;
+    lane: MasterLane;
+    signature: string;
+    headline: string;
+    recommendation?: string;
+    prNumber?: number | null;
+  }
+>;
+/**
+ * The issue was permanently promoted to complexity tier 1 on its first master escalation
+ * (ADR-0041). `from` records the tier it carried (or null when unlabeled) so the promotion
+ * is auditable; the promotion itself is idempotent — a second request re-emits nothing.
+ */
+export type ComplexityPromoted = Event<
+  "ComplexityPromoted",
+  { tier: ComplexityTier; from?: ComplexityTier | null }
+>;
+/** A numbered master intervention began (a fresh highest-tier session, ADR-0008). */
+export type MasterInterventionStarted = Event<
+  "MasterInterventionStarted",
+  { runId: string; attempt: number; phase: string; signature: string }
+>;
+/**
+ * The master chose exactly one of the five resolutions (ADR-0041) — the master's **own**
+ * conclusion, stated with its rationale, which is what gets injected/persisted regardless
+ * of what the worker recommended.
+ */
+export type MasterResolutionSelected = Event<
+  "MasterResolutionSelected",
+  { runId: string; attempt: number; phase: string; resolution: MasterResolution; rationale: string }
+>;
+/** A numbered master intervention finished (closes the attempt span opened above). */
+export type MasterInterventionCompleted = Event<
+  "MasterInterventionCompleted",
+  { runId: string; attempt: number; phase: string; resolution: MasterResolution }
+>;
+/**
+ * The master appended a binding scoped decision to the ledger (ADR-0040/0041). Records the
+ * record id + storage node so a replay can see *that* it was published without re-reading
+ * GitHub; the canonical record remains the `ralph-decision` comment.
+ */
+export type DecisionPublished = Event<
+  "DecisionPublished",
+  { runId: string; decisionId: string; key: string; scope: string; node: string; commentId: number }
+>;
+/**
+ * The master concluded only a human can decide and requested a `ralph-question`
+ * (ADR-0041). The question/checkpoint itself still rides the existing `Escalated` path —
+ * this fact records that the *master* (never a worker) asked for it.
+ */
+export type MasterHumanQuestionRequested = Event<
+  "MasterHumanQuestionRequested",
+  { runId: string; attempt: number; phase: string; headline: string }
+>;
+/**
+ * The master concluded neither another autonomous action nor a human decision can help
+ * (ADR-0041). The only path to a terminal `agent-stuck` for a worker-origin escalation
+ * after this slice — the run status it projects is `agent-stuck`, exactly as `RunStuck`,
+ * but the fact records that a master adjudicated first.
+ */
+export type MasterStuck = Event<"MasterStuck", { runId: string; attempt: number; reason: string }>;
+
 /** The discriminated union of every issue-stream event (ADR-0024 starter vocabulary). */
 export type IssueEvent =
   | RunStarted
@@ -151,7 +241,15 @@ export type IssueEvent =
   | Merged
   | RunEnded
   | AnomalyDetected
-  | AnomalyCleared;
+  | AnomalyCleared
+  | MasterTriageRequested
+  | ComplexityPromoted
+  | MasterInterventionStarted
+  | MasterResolutionSelected
+  | MasterInterventionCompleted
+  | DecisionPublished
+  | MasterHumanQuestionRequested
+  | MasterStuck;
 
 /** Every issue-event `type` discriminant. */
 export type IssueEventType = IssueEvent["type"];
@@ -182,4 +280,12 @@ export const ISSUE_EVENT_TYPES = Object.keys({
   RunEnded: true,
   AnomalyDetected: true,
   AnomalyCleared: true,
+  MasterTriageRequested: true,
+  ComplexityPromoted: true,
+  MasterInterventionStarted: true,
+  MasterResolutionSelected: true,
+  MasterInterventionCompleted: true,
+  DecisionPublished: true,
+  MasterHumanQuestionRequested: true,
+  MasterStuck: true,
 } satisfies Record<IssueEventType, true>) as IssueEventType[];

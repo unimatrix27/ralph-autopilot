@@ -36,6 +36,9 @@ export const RUN_STATUSES = [
   "review-maxed",
   "awaiting-ci",
   "awaiting-merge",
+  // Queued for / undergoing master escalation (ADR-0041) — an automated in-flight state,
+  // never a "needs you" one, so the UI tones it as machine work rather than attention.
+  "master-triage",
   "merged",
   "closed",
 ] as const;

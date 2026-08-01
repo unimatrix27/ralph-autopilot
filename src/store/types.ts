@@ -50,12 +50,54 @@ export type RunStatus =
   // (resolve + merge) flow. Non-terminal — it holds the issue (not in
   // RE_ADMITTABLE_STATUSES), and the build slot is freed once review hands off.
   | "awaiting-merge"
+  /**
+   * Queued for (or undergoing) **master escalation** (ADR-0041, DESIGN §13): a worker
+   * called `escalate` or `stuck`, its WIP was checkpointed, and the issue now waits for a
+   * fresh highest-tier master session to adjudicate. Automated in-flight state, **not** a
+   * human pause — nothing here is waiting on an operator, so it is deliberately not a
+   * {@link BacklogPausedState}. Non-terminal (it holds the issue, so it is not in
+   * `RE_ADMITTABLE_STATUSES`); the master queue services it every tick, off the fresh-
+   * admission path but on the ordinary concurrency cap. Projected from
+   * `MasterTriageRequested`.
+   */
+  | "master-triage"
   | "merged"
   // Effect-neutral terminal (issue #81): an issue that concluded out-of-band — a human
   // closed it while the daemon was down, so the orphan-discard never merged. Terminal for
   // completeness and re-admittable like `merged`, but triggers NO daemon-set label and is
   // read truthfully (not mislabelled `merged`). Projected from `RunEnded { outcome: "closed" }`.
   | "closed";
+
+/**
+ * Which worker signal opened a master escalation (ADR-0041). `escalate` means the worker
+ * wants a *decision* it cannot make; `stuck` means its execution budget is exhausted. Both
+ * enter the same master queue — the distinction is evidence for the master, never a
+ * different route.
+ */
+export type MasterRequestSource = "escalate" | "stuck";
+
+/**
+ * The agent lane a master request came from — which session was interrupted (ADR-0041).
+ * `impl`/`resume` are this slice's worker-origin lanes; `review`/`fix`/`master` are minted
+ * now so the vocabulary does not have to change when the next slice triages review-maxed.
+ */
+export type MasterLane = "impl" | "resume" | "review" | "fix" | "master";
+
+/**
+ * The five — and only five — terminal outcomes of one master intervention (ADR-0041):
+ * - `resolved-and-continue` — the master repaired/guided; re-enter the interrupted phase;
+ * - `redispatch-tier-1`     — launch a fresh tier-1 worker on the preserved WIP branch;
+ * - `retry-pipeline`        — one typed harness retry (CI/review/merge/reconcile), no gate bypass;
+ * - `ask-human`             — publish a `ralph-question` and enter `awaiting-answer`;
+ * - `terminal-stuck`        — neither another autonomous action nor a human decision can help.
+ * Exactly one is selected per intervention; there is no "deferred" arm (no-deferral rule).
+ */
+export type MasterResolution =
+  | "resolved-and-continue"
+  | "redispatch-tier-1"
+  | "retry-pipeline"
+  | "ask-human"
+  | "terminal-stuck";
 
 /**
  * A PAUSED run status — the resumable subset a deferred resume restores (issue #101).

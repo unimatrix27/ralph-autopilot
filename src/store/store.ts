@@ -2,7 +2,13 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import BetterSqlite3, { type Database } from "better-sqlite3";
 import { runMigrations } from "./migrations";
-import { EventLog, type IssueAggregate, type RecordedTranscriptEvent, type TranscriptPruneResult } from "./event-log";
+import {
+  EventLog,
+  type IssueAggregate,
+  type RecordedStreamEvent,
+  type RecordedTranscriptEvent,
+  type TranscriptPruneResult,
+} from "./event-log";
 import { LogBroadcaster } from "./log-broadcast";
 import type { IssueEvent, RunOutcome } from "./events/event-types";
 import type { IssueProjectionRow } from "./events/projection";
@@ -10,7 +16,11 @@ import type { TranscriptEvent, TranscriptRetentionBudget } from "./events/transc
 import type {
   AgentInput,
   AgentRecord,
+  ComplexityTier,
   DaemonSnapshot,
+  MasterLane,
+  MasterRequestSource,
+  MasterResolution,
   Mode,
   OpenQuestion,
   OpenQuestionInput,
@@ -396,6 +406,182 @@ export class Store {
       type: "AnomalyCleared",
       data: {},
     });
+  }
+
+  // ---- master escalation facts (ADR-0041) -------------------------------
+  //
+  // The master queue and its attempt history are **append-only issue-stream actual state**
+  // (never a mutable row), so a daemon restart re-folds them exactly rather than guessing.
+  // Every write here is one fact; the `master-triage` status — and therefore the label the
+  // reconciler's outbox applies — is derived from `MasterTriageRequested` by the projection.
+
+  /** Append `MasterTriageRequested` — a worker handed its decision up to the master. */
+  async recordMasterTriageRequested(
+    repo: string,
+    issueNumber: number,
+    input: {
+      runId: number;
+      source: MasterRequestSource;
+      phase: string;
+      lane: MasterLane;
+      signature: string;
+      headline: string;
+      recommendation?: string;
+      prNumber?: number | null;
+    },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "MasterTriageRequested",
+      data: {
+        runId: String(input.runId),
+        source: input.source,
+        phase: input.phase,
+        lane: input.lane,
+        signature: input.signature,
+        headline: input.headline,
+        ...(input.recommendation !== undefined ? { recommendation: input.recommendation } : {}),
+        ...(input.prNumber !== undefined ? { prNumber: input.prNumber } : {}),
+      },
+    });
+  }
+
+  /** Append `ComplexityPromoted` — the issue was permanently promoted to a complexity tier. */
+  async recordComplexityPromoted(
+    repo: string,
+    issueNumber: number,
+    input: { tier: ComplexityTier; from?: ComplexityTier | null },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "ComplexityPromoted",
+      data: { tier: input.tier, ...(input.from !== undefined ? { from: input.from } : {}) },
+    });
+  }
+
+  /** Append `MasterInterventionStarted` — a numbered master session began. */
+  async recordMasterInterventionStarted(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; attempt: number; phase: string; signature: string },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "MasterInterventionStarted",
+      data: { runId: String(input.runId), attempt: input.attempt, phase: input.phase, signature: input.signature },
+    });
+  }
+
+  /**
+   * Append `MasterResolutionSelected` + `MasterInterventionCompleted` in one commit. One
+   * adjudication is one operator-visible event even though two facts model it (the decision
+   * and the closing of the attempt span), so live consumers must see them as one batch —
+   * exactly the {@link recordReviewMaxedQuestion} discipline.
+   */
+  async recordMasterInterventionResolved(
+    repo: string,
+    issueNumber: number,
+    input: {
+      runId: number;
+      attempt: number;
+      phase: string;
+      resolution: MasterResolution;
+      rationale: string;
+    },
+  ): Promise<void> {
+    await this.events.appendToIssue(repo, issueNumber, [
+      {
+        type: "MasterResolutionSelected",
+        data: {
+          runId: String(input.runId),
+          attempt: input.attempt,
+          phase: input.phase,
+          resolution: input.resolution,
+          rationale: input.rationale,
+        },
+      },
+      {
+        type: "MasterInterventionCompleted",
+        data: {
+          runId: String(input.runId),
+          attempt: input.attempt,
+          phase: input.phase,
+          resolution: input.resolution,
+        },
+      },
+    ]);
+  }
+
+  /** Append `DecisionPublished` — the master appended a binding record to the ledger. */
+  async recordDecisionPublished(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; decisionId: string; key: string; scope: string; node: string; commentId: number },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "DecisionPublished",
+      data: {
+        runId: String(input.runId),
+        decisionId: input.decisionId,
+        key: input.key,
+        scope: input.scope,
+        node: input.node,
+        commentId: input.commentId,
+      },
+    });
+  }
+
+  /**
+   * Append `MasterHumanQuestionRequested` plus the `Escalated` fact that actually pauses the
+   * run, in one commit — the master's `ask_human` is the only path in this slice that
+   * creates a `ralph-question`, and its provenance ("a master asked, not a worker") must land
+   * with it or a replay could not tell the two apart.
+   */
+  async recordMasterHumanQuestion(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; attempt: number; phase: string; headline: string; commentId: number | null },
+  ): Promise<OpenQuestion> {
+    await this.events.appendToIssue(repo, issueNumber, [
+      {
+        type: "MasterHumanQuestionRequested",
+        data: {
+          runId: String(input.runId),
+          attempt: input.attempt,
+          phase: input.phase,
+          headline: input.headline,
+        },
+      },
+      this.questionEvent({
+        repo,
+        issueNumber,
+        runId: input.runId,
+        kind: "escalate",
+        headline: input.headline,
+        commentId: input.commentId,
+      }),
+    ]);
+    const question = this.events.openQuestionForIssue(repo, issueNumber);
+    if (!question) {
+      throw new Error("recordMasterHumanQuestion failed to read back the appended question");
+    }
+    return question;
+  }
+
+  /**
+   * Append `MasterStuck` + `RunEnded { stuck }` in one commit — the master adjudicated and
+   * concluded nothing further helps. The only worker-origin path to a terminal `agent-stuck`
+   * after ADR-0041.
+   */
+  async recordMasterStuck(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; attempt: number; reason: string },
+  ): Promise<void> {
+    await this.events.appendToIssue(repo, issueNumber, [
+      {
+        type: "MasterStuck",
+        data: { runId: String(input.runId), attempt: input.attempt, reason: input.reason },
+      },
+      { type: "RunEnded", data: { runId: String(input.runId), outcome: "stuck" } },
+    ]);
   }
 
   /** Append `Merged` — the PR merged and the issue closed (`merged`). */
@@ -1159,6 +1345,80 @@ export class ScopedStore {
   }
   recordAnomalyCleared(input: { issueNumber: number }): Promise<void> {
     return this.store.recordAnomalyCleared(this.repo, input.issueNumber);
+  }
+
+  // ---- master escalation facts (ADR-0041, auto-scoped to this.repo) -----
+  recordMasterTriageRequested(input: {
+    issueNumber: number;
+    runId: number;
+    source: MasterRequestSource;
+    phase: string;
+    lane: MasterLane;
+    signature: string;
+    headline: string;
+    recommendation?: string;
+    prNumber?: number | null;
+  }): Promise<void> {
+    return this.store.recordMasterTriageRequested(this.repo, input.issueNumber, input);
+  }
+  recordComplexityPromoted(input: {
+    issueNumber: number;
+    tier: ComplexityTier;
+    from?: ComplexityTier | null;
+  }): Promise<void> {
+    return this.store.recordComplexityPromoted(this.repo, input.issueNumber, input);
+  }
+  recordMasterInterventionStarted(input: {
+    issueNumber: number;
+    runId: number;
+    attempt: number;
+    phase: string;
+    signature: string;
+  }): Promise<void> {
+    return this.store.recordMasterInterventionStarted(this.repo, input.issueNumber, input);
+  }
+  recordMasterInterventionResolved(input: {
+    issueNumber: number;
+    runId: number;
+    attempt: number;
+    phase: string;
+    resolution: MasterResolution;
+    rationale: string;
+  }): Promise<void> {
+    return this.store.recordMasterInterventionResolved(this.repo, input.issueNumber, input);
+  }
+  recordDecisionPublished(input: {
+    issueNumber: number;
+    runId: number;
+    decisionId: string;
+    key: string;
+    scope: string;
+    node: string;
+    commentId: number;
+  }): Promise<void> {
+    return this.store.recordDecisionPublished(this.repo, input.issueNumber, input);
+  }
+  recordMasterHumanQuestion(input: {
+    issueNumber: number;
+    runId: number;
+    attempt: number;
+    phase: string;
+    headline: string;
+    commentId: number | null;
+  }): Promise<OpenQuestion> {
+    return this.store.recordMasterHumanQuestion(this.repo, input.issueNumber, input);
+  }
+  recordMasterStuck(input: {
+    issueNumber: number;
+    runId: number;
+    attempt: number;
+    reason: string;
+  }): Promise<void> {
+    return this.store.recordMasterStuck(this.repo, input.issueNumber, input);
+  }
+  /** Read this repo's issue stream in append order — the master-history fold's input. */
+  readIssueStream(issueNumber: number): RecordedStreamEvent[] {
+    return this.store.events.readIssueStream(this.repo, issueNumber);
   }
   recordMerged(input: { runId: number; issueNumber: number; prNumber: number }): Promise<void> {
     return this.store.recordMerged(this.repo, input.issueNumber, input);

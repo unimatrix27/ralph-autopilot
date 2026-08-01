@@ -66,6 +66,28 @@ export const LABEL_AWAITING_MERGE = "awaiting-merge";
  * parked state (advances into review, or is discarded).
  */
 export const LABEL_AWAITING_CI = "awaiting-ci";
+/**
+ * Automated in-flight state (**not** a human pause, ADR-0041): a worker handed its
+ * decision up to the master (`escalate`) or exhausted its execution budget (`stuck`), its
+ * WIP is checkpointed, and the issue is queued for a fresh highest-tier master session.
+ * Daemon-owned and level-triggered from the `master-triage` run status like the other
+ * state effects, so it is durable across a restart (the queue is reconstructible from
+ * GitHub) and excludes the issue from ordinary admission. It is deliberately NOT in
+ * {@link BACKLOG_PAUSED_STATES}: nothing here waits on an operator, so it must never read
+ * as a "needs you" state in the backlog view.
+ */
+export const LABEL_MASTER_TRIAGE = "master-triage";
+
+/**
+ * Cosmetics for self-creating {@link LABEL_MASTER_TRIAGE} on a target repo that has not
+ * pre-created it. Machine-state blue (not attention red): a queued master escalation is
+ * the daemon working, not a human being paged. Owned here with the constant so the GitHub
+ * adapter keeps no per-label knowledge.
+ */
+export const LABEL_MASTER_TRIAGE_CREATE = {
+  color: "1D76DB",
+  description: "Queued for master escalation — the daemon is adjudicating, no human action needed",
+} as const;
 
 /**
  * The paused/stuck states the backlog read model groups for operator attention (issue
@@ -94,6 +116,9 @@ export const PAUSED_LABELS: readonly string[] = [
   ...BACKLOG_PAUSED_STATES,
   LABEL_AWAITING_MERGE,
   LABEL_AWAITING_CI,
+  // Queued for / undergoing master escalation (ADR-0041): the master queue owns it, so a
+  // fresh impl must never race it. Not a human-attention state — see the constant.
+  LABEL_MASTER_TRIAGE,
 ];
 
 /** Whether a label takes an issue out of admission (any {@link PAUSED_LABELS}). */
@@ -172,4 +197,32 @@ export function readTier(labels: string[]): ComplexityTier | null {
 /** The GitHub label for a complexity tier, the inverse of {@link readTier}. */
 export function tierLabelFor(tier: ComplexityTier): string {
   return tier === 1 ? LABEL_COMPLEXITY_1 : tier === 2 ? LABEL_COMPLEXITY_2 : LABEL_COMPLEXITY_3;
+}
+
+/** Every complexity label, in tier order — the set a promotion reconciles against. */
+export const COMPLEXITY_LABELS: readonly string[] = [
+  LABEL_COMPLEXITY_1,
+  LABEL_COMPLEXITY_2,
+  LABEL_COMPLEXITY_3,
+];
+
+/**
+ * The **atomic** label patch that promotes an issue to complexity tier 1 on its first
+ * master escalation (ADR-0041). One patch — remove every *other* complexity label, add
+ * `complexity:1` — so an issue can never be observed carrying two tiers mid-promotion, and
+ * a duplicate-labelled issue (`complexity:2` + `complexity:3`) converges on exactly one.
+ * Pure and idempotent: an issue already on `complexity:1` alone yields an empty patch, so
+ * a second (or restart-replayed) promotion writes nothing. The promotion is **permanent**
+ * — nothing in the daemon demotes a tier.
+ */
+export function promoteToTierOnePatch(labels: readonly string[]): { remove: string[]; add: string[] } {
+  const remove = COMPLEXITY_LABELS.filter((l) => l !== LABEL_COMPLEXITY_1 && labels.includes(l));
+  const add = labels.includes(LABEL_COMPLEXITY_1) ? [] : [LABEL_COMPLEXITY_1];
+  return { remove, add };
+}
+
+/** Whether {@link promoteToTierOnePatch} would change anything (i.e. the issue is not yet tier-1-only). */
+export function needsTierOnePromotion(labels: readonly string[]): boolean {
+  const patch = promoteToTierOnePatch(labels);
+  return patch.remove.length > 0 || patch.add.length > 0;
 }

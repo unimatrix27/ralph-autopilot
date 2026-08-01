@@ -249,6 +249,18 @@ export function classifyIssueState(s: IssueSnapshot): Classification {
         ? { kind: "in-flight" }
         : { kind: "anomaly", reason: "non-terminal-run-on-closed-issue" };
 
+    case "master-triage":
+      // Queued for (or undergoing) master escalation (ADR-0041). The master queue services
+      // it every tick — before fresh admission, on the ordinary cap, globally serialized —
+      // so the daemon IS acting on it: in-flight in the completeness sense even while it
+      // waits for the master lease or a slot. Deliberately not `awaiting-human`: nothing
+      // here waits on an operator, and reporting it as attention would page a human for
+      // work the daemon is actively doing. A closed issue under it is the same island as
+      // any other non-terminal run — surfaced + swept.
+      return open
+        ? { kind: "in-flight" }
+        : { kind: "anomaly", reason: "non-terminal-run-on-closed-issue" };
+
     case "awaiting-merge":
       // Queued for (or undergoing) the single-concurrency integration flow
       // (ADR-0017). The merge worker leases it every tick, independent of the
