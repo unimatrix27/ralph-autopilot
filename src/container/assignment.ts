@@ -37,7 +37,7 @@ export interface Assignment {
    * the cloner uses it to clone the head branch directly (the code under review already lives
    * there) rather than forking a fresh WIP branch off base.
    */
-  kind?: "impl" | "review" | "fix";
+  kind?: "impl" | "review" | "fix" | "master";
   /** The target issue this run implements. */
   issueNumber: number;
   /** The implementation path (`tdd` default, `infra`). */
@@ -69,6 +69,17 @@ export interface Assignment {
    * `agent.*` globals apply, exactly as before.
    */
   profile?: SessionProfile;
+  /**
+   * What an in-session `escalate` MEANS for this run (ADR-0041). `human` (the default when
+   * absent, and what every pre-ADR-0041 runner does) → the runner publishes the
+   * `ralph-question` itself, runner-direct. `master` → the worker's escalation is an
+   * **internal** escalation: the runner pushes WIP and RELAYS the question, and the daemon
+   * queues a master triage request instead. Never additively tolerated: a runner that ignores
+   * this field would post a human question the daemon never asked, so the daemon gates the
+   * master path on the declared `master-escalation` capability and refuses to dispatch
+   * otherwise (see {@link import("./capabilities").assertRunnerSupports}).
+   */
+  escalationMode?: "human" | "master";
 }
 
 /**

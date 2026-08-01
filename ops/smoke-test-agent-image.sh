@@ -31,10 +31,30 @@ restore="$(field restore)"; test_cmd="$(field test)"; base="$(field baseBranch)"
 : "${base:?smoke-test: missing 'baseBranch' in agent.yaml}"
 
 tag="ralph/smoke/$(basename "$target_dir"):latest"
-echo "==> [1/2] build $tag  (-f .ralph/agent.Dockerfile)"
+echo "==> [1/3] build $tag  (-f .ralph/agent.Dockerfile)"
 docker build -f "$dockerfile" -t "$tag" "$target_dir"
 
-echo "==> [2/2] clone -> restore -> test in-container  (base=$base)"
+# The runner CAPABILITY contract (ADR-0041). A target image inherits the L0 base's
+# `io.ralph.runner-capabilities` label; the daemon refuses a master-escalation dispatch into an
+# image that does not declare `master-escalation`, so an image built FROM a stale base must fail
+# HERE — at onboarding — rather than mid-run as a generic no-result cascade.
+echo "==> [2/3] runner capability label"
+caps="$(docker image inspect --format '{{ index .Config.Labels "io.ralph.runner-capabilities" }}' "$tag" 2>/dev/null || true)"
+echo "    declares: ${caps:-(nothing)}"
+for required in impl review-fix runner-direct-escalate master-escalation; do
+  case ",$caps," in
+    *",$required,"*) ;;
+    *)
+      echo "smoke-test: image $tag does not declare runner capability '$required'." >&2
+      echo "            Rebuild ralph/agent-base (./docker/agent-base/build.sh) and bump the" >&2
+      echo "            target's .ralph/agent.Dockerfile FROM tag — see" >&2
+      echo "            docs/runbooks/container-image-refresh.md." >&2
+      exit 1
+      ;;
+  esac
+done
+
+echo "==> [3/3] clone -> restore -> test in-container  (base=$base)"
 # Override the runner entrypoint with a shell that reproduces the L3 fresh-clone + the contract's
 # restore/test, exactly as an agent run would, but with no GitHub round-trip. `--init` mirrors the
 # real runner (docker-runner.ts): a PID-1 reaper so process-group kills don't leave zombies (#213).

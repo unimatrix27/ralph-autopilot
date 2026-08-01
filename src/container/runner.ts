@@ -105,6 +105,15 @@ export interface RunnerEscalationInput {
  */
 export interface RunnerEscalation {
   publish(input: RunnerEscalationInput): Promise<{ commentId: number; prNumber?: number }>;
+  /**
+   * The **master-escalation** half (ADR-0041): make the WIP durable (push the branch, ensure the
+   * draft PR) and post **nothing**. Under `escalationMode: "master"` the worker's question is
+   * relayed to the daemon, which owns everything that follows — the tier-1 promotion, the durable
+   * `ralph-master-request` comment, and the queue fact. Splitting it from {@link publish} rather
+   * than adding a flag keeps the invariant readable at the call site: this method cannot post a
+   * `ralph-question` because it has no code path that does.
+   */
+  checkpoint(input: RunnerEscalationInput): Promise<{ prNumber?: number }>;
 }
 
 /** What the runner-direct no-PR salvage needs to land a clean session's work (issue #3061). */
@@ -327,8 +336,18 @@ async function runImplSession(
     workspacePath,
     transcriptSink,
     onRateLimit,
+    // ADR-0041: under `escalationMode: "master"` an `escalate` is an INTERNAL escalation to the
+    // master, not a human question. The runner still makes the WIP durable — the master's first
+    // move is to read the diff — but it posts NO `ralph-question`: it relays the question and the
+    // daemon queues the master triage request (promotion, durable request comment, the fact).
+    // Only the master's own `ask_human` may create a human question.
     onEscalate: publisher
       ? async (question) => {
+          if (assignment.escalationMode === "master") {
+            const published = await publisher.checkpoint({ assignment, question, workspacePath });
+            escalation = { question, commentId: 0, ...published };
+            return;
+          }
           // Push WIP + post the ralph-question straight to GitHub. This is the load-bearing
           // work (it lands the escalation); the terminal frame below is just the daemon's hint.
           const published = await publisher.publish({ assignment, question, workspacePath });

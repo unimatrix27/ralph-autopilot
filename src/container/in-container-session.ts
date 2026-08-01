@@ -540,6 +540,25 @@ export function createRunnerEscalation(config: RunnerEscalationConfig): RunnerEs
       }
       return prNumber !== undefined ? { commentId, prNumber } : { commentId };
     },
+
+    /**
+     * The master-escalation checkpoint (ADR-0041): steps 1–2 of {@link publish} and **not** step
+     * 3. The WIP is pushed and the draft PR ensured so the master has a diff to read, but no
+     * `ralph-question` is posted — the daemon queues a master triage request from the relayed
+     * question instead. This method has no comment-posting path at all, which is the point:
+     * the "only the master creates a human question" invariant is structural here, not a flag.
+     */
+    async checkpoint(input: RunnerEscalationInput): Promise<{ prNumber?: number }> {
+      const { assignment, question, workspacePath } = input;
+      runGit(["add", "-A"], workspacePath);
+      runGit(
+        ["commit", "-m", `[WIP] #${assignment.issueNumber} checkpoint (master escalation)`, "--allow-empty"],
+        workspacePath,
+      );
+      runGit(["push", "--set-upstream", "origin", assignment.branch], workspacePath);
+      const prNumber = ensureDraftPr(runGh, config.repo, host, assignment, question);
+      return prNumber !== undefined ? { prNumber } : {};
+    },
   };
 }
 

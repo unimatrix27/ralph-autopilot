@@ -88,6 +88,15 @@ RUN codebase-memory-mcp config set auto_index true
 RUN npm exec --yes --package=@morphllm/morphmcp -- node -e "process.exit(0)" \
  && npm exec --yes --package=@upstash/context7-mcp -- node -e "process.exit(0)"
 
+# The runner build's declared CAPABILITIES (ADR-0041). The daemon reads this label before
+# dispatching anything that a stale runner would mis-serve — notably `escalationMode: "master"`,
+# which an older runner would ignore and then post a human question the daemon never asked for.
+# Declared as both a label (daemon-side `docker inspect` probe) and an env var (the runner's own
+# self-report), kept in step with `CURRENT_RUNNER_CAPABILITIES` in src/container/capabilities.ts
+# by the shipped-contracts test. Additive: add a name here when the runner learns a new trick.
+LABEL io.ralph.runner-capabilities="impl,review-fix,runner-direct-escalate,master-escalation"
+ENV RALPH_RUNNER_CAPABILITIES="impl,review-fix,runner-direct-escalate,master-escalation"
+
 # The in-container runner entrypoint. Reads its dispatch from $RALPH_CONTAINER_DISPATCH; with it
 # unset it prints a clear error and exits 1.
 ENTRYPOINT ["node", "/app/dist/bin/ralph-runner.js"]
