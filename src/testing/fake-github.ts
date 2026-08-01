@@ -5,23 +5,62 @@
  * can assert "no double pickup" and "ready-for-agent removed on pickup".
  */
 
+import { refKey, sameRef } from "../github/ref";
 import type {
   AwaitChecksOptions,
   ChecksResult,
   ChecksSnapshot,
   DraftPullRequest,
   GitHubClient,
+  HierarchyNode,
+  HierarchyRead,
+  InaccessibleReason,
   Issue,
+  IssueContentRead,
+  IssueRef,
+  IssueState,
   LabelPatch,
   MergeMethod,
   MergeOptions,
   MergeStatusSnapshot,
+  ParentEdge,
   PrComment,
   PullRequest,
 } from "../github/types";
 
 export interface SeedIssue extends Partial<Omit<Issue, "number">> {
   number: number;
+}
+
+/** A node in the fake's native parent/sub-issue graph (ADR-0040). */
+export interface SeedHierarchyNode {
+  ref: IssueRef;
+  /** GitHub's global node id; derived from the ref when omitted. */
+  id?: string;
+  title?: string;
+  state?: IssueState;
+  body?: string;
+}
+
+/** Which reads a {@link FakeGitHub.seedInaccessible} marker applies to. */
+export interface InaccessibleSurfaces {
+  /** Fail {@link FakeGitHub.readIssueHierarchy} for this node (default `true`). */
+  hierarchy?: boolean;
+  /** Fail {@link FakeGitHub.readIssueContent} for this node (default `true`). */
+  content?: boolean;
+}
+
+interface FakeNode {
+  ref: IssueRef;
+  id: string;
+  title: string;
+  state: IssueState;
+  body: string;
+}
+
+/** The compact (body-less) projection of a seeded node the hierarchy reads return. */
+function toHierarchyNode(node: FakeNode): HierarchyNode {
+  return { ref: { ...node.ref }, id: node.id, title: node.title, state: node.state };
 }
 
 /** A recorded direct merge, for assertions. */
@@ -32,6 +71,8 @@ export interface RecordedMerge {
 }
 
 export class FakeGitHub implements GitHubClient {
+  /** The repo this client is bound to — the "local" side of a cross-repo hierarchy. */
+  readonly repo: string;
   readonly issues = new Map<number, Issue>();
   readonly pulls: PullRequest[] = [];
   /** Dependency issue numbers considered closed-with-merged-PR. */
@@ -70,8 +111,29 @@ export class FakeGitHub implements GitHubClient {
   private readonly mergeStatusQueue = new Map<number, MergeStatusSnapshot[]>();
   /** PR numbers, in order, that {@link readMergeStatus} was read for (one per merge poll). */
   readonly mergeStatusReads: number[] = [];
+  /** Comment bodies edited in place via {@link updateComment}, for assertions. */
+  readonly updatedComments: Array<{ id: number; body: string }> = [];
+  /** Refs, in order, that {@link readIssueHierarchy} was asked for. */
+  readonly hierarchyReads: IssueRef[] = [];
+  /** Refs, in order, that {@link readIssueContent} fetched — proves what pass two paid for. */
+  readonly contentReads: IssueRef[] = [];
+  /** The native hierarchy graph: node key → node. */
+  private readonly nodes = new Map<string, FakeNode>();
+  /** The native parent edge: child key → parent ref. */
+  private readonly parents = new Map<string, IssueRef>();
+  /** Nodes that fail to read, and on which surfaces. */
+  private readonly inaccessible = new Map<
+    string,
+    { reason: InaccessibleReason; hierarchy: boolean; content: boolean }
+  >();
+  /** Comment threads on nodes outside {@link repo} (local ones live in `comments`). */
+  private readonly foreignComments = new Map<string, PrComment[]>();
   private nextPrNumber = 1001;
   private nextCommentId = 5001;
+
+  constructor(repo = "owner/repo") {
+    this.repo = repo;
+  }
 
   seed(seed: SeedIssue): Issue {
     const issue: Issue = {
@@ -187,10 +249,11 @@ export class FakeGitHub implements GitHubClient {
     // REST PATCH the real client makes. Editing an id that does not exist is a fault
     // (the loop only ever edits an id it just posted or recovered from the PR), so
     // surface it rather than silently no-op.
-    for (const list of this.comments.values()) {
+    for (const list of [...this.comments.values(), ...this.foreignComments.values()]) {
       const comment = list.find((c) => c.id === commentId);
       if (comment) {
         comment.body = body;
+        this.updatedComments.push({ id: commentId, body });
         return;
       }
     }
@@ -276,6 +339,170 @@ export class FakeGitHub implements GitHubClient {
 
   async isDependencySatisfied(issueNumber: number): Promise<boolean> {
     return this.satisfiedDeps.has(issueNumber);
+  }
+
+  // ---- native issue hierarchy + cross-repo nodes (ADR-0040) ---------------
+
+  async readIssueHierarchy(ref: IssueRef): Promise<HierarchyRead> {
+    this.hierarchyReads.push({ ...ref });
+    const blocked = this.inaccessible.get(refKey(ref));
+    if (blocked?.hierarchy) {
+      return { kind: "inaccessible", ref: { ...ref }, reason: blocked.reason };
+    }
+    const node = this.nodeFor(ref);
+    if (!node) {
+      return { kind: "inaccessible", ref: { ...ref }, reason: "deleted" };
+    }
+    return {
+      kind: "node",
+      node: toHierarchyNode(node),
+      parent: this.parentEdge(ref),
+      children: this.childrenOf(ref),
+    };
+  }
+
+  async readIssueContent(ref: IssueRef): Promise<IssueContentRead> {
+    this.contentReads.push({ ...ref });
+    const blocked = this.inaccessible.get(refKey(ref));
+    if (blocked?.content) {
+      return { kind: "inaccessible", ref: { ...ref }, reason: blocked.reason };
+    }
+    const node = this.nodeFor(ref);
+    if (!node) {
+      return { kind: "inaccessible", ref: { ...ref }, reason: "deleted" };
+    }
+    return {
+      kind: "content",
+      node: toHierarchyNode(node),
+      body: node.body,
+      comments: this.commentsOn(ref).map((c) => ({ ...c })),
+    };
+  }
+
+  async postNodeComment(ref: IssueRef, body: string): Promise<{ id: number }> {
+    if (ref.repo === this.repo) {
+      return this.postComment(ref.number, body);
+    }
+    const comment: PrComment = { id: this.nextCommentId++, author: "ralph-autopilot", body };
+    const existing = this.foreignComments.get(refKey(ref)) ?? [];
+    existing.push(comment);
+    this.foreignComments.set(refKey(ref), existing);
+    return { id: comment.id };
+  }
+
+  async updateNodeComment(_ref: IssueRef, commentId: number, body: string): Promise<void> {
+    await this.updateComment(commentId, body);
+  }
+
+  /** Test helper: seed one node of the native hierarchy graph. */
+  seedNode(seed: SeedHierarchyNode): void {
+    this.nodes.set(refKey(seed.ref), {
+      ref: { ...seed.ref },
+      id: seed.id ?? `I_${refKey(seed.ref)}`,
+      title: seed.title ?? `Issue ${seed.ref.number}`,
+      state: seed.state ?? "OPEN",
+      body: seed.body ?? "",
+    });
+  }
+
+  /**
+   * Test helper: seed GitHub's **native** parent edge (the only hierarchy
+   * authority). Pointing at a ref that was never seeded models a deleted parent.
+   */
+  seedParent(child: IssueRef, parent: IssueRef): void {
+    this.parents.set(refKey(child), { ...parent });
+  }
+
+  /** Test helper: make a node unreadable — a deleted, private, or faulting node. */
+  seedInaccessible(
+    ref: IssueRef,
+    reason: InaccessibleReason,
+    surfaces: InaccessibleSurfaces = {},
+  ): void {
+    this.inaccessible.set(refKey(ref), {
+      reason,
+      hierarchy: surfaces.hierarchy ?? true,
+      content: surfaces.content ?? true,
+    });
+  }
+
+  /** Test helper: seed a comment on any (possibly cross-repo) node. */
+  seedNodeComment(ref: IssueRef, comment: Omit<PrComment, "id">): PrComment {
+    const full: PrComment = { id: this.nextCommentId++, ...comment };
+    if (ref.repo === this.repo) {
+      const existing = this.comments.get(ref.number) ?? [];
+      existing.push(full);
+      this.comments.set(ref.number, existing);
+      return full;
+    }
+    const existing = this.foreignComments.get(refKey(ref)) ?? [];
+    existing.push(full);
+    this.foreignComments.set(refKey(ref), existing);
+    return full;
+  }
+
+  /** Test helper: the comment bodies currently on a node, oldest first. */
+  nodeCommentBodies(ref: IssueRef): string[] {
+    return this.commentsOn(ref).map((c) => c.body);
+  }
+
+  /** The comment thread backing a node — local threads share the `comments` map. */
+  private commentsOn(ref: IssueRef): PrComment[] {
+    return (
+      (ref.repo === this.repo ? this.comments.get(ref.number) : this.foreignComments.get(refKey(ref))) ?? []
+    );
+  }
+
+  /**
+   * The node behind a ref: an explicitly seeded hierarchy node, else a local
+   * {@link seed}ed issue lifted into the graph, else absent (deleted).
+   */
+  private nodeFor(ref: IssueRef): FakeNode | null {
+    const seeded = this.nodes.get(refKey(ref));
+    if (seeded) {
+      return seeded;
+    }
+    const issue = ref.repo === this.repo ? this.issues.get(ref.number) : undefined;
+    return issue
+      ? {
+          ref: { ...ref },
+          id: `I_${refKey(ref)}`,
+          title: issue.title,
+          state: issue.state,
+          body: issue.body,
+        }
+      : null;
+  }
+
+  /** The native parent edge of a node, with an unreadable parent reported as such. */
+  private parentEdge(ref: IssueRef): ParentEdge {
+    const parent = this.parents.get(refKey(ref));
+    if (!parent) {
+      return { kind: "none" };
+    }
+    const blocked = this.inaccessible.get(refKey(parent));
+    if (blocked?.hierarchy) {
+      return { kind: "inaccessible", reason: blocked.reason, ref: { ...parent } };
+    }
+    const node = this.nodeFor(parent);
+    return node
+      ? { kind: "node", node: toHierarchyNode(node) }
+      : { kind: "inaccessible", reason: "deleted", ref: { ...parent } };
+  }
+
+  /** The node's native sub-issues, in seeding order (the mapper sorts them). */
+  private childrenOf(ref: IssueRef): HierarchyNode[] {
+    const children: HierarchyNode[] = [];
+    for (const [childKey, parent] of this.parents) {
+      if (!sameRef(parent, ref)) {
+        continue;
+      }
+      const node = this.nodes.get(childKey);
+      if (node) {
+        children.push(toHierarchyNode(node));
+      }
+    }
+    return children;
   }
 
   /** Test helper: simulate the impl agent opening a PR from `branch`. */

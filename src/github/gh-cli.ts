@@ -12,19 +12,26 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createLogger, type Logger } from "../log/logger";
+import { splitRepo } from "./ref";
 import type {
   AwaitChecksOptions,
   ChecksResult,
   ChecksSnapshot,
   DraftPullRequest,
   GitHubClient,
+  HierarchyNode,
+  HierarchyRead,
+  InaccessibleReason,
   Issue,
+  IssueContentRead,
+  IssueRef,
   IssueState,
   LabelPatch,
   LabelCreateOptions,
   MergeOptions,
   MergeStateStatus,
   MergeStatusSnapshot,
+  ParentEdge,
   PrComment,
   PullRequest,
   PullRequestState,
@@ -268,6 +275,157 @@ export function commentIdFromUrl(url: string | undefined): number {
 
 function toIssueState(raw: string | undefined): IssueState {
   return raw && raw.toUpperCase() === "CLOSED" ? "CLOSED" : "OPEN";
+}
+
+// ---- native issue hierarchy (ADR-0040) -----------------------------------
+
+/**
+ * How many sub-issues one hierarchy read requests. The compact map caps its own
+ * listing well below this; a node with more sub-issues than this reports the ones
+ * GitHub returned first rather than paginating on the hot path.
+ */
+const SUB_ISSUE_PAGE_SIZE = 100;
+
+/**
+ * The one GraphQL query pass one makes per level: the node, its **native** parent,
+ * and its **native** sub-issues. REST has no parent field, and `gh issue view` does
+ * not expose the sub-issue graph — GraphQL is the only surface that answers
+ * "who is this issue's parent?" authoritatively, and it answers cross-repo
+ * (`repository { nameWithOwner }` on every node) in the same call.
+ */
+const HIERARCHY_QUERY = `query($owner:String!,$name:String!,$number:Int!,$children:Int!){
+  repository(owner:$owner,name:$name){
+    issue(number:$number){
+      id number title state
+      repository{ nameWithOwner }
+      parent{ id number title state repository{ nameWithOwner } }
+      subIssues(first:$children){ totalCount nodes{ id number title state repository{ nameWithOwner } } }
+    }
+  }
+}`;
+
+/** One issue node as GitHub's GraphQL returns it. */
+interface RawGraphQlNode {
+  id?: string;
+  number?: number;
+  title?: string;
+  state?: string;
+  repository?: { nameWithOwner?: string } | null;
+}
+
+interface RawGraphQlIssue extends RawGraphQlNode {
+  parent?: RawGraphQlNode | null;
+  subIssues?: { totalCount?: number; nodes?: Array<RawGraphQlNode | null> | null } | null;
+}
+
+interface RawGraphQlError {
+  type?: string;
+  message?: string;
+  path?: Array<string | number>;
+}
+
+/**
+ * Classify a GitHub failure (a GraphQL error, or gh's stderr) into the reason a
+ * node is inaccessible. Pure, so the mapping is unit-tested without a network.
+ * Fails to `error` — the conservative bucket — rather than guessing `deleted`,
+ * because "the node is gone" and "I may not look" are different facts to a human
+ * adjudicating a broken hierarchy.
+ */
+export function classifyInaccessible(text: string): InaccessibleReason {
+  const t = text.toLowerCase();
+  if (/could not resolve to|not_found|no issue found|not found/.test(t)) {
+    return "deleted";
+  }
+  if (/not accessible|forbidden|permission|must have|bad credentials|unauthorized|401|403/.test(t)) {
+    return "unauthorized";
+  }
+  return "error";
+}
+
+function graphQlNode(raw: RawGraphQlNode | null | undefined, fallbackRepo: string): HierarchyNode | null {
+  if (!raw || typeof raw.number !== "number") {
+    return null;
+  }
+  return {
+    ref: { repo: raw.repository?.nameWithOwner ?? fallbackRepo, number: raw.number },
+    id: raw.id ?? "",
+    title: raw.title ?? "",
+    state: toIssueState(raw.state),
+  };
+}
+
+/**
+ * Turn one `gh api graphql` payload into a {@link HierarchyRead} (pure). The
+ * load-bearing case is the *absence* of an issue: a missing node with errors is
+ * classified from those errors, and a masked `parent` — GitHub reporting an error
+ * on the `parent` path rather than a node — becomes an explicit `inaccessible`
+ * edge, never `{ kind: "none" }`. Only a genuinely null parent with no error on
+ * that path is "this node has no parent".
+ */
+export function parseHierarchyResponse(out: string, ref: IssueRef): HierarchyRead {
+  let payload: { data?: { repository?: { issue?: RawGraphQlIssue | null } | null } | null; errors?: RawGraphQlError[] };
+  try {
+    payload = JSON.parse(out) as typeof payload;
+  } catch {
+    return { kind: "inaccessible", ref, reason: "error", detail: "unparseable gh api graphql output" };
+  }
+  const errors = payload.errors ?? [];
+  const issue = payload.data?.repository?.issue;
+  if (!issue) {
+    const detail = errors.map((e) => e.message ?? e.type ?? "").join("; ");
+    return {
+      kind: "inaccessible",
+      ref,
+      reason: classifyInaccessible(detail),
+      ...(detail ? { detail } : {}),
+    };
+  }
+  const node = graphQlNode(issue, ref.repo);
+  if (!node) {
+    return { kind: "inaccessible", ref, reason: "error", detail: "issue payload carried no number" };
+  }
+  const children = (issue.subIssues?.nodes ?? [])
+    .map((c) => graphQlNode(c, node.ref.repo))
+    .filter((c): c is HierarchyNode => c !== null);
+  const total = issue.subIssues?.totalCount;
+  return {
+    kind: "node",
+    node,
+    parent: parseParentEdge(issue, errors, node.ref.repo),
+    children,
+    ...(typeof total === "number" ? { childCount: total } : {}),
+  };
+}
+
+/**
+ * The parent edge, erring **towards inaccessible**. A null `parent` only means
+ * "absolute root" when the response is otherwise clean: GitHub returns partial data
+ * with a null field for a masked parent, and its error entry is not reliably pathed
+ * at `parent` (a `RATE_LIMITED` or `MAX_NODE_LIMIT_EXCEEDED` error carries no path at
+ * all). Treating any errored response's null parent as `none` is exactly how a
+ * transient rate-limit would manufacture a false root and plant an initiative-scoped
+ * decision on the wrong node — so a null parent alongside *any* error fails closed.
+ */
+function parseParentEdge(
+  issue: RawGraphQlIssue,
+  errors: readonly RawGraphQlError[],
+  fallbackRepo: string,
+): ParentEdge {
+  const parent = graphQlNode(issue.parent, fallbackRepo);
+  if (parent) {
+    return { kind: "node", node: parent };
+  }
+  if (errors.length === 0) {
+    return { kind: "none" };
+  }
+  const pathed = errors.filter((e) => (e.path ?? []).includes("parent"));
+  const relevant = pathed.length > 0 ? pathed : errors;
+  const detail = relevant.map((e) => e.message ?? e.type ?? "").join("; ");
+  return {
+    kind: "inaccessible",
+    reason: classifyInaccessible(detail),
+    ...(detail ? { detail } : {}),
+  };
 }
 
 function toPullState(raw: string): PullRequestState {
@@ -813,5 +971,103 @@ export class GhCliClient implements GitHubClient {
       return true;
     }
     return false;
+  }
+
+  // ---- native issue hierarchy + cross-repo nodes (ADR-0040) ---------------
+
+  async readIssueHierarchy(ref: IssueRef): Promise<HierarchyRead> {
+    const { owner, name } = splitRepo(ref.repo);
+    // `gh api graphql` exits non-zero when the payload carries `errors`, yet still
+    // writes the body we need (partial data + the error list). Read it tolerantly and
+    // classify — a permissions failure must surface as `unauthorized`, never as a
+    // thrown fault that a climb could mistake for "no parent".
+    const out = await this.ghAllowFail([
+      "api",
+      "graphql",
+      // `-f` sends a raw string (the `String!` variables), `-F` a typed literal (the
+      // `Int!` ones). Using `-F` for a repo name would let gh coerce an owner literally
+      // called `true`/`42` into the wrong JSON type.
+      "-f",
+      `query=${HIERARCHY_QUERY}`,
+      "-f",
+      `owner=${owner}`,
+      "-f",
+      `name=${name}`,
+      "-F",
+      `number=${ref.number}`,
+      "-F",
+      `children=${SUB_ISSUE_PAGE_SIZE}`,
+    ]);
+    if (out.trim().length === 0) {
+      return { kind: "inaccessible", ref, reason: "error", detail: "gh api graphql returned nothing" };
+    }
+    return parseHierarchyResponse(out, ref);
+  }
+
+  async readIssueContent(ref: IssueRef): Promise<IssueContentRead> {
+    // Cross-repo capable by construction: `--repo` comes off the ref, so a node in
+    // another repository costs exactly the same one call as a local one.
+    let out: string;
+    try {
+      out = await this.gh([
+        "issue",
+        "view",
+        String(ref.number),
+        "--repo",
+        ref.repo,
+        "--json",
+        "id,number,title,body,state,comments",
+      ]);
+    } catch (err) {
+      const detail = `${(err as { stderr?: string } | null)?.stderr ?? ""} ${String(err)}`.trim();
+      return { kind: "inaccessible", ref, reason: classifyInaccessible(detail), detail };
+    }
+    let raw: { id?: string; title?: string; body?: string; state?: string; comments?: RawComment[] };
+    try {
+      raw = JSON.parse(out) as typeof raw;
+    } catch {
+      return { kind: "inaccessible", ref, reason: "error", detail: "unparseable gh issue view output" };
+    }
+    return {
+      kind: "content",
+      node: {
+        ref,
+        id: raw.id ?? "",
+        title: raw.title ?? "",
+        state: toIssueState(raw.state),
+      },
+      body: raw.body ?? "",
+      comments: (raw.comments ?? []).map((c, i) => ({
+        id: commentIdFromUrl(c.url) || i,
+        author: c.author?.login ?? "",
+        body: c.body ?? "",
+      })),
+    };
+  }
+
+  async postNodeComment(ref: IssueRef, body: string): Promise<{ id: number }> {
+    const out = await this.gh([
+      "issue",
+      "comment",
+      String(ref.number),
+      "--repo",
+      ref.repo,
+      "--body",
+      body,
+    ]);
+    return { id: commentIdFromUrl(out.trim()) };
+  }
+
+  async updateNodeComment(ref: IssueRef, commentId: number, body: string): Promise<void> {
+    // Same REST PATCH as {@link updateComment}, but against the node's own repo so
+    // the derived index on a cross-repo root can be kept current.
+    await this.gh([
+      "api",
+      "--method",
+      "PATCH",
+      `/repos/${ref.repo}/issues/comments/${commentId}`,
+      "-f",
+      `body=${body}`,
+    ]);
   }
 }

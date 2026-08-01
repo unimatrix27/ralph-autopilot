@@ -185,6 +185,68 @@ ingests. It round-trips through the same shared fenced-payload codec as
 `ralph-question`. _Avoid_: review comment, worklist comment (when you mean this
 specific format).
 
+**Issue hierarchy / ancestor path**:
+GitHub's **native** parent/sub-issue graph — the *only* hierarchy authority here
+(ADR-0040). Depth is unbounded by product semantics: there is no "epic level", and
+prose headings ("epic", "master epic", "wayfinder") carry no structural meaning,
+because a human writes them at whatever depth they feel like. The **ancestor path**
+is root→issue, root-most first; the **absolute root** is a node GitHub itself reports
+as parentless — nothing else may be called one. A cycle, an over-ceiling chain, a
+deleted parent, and an unauthorized parent are each their own typed outcome, so a
+climb that fails is never mistaken for a climb that reached the top.
+_Avoid_: epic, master epic, wayfinder, level (as structure); parent link (when you
+mean the native edge).
+
+**Hierarchy map**:
+Pass one of the zoom-out: the *compact* relationship map — the ancestor path plus
+each path node's children, carrying ref/id/title/state and **no bodies**. Its job is
+to make sibling branches visible for one line's cost, so pass two can choose what to
+pay to read.
+_Avoid_: tree, graph dump, issue index.
+
+**Context packet**:
+Pass two's output: a deterministic, character-budgeted bundle of the [[hierarchy-map]]
+plus the fetched bodies/comments/linked design references for the nodes it selected
+(origin, ancestors, direct children, explicit extras). Deterministic across the order
+GitHub returns children, and explicit about what the budget trimmed and what it
+dropped. A sibling's body enters a packet only when something asks for it by name.
+_Avoid_: context blob, prompt context, dump.
+
+**Decision ledger**:
+The durable, cross-run memory a fresh master session reads instead of a conversation
+(ADR-0040). Canonical records are **append-only** `ralph-decision` fenced comments;
+a later record *supersedes* an earlier one **by id** (never by recency), and the old
+comment is never edited. An issue's active ledger is the fold along its root→issue
+path.
+_Avoid_: memory, history, conversation log, knowledge base.
+
+**Decision scope (issue / subtree / initiative)**:
+How far one decision reaches, and therefore which node stores it — always the
+**narrowest** node matching the scope: `issue` → the issue itself, `subtree` → the
+subtree root it governs, `initiative` → the absolute root. Inheritance falls out of
+the hierarchy rather than a rule: a descendant loads what its ancestor path carries,
+so a sibling subtree's decisions are simply not on the path.
+_Avoid_: global, local, project-wide.
+
+**ralph-decision / ralph-decision-index**:
+The two decision-ledger comment formats, both through the shared fenced-payload codec.
+`ralph-decision` is the canonical, append-only record (decision, rationale,
+constraints, rejected alternatives, affected nodes/paths, evidence, provenance,
+optional `supersedes`). `ralph-decision-index` is **one** daemon-managed, *derived*
+comment on the absolute root listing active decisions with source links — a view for
+discoverability, regenerated from the records, byte-identical on an unchanged ledger,
+and safe to delete. It is **not authoritative**.
+_Avoid_: decision doc, summary comment (when you mean the index); treating the index
+as a source of truth.
+
+**Fail closed (ledger)**:
+Two active records claiming one decision key with no supersession between them do not
+resolve to a winner — the key drops out of the active fold and both claims surface
+with their node and comment id for a later master or human to adjudicate. Likewise a
+fenced-but-malformed record is a diagnostic, never state. Guessing here would pick an
+architecture on a timestamp.
+_Avoid_: last-writer-wins, merge the decisions.
+
 **Stakes**:
 The required field on every escalation that translates a technical decision *up a
 level* — its architecture-level and user-facing consequences — so the operator can

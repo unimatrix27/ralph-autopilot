@@ -538,3 +538,85 @@ Off by default (`selfUpdate.enabled: false`); a bare daemon that exits 75 with n
 supervisor simply stops. A forced (timeout) restart is safe: startup rehydration
 re-derives in-flight runs from GitHub ([ADR-0003](adr/0003-reconciler-poll.md), §1/§7),
 so nothing is abandoned. Operator runbook: [SELF-UPDATE.md](SELF-UPDATE.md).
+
+## 12. Master-escalation foundation — native hierarchy zoom-out + decision ledger (issue #41)
+
+Every agent so far reasons from **one issue and one run**. That is right for a
+worker and wrong for the high-tier *master escalation* agent later slices need: one
+that can see where an issue sits in a programme and what has already been decided
+above it, from a fresh session, with no conversational memory. This section is the
+substrate for that — it changes no existing behaviour ([ADR-0040](adr/0040-native-hierarchy-and-decision-ledger.md)).
+
+**The hierarchy is GitHub's native parent/sub-issue graph, and nothing else.**
+Depth is unbounded by product semantics: there is no "epic level", and a prose
+heading ("epic", "master epic", "wayfinder") is how a human *narrates* structure, not
+a contract — the word lands at whatever depth the author felt like and drifts as
+tickets are re-parented. `readIssueHierarchy` reads the graph through GraphQL
+(`Issue.parent`, `Issue.subIssues`), the only surface that answers "who is this
+issue's parent?", and every node carries its own `repository { nameWithOwner }`, so a
+cross-repository hierarchy is represented rather than flattened. Because issue
+numbers collide across repos, every surface here keys on `IssueRef`
+(`owner/repo` + number), not a bare number.
+
+**Never a false root** (`src/hierarchy/map.ts`). `RootResolution` has exactly one
+variant meaning "this is the absolute root", reached only when GitHub itself reports
+no parent. A **cycle**, an **over-ceiling** chain (`HIERARCHY_DEPTH_CEILING` = 32, a
+technical safety stop that names the ancestor it stopped before — never a silent
+truncation), a **deleted** parent, and an **unauthorized** parent are each their own
+typed outcome. This is load-bearing rather than tidy: an unreadable parent collapsed
+into "no parent" would plant an initiative-scoped decision, or the root index, on a
+node that merely looked like the top. Callers that need the root go through
+`absoluteRoot(map)` and fail closed on `null`.
+
+**Context assembly is two-pass and budgeted** (`src/hierarchy/context-packet.ts`).
+Pass one builds the compact map from body-less reads, so every sibling branch is
+*visible* for one line's cost. Pass two fetches bodies and comments only for the
+nodes it selects — origin, ancestors nearest-first, direct children, plus explicit
+extras — so a sibling's body enters a packet only when something asks for it by name.
+The budget is a plain **character** count (tokenizer-independent, so it means the
+same thing across providers, and a constant rather than a config key — see the
+compatibility note below); selection order is fixed and every child listing is
+sorted, so the same hierarchy yields a byte-identical packet. When the budget binds,
+the packet names what it trimmed and what it dropped.
+
+**Decisions live on the narrowest node matching their scope** (`src/ledger/`).
+`issue` → the issue; `subtree` → the subtree root it governs; `initiative` → the
+absolute root. A descendant loads the fold along its entire root→issue ancestor path,
+so inheritance falls out of the hierarchy instead of a rule to get wrong: a sibling
+subtree's decisions are simply not on the path. Canonical records are **append-only**
+`ralph-decision` fenced comments through the same shared codec as `ralph-question` /
+`ralph-review`; a later record **supersedes** an earlier one **by id**, never by
+recency, and the superseded comment is never edited.
+
+**Conflicts and malformed records fail closed and stay visible.** Two active records
+claiming one key with no supersession between them do not resolve to a winner: the
+key drops out of the active fold and both claims surface with their node and comment
+id for a later master or human to adjudicate — guessing would pick an architecture on
+a timestamp. A fenced-but-unparseable comment is a diagnostic, not state; an ordinary
+comment that merely *discusses* a decision, or pastes one in a ` ```json ` block, is
+never parsed as one (extraction is anchored on the fence tag).
+
+**One derived index on the absolute root.** A single daemon-managed
+`ralph-decision-index` comment lists active decisions with source links back to their
+canonical records. It is a *view*: regenerated from the records, byte-identical on an
+unchanged ledger (nothing time-varying is rendered, so an unchanged ledger performs
+**no write**), found by its fence tag and edited in place so a restart cannot plant a
+second one, and safe to delete.
+
+**GitHub stays authoritative; there is no SQLite here.** Every read walks canonical
+comments, so "delete the local database" is not a recovery scenario but the normal
+path — the same rebuildable-store guarantee as §1/§7
+([ADR-0003](adr/0003-reconciler-poll.md)/[ADR-0021](adr/0021-event-sourced-actual-state.md)).
+A projection may be added later purely as a cache; **no decision may ever exist only
+in it.** Payload evolution follows
+[ADR-0026](adr/0026-event-schema-evolution.md): the record schema is a *loose* object,
+so a field a later slice adds parses, round-trips, and is preserved.
+
+**Compatibility.** No new config key: the budget and ceiling are constants with
+per-call overrides. A daemon-only field on the mounted config would re-run the
+unknown-keys-rejected failure documented in issue #19 against stale container
+runners, for no benefit this slice needs.
+
+Deliberately **out of scope**: running a master agent, its prompt, any change to
+worker `escalate`/`stuck` behaviour or the human-attention labels, persisting
+free-form master conversation history, and any inference of hierarchy from prose.

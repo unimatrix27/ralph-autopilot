@@ -17,13 +17,23 @@ function escapeForRegExp(literal: string): string {
 }
 
 /**
+ * Match the opening ```` ```<fence> ```` tag, and **only** that tag: the negative
+ * lookahead stops one fence name from matching another it merely prefixes. Without
+ * it ```` ```ralph-decision-index ```` would satisfy a `ralph-decision` probe, and
+ * the derived index comment would be read back as a malformed decision record.
+ */
+function fencedTagPattern(fence: string): string {
+  return "```" + escapeForRegExp(fence) + "(?![A-Za-z0-9_-])";
+}
+
+/**
  * Match a fenced block opened by ```` ```<fence> ```` (the tag leading a line),
  * capturing the payload up to the next closing ```` ``` ````. Non-greedy, so the
  * first such block wins — mirroring "the latest parseable comment is the live
  * one" scan that operates one comment body at a time.
  */
 function fencedBlockRegex(fence: string): RegExp {
-  return new RegExp("```" + escapeForRegExp(fence) + "[^\\n]*\\n([\\s\\S]*?)```");
+  return new RegExp(fencedTagPattern(fence) + "[^\\n]*\\n([\\s\\S]*?)```");
 }
 
 /**
@@ -48,9 +58,12 @@ export function sanitizeForFence(s: string): string {
   return s.replace(/`/g, "´");
 }
 
-/** Whether `body` carries a fenced payload block for `fence`. */
+/**
+ * Whether `body` carries a fenced payload block for `fence`. Tag-exact: a longer
+ * fence name that merely starts with `fence` does not count.
+ */
 export function hasFencedPayload(body: string, fence: string): boolean {
-  return body.includes("```" + fence);
+  return new RegExp(fencedTagPattern(fence)).test(body);
 }
 
 /**

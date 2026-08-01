@@ -111,7 +111,11 @@ One pass through the system, mapped to modules (all under `src/`):
    auto-merge — it is matrix-tested in `completeness.test.ts`; keep it total.
 
 Supporting layers: **`github/`** (`gh` CLI window — `GhCliClient`, `## Blocked by` parsing,
-the `<!-- ralph-launch: … -->` PR marker, check classification), **`store/`** (`better-sqlite3`,
+the `<!-- ralph-launch: … -->` PR marker, check classification, and the native
+parent/sub-issue reads), **`hierarchy/`** + **`ledger/`** (the master-escalation
+foundation, ADR-0040 / DESIGN §12: the native-graph-only hierarchy climb + budgeted
+two-pass context packet, and the append-only scoped `ralph-decision` ledger with its
+derived root index — GitHub-authoritative, no SQLite), **`store/`** (`better-sqlite3`,
 transactional, schema in `migrations.ts`), **`config/`**, **`log/`** (structured + secret
 redaction), **`projection/`** (the pure `snapshot.ts` projection the web read API consumes — the Ink TUI that rendered it is retired, legacy issue 120), **`core/labels.ts`**
 + **`core/slug.ts`**.

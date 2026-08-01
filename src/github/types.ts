@@ -22,6 +22,88 @@ export interface Issue {
   createdAt: string;
 }
 
+/**
+ * A fully-qualified pointer at one issue node — `owner/repo` **plus** number.
+ * Issue numbers are not unique across repos, and GitHub's native parent/sub-issue
+ * graph may return cross-repository nodes, so every hierarchy/ledger surface keys
+ * on this rather than a bare number (ADR-0040).
+ */
+export interface IssueRef {
+  /** `owner/repo`, e.g. `unimatrix27/ralph-autopilot`. */
+  repo: string;
+  number: number;
+}
+
+/**
+ * One node in GitHub's native issue hierarchy, reduced to what a *compact*
+ * relationship map needs: identity, title, state — and deliberately **no body**.
+ * Pass two of the context assembler fetches bodies only for the nodes it selects.
+ */
+export interface HierarchyNode {
+  ref: IssueRef;
+  /** GitHub's global node id (GraphQL `id`); stable across renames and transfers. */
+  id: string;
+  title: string;
+  state: IssueState;
+}
+
+/**
+ * Why a hierarchy node could not be read. Reported explicitly — never collapsed
+ * into "this node has no parent", which would manufacture a false root (ADR-0040).
+ *
+ * - `deleted`      — GitHub would not resolve the node. Note GitHub deliberately
+ *   answers `NOT_FOUND` for resources a token may not *see*, so this reads as
+ *   "gone, or invisible to this token" — it is not proof of deletion;
+ * - `unauthorized` — GitHub said so outright (`FORBIDDEN`, `Resource not
+ *   accessible`, bad credentials), e.g. a SAML-protected org in a cross-repo tree;
+ * - `error`        — any other read fault; fails closed the same way.
+ *
+ * All three are equally "not a root": the distinction exists to help a human
+ * adjudicate a broken hierarchy, never to gate behaviour.
+ */
+export type InaccessibleReason = "deleted" | "unauthorized" | "error";
+
+/**
+ * The native parent edge of one issue. `none` is the ONLY value that means "this
+ * node is an absolute root"; an unreadable parent is `inaccessible`, so a climb
+ * can never mistake a permissions failure for the top of the tree.
+ */
+export type ParentEdge =
+  | { kind: "none" }
+  | { kind: "node"; node: HierarchyNode }
+  | { kind: "inaccessible"; reason: InaccessibleReason; ref?: IssueRef; detail?: string };
+
+/**
+ * One native hierarchy read: the node, its parent edge, and its sub-issues. The
+ * children are the *compact* listing (no bodies) that makes sibling branches
+ * visible in pass one without paying to fetch them.
+ */
+export type HierarchyRead =
+  | {
+      kind: "node";
+      node: HierarchyNode;
+      parent: ParentEdge;
+      /** The sub-issues returned; a PREFIX of all of them when `childCount` is larger. */
+      children: HierarchyNode[];
+      /**
+       * How many sub-issues GitHub says the node has, when it reports a total. A
+       * single page tops out at 100, so without this a node with more children
+       * would look complete — and the compact map's `omitted` count would read 0
+       * while sub-issues (and their decision records) were silently missing.
+       */
+      childCount?: number;
+    }
+  | { kind: "inaccessible"; ref: IssueRef; reason: InaccessibleReason; detail?: string };
+
+/**
+ * One (possibly cross-repo) issue's full content: the body plus its comment
+ * thread. Pass two of the context assembler and the decision ledger both read
+ * through this, so a cross-repo node costs the same one call as a local one.
+ */
+export type IssueContentRead =
+  | { kind: "content"; node: HierarchyNode; body: string; comments: PrComment[] }
+  | { kind: "inaccessible"; ref: IssueRef; reason: InaccessibleReason; detail?: string };
+
 /** A pull request, reduced to the fields the executor needs to record. */
 export interface PullRequest {
   number: number;
@@ -295,4 +377,35 @@ export interface GitHubClient {
    * without a merged closing PR, is unsatisfied.
    */
   isDependencySatisfied(issueNumber: number): Promise<boolean>;
+
+  // ---- native issue hierarchy + cross-repo nodes (ADR-0040) ---------------
+
+  /**
+   * One read of GitHub's **native** parent/sub-issue graph for `ref`: the node,
+   * its parent edge, and its sub-issues — the whole of pass one's per-node cost.
+   * The native graph is the only hierarchy authority; nothing here is inferred
+   * from titles, labels, links, or prose. A parent this token cannot read comes
+   * back as an explicit `inaccessible` edge, never as "no parent".
+   */
+  readIssueHierarchy(ref: IssueRef): Promise<HierarchyRead>;
+
+  /**
+   * Body + comment thread for one (possibly cross-repo) issue node. The
+   * cross-repo-capable sibling of {@link getIssue} / {@link listIssueComments},
+   * used by context assembly's pass two and by the decision ledger.
+   */
+  readIssueContent(ref: IssueRef): Promise<IssueContentRead>;
+
+  /**
+   * Post a comment on any (possibly cross-repo) issue node — how an append-only
+   * `ralph-decision` record lands on the narrowest node matching its scope.
+   */
+  postNodeComment(ref: IssueRef, body: string): Promise<{ id: number }>;
+
+  /**
+   * Edit a comment on any (possibly cross-repo) issue node. Used for exactly one
+   * thing: keeping the single derived `ralph-decision-index` comment on the
+   * absolute root current. Canonical decision records are **never** edited.
+   */
+  updateNodeComment(ref: IssueRef, commentId: number, body: string): Promise<void>;
 }
