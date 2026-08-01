@@ -14,7 +14,8 @@ import type { RoutingConfig, RouteWorld } from "../providers/resolve";
 import type { Issue, Run } from "../github/types";
 import { LABEL_AGENT_STUCK, LABEL_COMPLEXITY_1, LABEL_MASTER_TRIAGE } from "../core/labels";
 import { RALPH_QUESTION_FENCE } from "../review/escalation";
-import { RALPH_DECISION_FENCE } from "../ledger/decision";
+import { isDecisionComment, RALPH_DECISION_FENCE } from "../ledger/decision";
+import { RALPH_DECISION_INDEX_FENCE } from "../ledger/index-comment";
 import { MasterEngine } from "./engine";
 import { foldMasterHistory } from "./history";
 import { formatMasterRequestComment, RALPH_MASTER_REQUEST_FENCE } from "./request";
@@ -513,6 +514,44 @@ describe("MasterEngine (ADR-0041)", () => {
       expect(history.publishedDecisionIds).toHaveLength(1);
     });
 
+    it("indexes the decision on the absolute root and never duplicates it on replay", async () => {
+      await seedQueuedEscalation();
+      github.seedNode({ ref: { repo: REPO, number: 7 }, title: "Widget pipeline" });
+      const draft = {
+        key: "widget-contract",
+        scope: "issue" as const,
+        decision: "The strict schema in contract.ts is authoritative.",
+        rationale: "ADR-0010 pins strict zod.",
+        constraints: [],
+        rejectedAlternatives: [],
+        evidence: [],
+      };
+      agent.push({ ...outcome(), decisions: [draft] });
+      const engine = engineWith();
+      await engine.runIntervention(run, issue);
+
+      const bodies = () => (github.comments.get(7) ?? []).map((c) => c.body);
+      expect(bodies().filter(isDecisionComment)).toHaveLength(1);
+      expect(bodies().some((b) => b.includes(RALPH_DECISION_INDEX_FENCE))).toBe(true);
+
+      // A restart replays the same intervention (same run, same attempt): the deterministic
+      // decision id is already published, so nothing is re-appended.
+      await store.recordMasterTriageRequested({
+        issueNumber: 7,
+        runId: run.id,
+        source: "escalate",
+        phase: "impl",
+        lane: "impl",
+        signature: "escalate|impl|typecheck failed",
+        headline: "replay",
+      });
+      agent.push({ ...outcome(), decisions: [draft] });
+      await engine.runIntervention(run, issue);
+
+      expect(bodies().filter(isDecisionComment)).toHaveLength(1);
+      expect(foldMasterHistory(store.readIssueStream(7)).publishedDecisionIds).toHaveLength(1);
+    });
+
     it("routes an attempted contradiction of a standing decision to a human", async () => {
       await seedQueuedEscalation();
       github.seedNode({ ref: { repo: REPO, number: 7 }, title: "Widget pipeline" });
@@ -567,9 +606,9 @@ describe("MasterEngine (ADR-0041)", () => {
       expect(bodies).toContain("Master wants to change the binding decision");
       // The contradicting RECORD was not written — only the first decision is in the ledger.
       // (The human question quotes the proposed change; that is the point of asking.)
-      const decisionRecords = (github.comments.get(7) ?? []).filter((c) =>
-        c.body.includes(`\`\`\`${RALPH_DECISION_FENCE}`),
-      );
+      // `isDecisionComment` is anchored on the exact fence tag, so the derived
+      // `ralph-decision-index` comment (which the shorter name prefixes) is not miscounted.
+      const decisionRecords = (github.comments.get(7) ?? []).filter((c) => isDecisionComment(c.body));
       expect(decisionRecords).toHaveLength(1);
       expect(decisionRecords[0]!.body).toContain("v1 contract is authoritative.");
       expect(foldMasterHistory(store.readIssueStream(7)).publishedDecisionIds).toHaveLength(1);

@@ -26,6 +26,9 @@ import { isUsageLimitError } from "../core/usage";
 import type { TargetConfig } from "../config/schema";
 import type { MasterAgentRunner, MasterSessionInput, MasterSessionOutcome } from "./engine";
 import { parseMasterSessionResult } from "./outcome";
+import { MASTER_TIER } from "./route";
+import { tierProfile } from "../providers/select";
+import type { RoutingSource } from "../providers/resolve";
 
 export interface ContainerMasterRunnerDeps {
   /** The `docker run` port — faked in tests, shells `docker` in production. */
@@ -36,6 +39,11 @@ export interface ContainerMasterRunnerDeps {
   config: TargetConfig;
   /** The branch the eventual PR targets. */
   baseBranch: string;
+  /**
+   * The live routing, read per dispatch so the tier-1 session budget (`effort` /
+   * `wallClockSeconds`) reflects a runtime overlay edit. Absent → the loaded config's tiers.
+   */
+  routing?: RoutingSource;
   /** Folds a container-reported per-account rate-limit signal back into the daemon's meter. */
   recordRateLimit?: RecordRateLimitSignal;
   /** Reads the runner image's declared capabilities for the pre-dispatch gate. */
@@ -53,6 +61,17 @@ export class ContainerMasterAgentRunner implements MasterAgentRunner {
     // Fail loud, pre-dispatch, on a stale runner: `kind: "master"` is not additively tolerable.
     await assertRunnerSupports(this.deps.capabilities, this.deps.config.targetRepo, ["master-escalation"]);
 
+    // The master runs on tier 1 by construction (the escalation promoted the issue), so its
+    // session budget is the tier-1 profile's `effort` / `wallClockSeconds` — resolved daemon-side
+    // and ridden on the assignment, exactly as every other lane does (#278 discipline).
+    const profile = tierProfile(this.deps.routing?.().agent ?? this.deps.config.agent, MASTER_TIER);
+    const sessionProfile =
+      profile && (profile.effort !== undefined || profile.wallClockSeconds !== undefined)
+        ? {
+            ...(profile.effort !== undefined ? { effort: profile.effort } : {}),
+            ...(profile.wallClockSeconds !== undefined ? { wallClockSeconds: profile.wallClockSeconds } : {}),
+          }
+        : undefined;
     const assignment: Assignment = {
       kind: "master",
       issueNumber: input.issue.number,
@@ -61,6 +80,7 @@ export class ContainerMasterAgentRunner implements MasterAgentRunner {
       base: this.deps.baseBranch,
       prompt: input.prompt,
       escalationMode: "master",
+      ...(sessionProfile ? { profile: sessionProfile } : {}),
     };
     const dispatch: ContainerDispatch = {
       assignment,

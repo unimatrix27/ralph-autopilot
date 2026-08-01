@@ -27,7 +27,8 @@ import type { RoutingSource, RouteWorld } from "../providers/resolve";
 import type { ContainerRoute } from "../container/assignment";
 import { recordDispatchedRoute } from "../container/route-recording";
 import { buildHierarchyMap } from "../hierarchy/map";
-import { appendDecision } from "../ledger/ledger";
+import { appendDecision, readDecisionLedger } from "../ledger/ledger";
+import { syncDecisionIndex } from "../ledger/index-comment";
 import type { DecisionRecord } from "../ledger/decision";
 import { formatRalphQuestion, type EscalationQuestion } from "../review/escalation";
 import { evaluateMasterBudget, resolutionAllowed, type MasterBudgetVerdict } from "./budget";
@@ -658,6 +659,7 @@ export class MasterEngine {
       return {};
     }
     const map = context.hierarchy ?? (await buildHierarchyMap(github, context.ref));
+    let published = false;
 
     for (const draft of drafts) {
       const contradicts = draft.supersedes !== undefined || hasActiveDecisionFor(context, draft.key);
@@ -747,6 +749,20 @@ export class MasterEngine {
         commentId: appended.commentId,
       });
       logger.info("master.decision-published", { issue: context.ref.number, key: draft.key, id: decisionId });
+      published = true;
+    }
+    if (published) {
+      // Regenerate the derived `ralph-decision-index` on the absolute root (ADR-0040): a view,
+      // not authority — byte-identical on an unchanged ledger (so a replay writes nothing) and
+      // edited in place, so a restart can never plant a second one. Best-effort: a failed index
+      // sync must never invalidate a decision that is already canonical on its own comment.
+      try {
+        const fold = await readDecisionLedger(github, map);
+        const synced = await syncDecisionIndex(github, map, fold);
+        logger.info("master.decision-index", { issue: context.ref.number, ...synced });
+      } catch (err) {
+        logger.warn("master.decision-index-failed", { issue: context.ref.number, error: String(err) });
+      }
     }
     return {};
   }

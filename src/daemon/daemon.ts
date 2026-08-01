@@ -638,6 +638,7 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
             store: scopedStore,
             config: target,
             baseBranch,
+            routing,
             recordRateLimit,
             capabilities,
             drainSignal: deps.drain,

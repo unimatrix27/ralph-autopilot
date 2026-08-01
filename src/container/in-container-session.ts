@@ -405,7 +405,9 @@ export function createMasterSessionHost(
 ): MasterSessionHost {
   return {
     adjudicate(input) {
-      const backend = structuredBackendForRoute(config, route, input.transcriptSink, deps, input.onRateLimit);
+      // The master runs on tier 1 by construction, so its session budget is the tier's.
+      const profiled = withProfileOverride(config, input.assignment.profile);
+      const backend = structuredBackendForRoute(profiled, route, input.transcriptSink, deps, input.onRateLimit);
       return runStructuredWithBackend(
         backend,
         {
@@ -474,7 +476,8 @@ export function createFixSessionHost(
 ): FixSessionHost {
   return {
     async fix(input): Promise<FixOutcome> {
-      const backend = structuredBackendForRoute(config, route, input.transcriptSink, deps, input.onRateLimit);
+      const profiled = withProfileOverride(config, input.assignment.profile);
+      const backend = structuredBackendForRoute(profiled, route, input.transcriptSink, deps, input.onRateLimit);
       const parsed = await runStructuredWithBackend(
         backend,
         { prompt: input.assignment.prompt, worktreePath: input.workspacePath, systemAppend: REVIEW_SYSTEM_APPEND },
