@@ -700,6 +700,43 @@ describe("ReviewLoop", () => {
     expect(await loop.run(ctx)).toEqual({ kind: "merged" });
   });
 
+  it("waits for the hosted reviewer to observe the current head before merging (issue #43)", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // CI is green on head2, but the hosted reviewer has so far only looked at the PREVIOUS head.
+    // A single classify() read would find an empty head2 worklist and merge immediately — the
+    // exact "an empty read is the reviewer being happy" antipattern the design forbids.
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head2" });
+    github.setReviewThreadSequence(ctx.prNumber, [
+      // First observation: an unresolved conversation still anchored to head1 → the reviewer has
+      // NOT yet observed head2, so the bounded wait must keep looking rather than merge.
+      { kind: "threads", threads: [codexThread({ id: "PRRT_old", reviewedSha: "head1" })], headSha: "head2" },
+      // The reviewer then posts a P0 on head2. observe() re-reads, sees the current head, and gates.
+      { kind: "threads", threads: [codexThread({ reviewedSha: "head2" })], headSha: "head2" },
+    ]);
+
+    const outcome = await loop.run(ctx);
+
+    // It observed the new head and caught the finding — no merge, escalated as a hosted blocker.
+    expect(outcome).toEqual({ kind: "master-triage", phase: 0 });
+    expect(github.merges).toHaveLength(0);
+    expect(masterRequests()[0]!.source).toBe("hosted-review");
+  });
+
+  it("merges without stalling when the repo has no hosted reviewer (issue #43)", async () => {
+    const ctx = setup();
+    const { loop } = wire({ review: [clean], hostedGate: true });
+    worktrees.scriptRebase({ kind: "clean", moved: false }, { kind: "clean", moved: false });
+    // Green CI, hosted gate wired, but the reviewer has nothing outstanding on this head — the
+    // bounded observation must resolve to "clean" and merge, never stall on an empty read.
+    github.setMergeStatus(ctx.prNumber, { state: "CLEAN", headSha: "head1" });
+    github.setReviewThreads(ctx.prNumber, [], "head1");
+
+    expect(await loop.run(ctx)).toEqual({ kind: "merged" });
+    expect(github.merges).toHaveLength(1);
+  });
+
   it("a fix agent can escalate instead of applying a risky structural change", async () => {
     const ctx = setup();
     const { loop, reviewAgent } = wire({

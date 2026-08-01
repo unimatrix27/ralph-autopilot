@@ -311,6 +311,19 @@ export function classifyMergeBlock(input: MergeBlockInput): MergeBlockCause {
   if (merge.state === "DRAFT") {
     return { kind: "draft" };
   }
+  // A thread read that failed closed is UNATTRIBUTABLE evidence: with no worklist we cannot prove
+  // there is no unresolved conversation, so we must not merge — REGARDLESS of what branch
+  // protection reports. This is tested BEFORE the MERGEABLE early-return so a CLEAN/UNSTABLE/
+  // HAS_HOOKS state does not merge past an unread hosted gate when the token lacks the GraphQL
+  // scope (issue #43: "missing GraphQL permissions ... all fail closed with typed evidence").
+  // The rate-limited reason lands here too and is routed to the caller's defer path unchanged.
+  if (input.threadsUnavailable) {
+    return {
+      kind: "threads-unavailable",
+      reason: input.threadsUnavailable.reason,
+      detail: input.threadsUnavailable.detail,
+    };
+  }
   if (MERGEABLE.has(merge.state)) {
     // Mergeable by branch protection — but an unresolved conversation the ruleset does not
     // enforce is still a finding Ralph must not merge past silently.
@@ -320,13 +333,6 @@ export function classifyMergeBlock(input: MergeBlockInput): MergeBlockCause {
     return { kind: "mergeable" };
   }
   // BLOCKED / UNKNOWN: attribute it.
-  if (input.threadsUnavailable) {
-    return {
-      kind: "threads-unavailable",
-      reason: input.threadsUnavailable.reason,
-      detail: input.threadsUnavailable.detail,
-    };
-  }
   if (input.worklist && !hostedGateClean(input.worklist)) {
     return hostedCause(input.worklist, merge);
   }

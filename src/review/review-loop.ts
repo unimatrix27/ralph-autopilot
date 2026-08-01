@@ -64,7 +64,7 @@ import {
   reviewPhaseKey,
   type MasterEscalationPort,
 } from "../master/harness-escalation";
-import { HostedReviewGate } from "./hosted-gate";
+import { HostedReviewGate, type HostedGateContext } from "./hosted-gate";
 import {
   describeMergeBlock,
   hostedFailureDetail,
@@ -1285,10 +1285,17 @@ export class ReviewLoop {
       });
       if (MERGEABLE_STATES.has(snapshot.state)) {
         // Branch protection is satisfied — but the hosted reviewer is a gate of its own
-        // (issue #43): a ruleset can permit the merge while an unresolved conversation still
-        // means the change is not agreed. Check it before firing the merge, never after.
-        const hosted = await this.hostedGateVerdict(ctx, snapshot);
-        return hosted ?? { kind: "mergeable" };
+        // (issue #43): before firing the merge, wait boundedly for the reviewer to OBSERVE this
+        // head, then read its threads. An empty read is "the reviewer has not looked at this head
+        // yet", never "the reviewer is happy"; an unreadable read fails closed; a rate-limit
+        // defers by re-polling. The merge command stays unreachable until the reviewer has
+        // observed the current head (or the bounded wait proves the repo has no hosted reviewer).
+        const hosted = await this.hostedObserveVerdict(ctx, snapshot);
+        if (hosted.kind !== "defer") {
+          return hosted;
+        }
+        // Rate-limited read: keep polling within the CI budget, exactly as the BLOCKED arm does,
+        // rather than merging past an unread gate on transient evidence.
       }
       // The strict-up-to-date treadmill (#31): the base advanced under the rebased head (BEHIND)
       // or into a textual conflict (DIRTY). Neither self-clears by waiting — hand back to the
@@ -1348,20 +1355,11 @@ export class ReviewLoop {
     ctx: ReviewLoopContext,
     snapshot: MergeStatusSnapshot,
   ): Promise<MergeReadiness | null> {
-    const gate = this.deps.hostedGate;
-    if (!gate) {
+    const wired = this.hostedGateContext(ctx, snapshot);
+    if (!wired) {
       return null;
     }
-    const head = snapshot.headSha ?? this.deps.store.getRunByIssue(ctx.issue.number)?.runnerPushedSha ?? null;
-    const gateCtx = {
-      issueNumber: ctx.issue.number,
-      runId: ctx.runId,
-      prNumber: ctx.prNumber,
-      headSha: head,
-      logger: ctx.logger,
-      ...(ctx.abortSignal ? { abortSignal: ctx.abortSignal } : {}),
-    };
-    const { cause, worklist } = await gate.classify(gateCtx, snapshot, await this.readChecksQuietly(ctx));
+    const { cause, worklist } = await wired.gate.classify(wired.gateCtx, snapshot, await this.readChecksQuietly(ctx));
     if (cause.kind === "mergeable") {
       return null;
     }
@@ -1378,8 +1376,81 @@ export class ReviewLoop {
     }
     return {
       kind: "stuck",
-      outcome: await this.escalateHostedBlocker(ctx, cause, worklist, head),
+      outcome: await this.escalateHostedBlocker(ctx, cause, worklist, wired.head),
     };
+  }
+
+  /**
+   * Wait boundedly for the GitHub-hosted reviewer to OBSERVE the current head before a merge, then
+   * turn its verdict into a merge decision (issue #43, DESIGN §5a). This is the check the binding
+   * decision requires before every merge attempt: "after a verified push Ralph observes the new
+   * head, and proceeds only when the gate is stable." Unlike a single {@link hostedGateVerdict}
+   * classify read — which reports `mergeable` the instant the current-head worklist is empty — the
+   * gate's own {@link HostedReviewGate.observe} never treats "the reviewer has not looked at this
+   * head yet" as "the reviewer is happy": it re-reads up to its bounded budget until the reviewer
+   * has anchored a thread to this head (or has nothing outstanding at all, i.e. no hosted gate).
+   *
+   * Three outcomes, mapped to the merge loop:
+   *  - **clean** (or no hosted gate wired) → `{ kind: "mergeable" }`: the reviewer observed the
+   *    head and nothing hosted blocks; the merge command becomes reachable.
+   *  - **findings / fail-closed blocker** → `{ kind: "stuck" }`: escalate the typed blocker with
+   *    its actual findings, exactly as {@link hostedGateVerdict} does for classify's cause.
+   *  - **rate-limited** → `{ kind: "defer" }`: GitHub rate limits defer through the ordinary
+   *    poll path — the caller keeps polling, never merging on transient evidence and never
+   *    consuming a master attempt.
+   */
+  private async hostedObserveVerdict(
+    ctx: ReviewLoopContext,
+    snapshot: MergeStatusSnapshot,
+  ): Promise<{ kind: "mergeable" } | { kind: "stuck"; outcome: ReviewLoopOutcome } | { kind: "defer" }> {
+    const wired = this.hostedGateContext(ctx, snapshot);
+    if (!wired) {
+      return { kind: "mergeable" };
+    }
+    const verdict = await wired.gate.observe(wired.gateCtx);
+    switch (verdict.kind) {
+      case "clean":
+        return { kind: "mergeable" };
+      case "defer":
+        // GitHub rate limits defer through the existing rate-limit path — never a master attempt.
+        ctx.logger.warn("review.hosted-rate-limited", { pr: ctx.prNumber });
+        return { kind: "defer" };
+      case "findings":
+        return {
+          kind: "stuck",
+          outcome: await this.escalateHostedBlocker(ctx, verdict.cause, verdict.worklist, verdict.headSha),
+        };
+      case "blocked":
+        return {
+          kind: "stuck",
+          outcome: await this.escalateHostedBlocker(ctx, verdict.cause, null, verdict.headSha),
+        };
+    }
+  }
+
+  /**
+   * Build the {@link HostedGateContext} for the current head, or null when no hosted gate is
+   * wired. The head is the merge snapshot's head, falling back to the run's recorded
+   * runner-pushed SHA — never a guess, so the gate anchors its observation to a commit it can name.
+   */
+  private hostedGateContext(
+    ctx: ReviewLoopContext,
+    snapshot: MergeStatusSnapshot,
+  ): { gate: HostedReviewGate; gateCtx: HostedGateContext; head: string | null } | null {
+    const gate = this.deps.hostedGate;
+    if (!gate) {
+      return null;
+    }
+    const head = snapshot.headSha ?? this.deps.store.getRunByIssue(ctx.issue.number)?.runnerPushedSha ?? null;
+    const gateCtx: HostedGateContext = {
+      issueNumber: ctx.issue.number,
+      runId: ctx.runId,
+      prNumber: ctx.prNumber,
+      headSha: head,
+      logger: ctx.logger,
+      ...(ctx.abortSignal ? { abortSignal: ctx.abortSignal } : {}),
+    };
+    return { gate, gateCtx, head };
   }
 
   /** Escalate a typed hosted/human/ruleset merge blocker with its actual evidence. */

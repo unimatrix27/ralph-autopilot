@@ -168,6 +168,45 @@ describe("hosted review — typed BLOCKED classification (issue #3430)", () => {
     expect(describeMergeBlock(cause)).toContain("permissions");
   });
 
+  // Issue #43: an unreadable thread read is UNATTRIBUTABLE evidence, so it must fail closed
+  // regardless of what branch protection reports — including the MERGEABLE states, where the old
+  // early-return dropped the threadsUnavailable evidence and merged EVERY PR past the unread gate
+  // when the token lacked the GraphQL scope.
+  it.each(["CLEAN", "UNSTABLE", "HAS_HOOKS"] as const)(
+    "fails closed on an unreadable read (permissions) even when branch protection says %s",
+    (state) => {
+      const cause = classifyMergeBlock({
+        merge: { state },
+        worklist: null,
+        threadsUnavailable: { reason: "permissions", detail: "missing pull_requests: read" },
+      });
+      expect(cause.kind).toBe("threads-unavailable");
+      expect(cause.kind === "threads-unavailable" && cause.reason).toBe("permissions");
+    },
+  );
+
+  it("fails closed on an unreadable read (hard error) for a mergeable branch state", () => {
+    const cause = classifyMergeBlock({
+      merge: { state: "CLEAN" },
+      worklist: null,
+      threadsUnavailable: { reason: "error", detail: "GraphQL 502" },
+    });
+    expect(cause.kind).toBe("threads-unavailable");
+    expect(cause.kind === "threads-unavailable" && cause.reason).toBe("error");
+  });
+
+  it("surfaces a rate-limited read as threads-unavailable (the caller defers) on a CLEAN state", () => {
+    // Rate-limited lands in the same fail-closed arm; the review loop routes THIS reason to its
+    // defer/keep-polling path, so the merge is still never fired on transient evidence.
+    const cause = classifyMergeBlock({
+      merge: { state: "CLEAN" },
+      worklist: null,
+      threadsUnavailable: { reason: "rate-limited", detail: "API rate limit exceeded" },
+    });
+    expect(cause.kind).toBe("threads-unavailable");
+    expect(cause.kind === "threads-unavailable" && cause.reason).toBe("rate-limited");
+  });
+
   it("fails closed on an unknown ruleset blocker rather than guessing", () => {
     const cause = classifyMergeBlock({
       merge: { state: "BLOCKED", reviewDecision: "APPROVED" },
