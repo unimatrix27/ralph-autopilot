@@ -5,7 +5,7 @@
  * lets them rule without reloading the deep technical context.
  */
 
-import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "./labels";
+import { LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "./labels";
 import type { OpenQuestionItem } from "./queue";
 
 /** The operator-facing tag for each answerable label — what the question is. */
@@ -14,7 +14,6 @@ const LABEL_TAG: Record<OpenQuestionItem["label"], string> = {
   // Pre-cutover only (ADR-0042): no path applies this label any more; the reconciler adopts
   // any survivor into `master-triage`. Rendered so a legacy park is still readable.
   [LABEL_REVIEW_MAXED]: "review-maxed / heal-card (legacy)",
-  [LABEL_AGENT_STUCK]: "agent-stuck / stuck-card",
 };
 
 /** Render one question as a plain-text block, options numbered for picking. */

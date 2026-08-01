@@ -44,8 +44,15 @@ import {
   type MasterContextDeps,
   type MasterHumanAnswer,
 } from "./context";
-import { foldMasterHistory, type MasterHistory, type PendingMasterRequest } from "./history";
+import { latestRalphQuestion } from "../hitl/answer";
+import {
+  foldMasterHistory,
+  type MasterHistory,
+  type MasterInterventionRecord,
+  type PendingMasterRequest,
+} from "./history";
 import { buildMasterPrompt, MASTER_SYSTEM_APPEND } from "./prompt";
+import { masterOutcomeSchema } from "./outcome";
 import type { MasterDecisionDraft, MasterOutcome, MasterSessionResult } from "./outcome";
 import { parseMasterRequestComment, type MasterRequestPayload } from "./request";
 import { describeMasterRouteDefect, resolveMasterRoute, type MasterRouteResolution } from "./route";
@@ -281,6 +288,18 @@ export class MasterEngine {
       return { kind: "no-request" };
     }
 
+    // The outcome→effect restart boundary (ADR-0042). The decision is recorded *before* its
+    // effect, so an open attempt that already carries one is a crash after the master ruled:
+    // replay that exact ruling rather than spending a fresh session to reach a possibly
+    // different one. A pre-cutover attempt carries no replayable payload and falls through to
+    // the ordinary re-adoption below, which is what a crash mid-*session* has always done.
+    if (open && !open.completed && open.outcome) {
+      const replayed = await this.replayEffect(run, issue, open);
+      if (replayed) {
+        return replayed;
+      }
+    }
+
     const branch = run.branch ?? `ralph/${issueNumber}`;
     const request = await resolveRequestPayload(github, issueNumber, history.pending, branch, run.id);
     if (!request) {
@@ -346,6 +365,12 @@ export class MasterEngine {
         attempt: budget.attempt,
         phase,
         signature,
+        // Restated from the request being serviced: starting the session takes that request off
+        // the queue, and without these the operator surface goes blank on `source`/`lane`/
+        // `headline` for exactly as long as the master is actually working (ADR-0042).
+        source: request.source,
+        lane: request.lane,
+        headline: request.evidence.headline,
       });
     }
     await recordDispatchedRoute({
@@ -456,13 +481,18 @@ export class MasterEngine {
       };
     }
 
-    await store.recordMasterInterventionResolved({
+    // Decision first, effect second, span closed third. The window between the first two is what
+    // makes a crash recoverable: `replayEffect` above re-applies exactly this outcome, and the
+    // span stays open until the effect has actually landed (ADR-0042).
+    await store.recordMasterResolutionSelected({
       issueNumber,
       runId: run.id,
       attempt,
       phase,
       resolution: outcome.resolution,
       rationale: outcome.rationale,
+      conclusion: outcome.conclusion,
+      outcome: outcome as unknown as Record<string, unknown>,
     });
     store.appendLog({
       runId: run.id,
@@ -473,8 +503,54 @@ export class MasterEngine {
     });
 
     await this.executeResolution(run, issue, attempt, phase, outcome);
+    await store.recordMasterInterventionCompleted({
+      issueNumber,
+      runId: run.id,
+      attempt,
+      phase,
+      resolution: outcome.resolution,
+    });
     logger.info("master.resolved", { issue: issueNumber, attempt, resolution: outcome.resolution });
     return { kind: "resolved", attempt, resolution: outcome.resolution };
+  }
+
+  /**
+   * Re-apply a decision whose effect did not land, then close its span. Returns `null` when the
+   * recorded payload cannot be replayed (a pre-cutover attempt, or an outcome grammar this build
+   * no longer understands), so the caller falls back to re-adopting the attempt with a fresh
+   * session — never a wedge, and never a *silent* replacement of the master's ruling.
+   */
+  private async replayEffect(
+    run: Run,
+    issue: Issue,
+    open: MasterInterventionRecord,
+  ): Promise<MasterInterventionResult | null> {
+    const { store, logger } = this.deps;
+    const parsed = masterOutcomeSchema.safeParse(open.outcome);
+    if (!parsed.success) {
+      logger.warn("master.effect-replay-unparseable", {
+        issue: run.issueNumber,
+        attempt: open.attempt,
+        phase: open.phase,
+      });
+      return null;
+    }
+    const outcome = parsed.data;
+    logger.info("master.effect-replay", {
+      issue: run.issueNumber,
+      attempt: open.attempt,
+      phase: open.phase,
+      resolution: outcome.resolution,
+    });
+    await this.executeResolution(run, issue, open.attempt, open.phase, outcome);
+    await store.recordMasterInterventionCompleted({
+      issueNumber: run.issueNumber,
+      runId: run.id,
+      attempt: open.attempt,
+      phase: open.phase,
+      resolution: outcome.resolution,
+    });
+    return { kind: "resolved", attempt: open.attempt, resolution: outcome.resolution };
   }
 
   /** Carry out the chosen resolution. Exhaustive by construction — five arms, no default. */
@@ -540,13 +616,28 @@ export class MasterEngine {
   }
 
   /**
+   * The comment id of a card with this headline already on the issue, or null. A replayed effect
+   * must not publish a second copy of something GitHub cannot un-post (ADR-0042). Only a master
+   * posts questions now, so the latest `ralph-question` on the issue is the one this effect
+   * wrote — matching on the headline is what tells "mine, already posted" from "someone else's".
+   */
+  private async postedCardId(issueNumber: number, headline: string): Promise<number | null> {
+    const latest = latestRalphQuestion(await this.deps.github.listIssueComments(issueNumber));
+    return latest && latest.question.headline === headline ? latest.commentId : null;
+  }
+
+  /**
    * The **only** path in this slice that creates a `ralph-question`. Posts the structured
    * comment, indexes the open question with master provenance, and checkpoints the master's
    * own resume context — so an answer resumes the MASTER, not the original worker.
+   *
+   * Idempotent by headline: a replay after a crash between the comment and its durable fact
+   * adopts the posted comment rather than asking the same question twice.
    */
   private async askHuman(run: Run, attempt: number, phase: string, question: EscalationQuestion): Promise<void> {
     const { store, github } = this.deps;
-    const { id } = await github.postComment(run.issueNumber, formatRalphQuestion(question));
+    const posted = await this.postedCardId(run.issueNumber, question.headline);
+    const { id } = posted !== null ? { id: posted } : await github.postComment(run.issueNumber, formatRalphQuestion(question));
     await store.recordMasterHumanQuestion({
       issueNumber: run.issueNumber,
       runId: run.id,
@@ -568,38 +659,47 @@ export class MasterEngine {
     });
   }
 
-  /** The master's terminal: a self-explaining card plus `MasterStuck` (→ `agent-stuck`). */
+  /**
+   * The master's terminal: a self-explaining card plus `MasterStuck` (→ `agent-stuck`). The card
+   * is *evidence*, not a question — `agent-stuck` is not answerable (ADR-0042 §7), so the moves
+   * it offers are the ones an operator can actually make. Idempotent by headline, so a replayed
+   * effect does not post a second card.
+   */
   private async terminalStuck(run: Run, attempt: number, reason: string, conclusion: string): Promise<void> {
     const { store, github } = this.deps;
-    await github.postComment(
-      run.issueNumber,
-      formatRalphQuestion({
-        headline: "Master concluded this run cannot be completed",
-        feature: "Master escalation (ADR-0041)",
-        whereWeStand: [
-          "A fresh highest-tier master session investigated this run independently and concluded that neither",
-          "another autonomous action nor a human decision would resolve it.",
-          "",
-          "Master's conclusion:",
-          conclusion,
-          "",
-          "Why it is terminal:",
-          reason,
-        ].join("\n"),
-        decision: "How should this issue be disposed of?",
-        options: [
-          "Re-scope the issue (edit it and re-label `ready-for-agent`)",
-          "Provide guidance and re-enable the run (heal)",
-          "Close the issue",
-        ],
-        stakes:
-          "No pull request will merge from this run. The issue is parked on `agent-stuck`, and the daemon will " +
-          "not pick it up again on its own.",
-        recommendation:
-          "Read the master's conclusion. If it names a missing prerequisite, resolve that first; otherwise " +
-          "re-scope or close.",
-      }),
-    );
+    const headline = "Master concluded this run cannot be completed";
+    if ((await this.postedCardId(run.issueNumber, headline)) === null) {
+      await github.postComment(
+        run.issueNumber,
+        formatRalphQuestion({
+          headline,
+          feature: "Master escalation (ADR-0041)",
+          whereWeStand: [
+            "A fresh highest-tier master session investigated this run independently and concluded that neither",
+            "another autonomous action nor a human decision would resolve it.",
+            "",
+            "Master's conclusion:",
+            conclusion,
+            "",
+            "Why it is terminal:",
+            reason,
+          ].join("\n"),
+          decision: "How should this issue be disposed of?",
+          // No "answer this to heal it" move: the terminal is not answerable (ADR-0042 §7), so
+          // offering one would send the operator to a `ralph-answer` that refuses them.
+          options: [
+            "Re-scope the issue (edit it) and re-label it `ready-for-agent`",
+            "Close the issue",
+          ],
+          stakes:
+            "No pull request will merge from this run. The issue is parked on `agent-stuck`, and the daemon will " +
+            "not pick it up again on its own. Answering this card will not lift it.",
+          recommendation:
+            "Read the master's conclusion. If it names a missing prerequisite, resolve that first; otherwise " +
+            "re-scope or close.",
+        }),
+      );
+    }
     await store.recordMasterStuck({ issueNumber: run.issueNumber, runId: run.id, attempt, reason });
     store.appendLog({
       runId: run.id,

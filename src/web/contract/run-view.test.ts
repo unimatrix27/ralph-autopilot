@@ -337,6 +337,190 @@ describe("buildRunView — timeline + phase dividers", () => {
   });
 });
 
+// ── master triage lifecycle ───────────────────────────────────────────────────────
+
+/**
+ * Every master lifecycle event the run timeline must speak (ADR-0041/0042). Enumerated here
+ * so a newly-minted master fact that nobody taught the renderer about fails this file rather
+ * than shipping to the operator as a bare type name.
+ */
+const MASTER_EVENT_TYPES = [
+  "MasterTriageRequested",
+  "ComplexityPromoted",
+  "MasterInterventionStarted",
+  "MasterResolutionSelected",
+  "MasterInterventionCompleted",
+  "DecisionPublished",
+  "MasterHumanQuestionRequested",
+  "MasterStuck",
+] as const;
+
+describe("buildRunView — master triage lifecycle (ADR-0042, #43)", () => {
+  it("no master event falls through to the bare type-name default", () => {
+    const view = buildRunView(
+      detail({ timeline: MASTER_EVENT_TYPES.map((type, i) => domain(i + 1, type, {})) }),
+    );
+    for (const type of MASTER_EVENT_TYPES) {
+      const node = view.timeline.find((n) => n.type === type);
+      expect(node, type).toBeDefined();
+      // The default arm renders `label: ev.type` — a real case never does.
+      expect(node!.label, type).not.toBe(type);
+      expect(node!.label.length, type).toBeGreaterThan(0);
+    }
+  });
+
+  it("renders the queued request, the promotion, the attempt budget, the resolution and its rationale", () => {
+    const view = buildRunView(
+      detail({
+        timeline: [
+          domain(1, "RunStarted", { runId: "5", mode: "tdd" }),
+          domain(10, "ReviewMaxed", { runId: "5", phase: 1 }),
+          domain(11, "MasterTriageRequested", {
+            runId: "5",
+            source: "review-maxed",
+            phase: "review-1",
+            lane: "review",
+            signature: "abc",
+            headline: "Phase 1 spent its three fix attempts",
+          }),
+          domain(12, "ComplexityPromoted", { tier: 1, from: 3 }),
+          domain(13, "MasterInterventionStarted", { runId: "5", attempt: 1, phase: "review-1", signature: "abc" }),
+          domain(14, "MasterResolutionSelected", {
+            runId: "5",
+            attempt: 1,
+            phase: "review-1",
+            resolution: "resolved-and-continue",
+            rationale: "The finding named a stale import; removed it",
+          }),
+          domain(15, "DecisionPublished", {
+            runId: "5",
+            decisionId: "d1",
+            key: "storage-backend",
+            scope: "subtree",
+            node: "owner/repo#7",
+            commentId: 99,
+          }),
+          domain(16, "MasterInterventionCompleted", {
+            runId: "5",
+            attempt: 1,
+            phase: "review-1",
+            resolution: "resolved-and-continue",
+          }),
+        ],
+      }),
+    );
+    const byType = new Map(view.timeline.map((n) => [n.type, n]));
+
+    // Queued for the master: the source and the phase the budget counts against — and a
+    // waiting tone, because triage is work the daemon is doing, not work a human owes.
+    const requested = byType.get("MasterTriageRequested")!;
+    expect(requested.label).toBe("Master triage");
+    expect(requested.tone).toBe("waiting");
+    expect(requested.detail).toContain("review-maxed");
+    expect(requested.detail).toContain("review-1");
+    expect(requested.detail).toContain("Phase 1 spent its three fix attempts");
+
+    expect(byType.get("ComplexityPromoted")).toMatchObject({ label: "Complexity promoted", detail: "tier 3 → 1" });
+
+    // The attempt against the two-per-phase ceiling, in the divider's own "att n/N" voice.
+    expect(byType.get("MasterInterventionStarted")).toMatchObject({
+      label: "Master intervention",
+      detail: "att 1/2 · review-1",
+      tone: "running",
+    });
+
+    // The master's own conclusion — the route it chose and why.
+    const resolution = byType.get("MasterResolutionSelected")!;
+    expect(resolution.label).toBe("Master resolution");
+    expect(resolution.detail).toContain("resolved-and-continue");
+    expect(resolution.detail).toContain("The finding named a stale import");
+
+    expect(byType.get("DecisionPublished")).toMatchObject({
+      label: "Decision published",
+      detail: "storage-backend · subtree",
+    });
+    expect(byType.get("MasterInterventionCompleted")).toMatchObject({
+      label: "Master intervention ended",
+      detail: "att 1/2 · resolved-and-continue",
+    });
+  });
+
+  it("tones the human-attention ask and the master terminal, and folds the terminal into the header", () => {
+    const view = buildRunView(
+      detail({
+        timeline: [
+          domain(1, "RunStarted", { runId: "5", mode: "tdd" }),
+          domain(20, "MasterResolutionSelected", {
+            runId: "5",
+            attempt: 2,
+            phase: "impl",
+            resolution: "ask-human",
+            rationale: "Only the operator can pick the storage backend",
+          }),
+          domain(21, "MasterHumanQuestionRequested", { runId: "5", attempt: 2, phase: "impl", headline: "Which storage backend?" }),
+          domain(22, "MasterStuck", { runId: "5", attempt: 2, reason: "no autonomous action remains" }),
+        ],
+      }),
+    );
+    const byType = new Map(view.timeline.map((n) => [n.type, n]));
+    expect(byType.get("MasterResolutionSelected")!.tone).toBe("attention");
+    expect(byType.get("MasterHumanQuestionRequested")).toMatchObject({
+      label: "Human decision requested",
+      detail: "Which storage backend?",
+      tone: "attention",
+    });
+    expect(byType.get("MasterStuck")).toMatchObject({
+      label: "Master stuck",
+      detail: "no autonomous action remains",
+      tone: "danger",
+    });
+    // `MasterStuck` is the terminal `agent-stuck` a master adjudicated (ADR-0042 §7), so the
+    // header reads stuck exactly as it does for a worker `RunStuck`.
+    expect(view.header.phaseSummary).toContain("stuck");
+  });
+
+  it("tones a terminal resolution as danger and an autonomous one as neutral", () => {
+    const toneFor = (resolution: string) =>
+      buildRunView(
+        detail({ timeline: [domain(1, "MasterResolutionSelected", { runId: "5", attempt: 1, phase: "impl", resolution })] }),
+      ).timeline[0]!.tone;
+    expect(toneFor("terminal-stuck")).toBe("danger");
+    expect(toneFor("redispatch-tier-1")).toBe("neutral");
+    expect(toneFor("retry-pipeline")).toBe("neutral");
+  });
+
+  it("renders no prompt, transcript or unknown payload text (#43: no leakage)", () => {
+    // A tolerant reader sees whatever the writer put on the fact; the renderer must project
+    // only the fields it names, never the payload wholesale.
+    const secrets = { prompt: "SECRET-PROMPT", transcript: "SECRET-TRANSCRIPT", token: "SECRET-TOKEN" };
+    const view = buildRunView(
+      detail({
+        timeline: MASTER_EVENT_TYPES.map((type, i) =>
+          domain(i + 1, type, {
+            ...secrets,
+            runId: "5",
+            attempt: 1,
+            phase: "impl",
+            source: "escalate",
+            lane: "impl",
+            signature: "sig",
+            headline: "headline",
+            rationale: "rationale",
+            resolution: "ask-human",
+            tier: 1,
+            key: "k",
+            scope: "issue",
+            node: "owner/repo#7",
+            reason: "reason",
+          }),
+        ),
+      }),
+    );
+    const rendered = view.timeline.map((n) => `${n.label} ${n.detail ?? ""}`).join("\n");
+    expect(rendered).not.toContain("SECRET");
+  });
+});
+
 // ── pruned marker ─────────────────────────────────────────────────────────────────
 
 describe("buildRunView — pruned marker", () => {

@@ -14,16 +14,35 @@ import { extractJsonObject, runStructuredWithBackend } from "../executor/structu
 import type { SessionBackend } from "../providers/backend";
 import type { FixContext, FixOutcome, ReviewContext } from "./agents";
 import { escalationQuestionSchema } from "./escalation";
+import type { HostedDisposition } from "./hosted-review";
 import { buildFixPrompt, buildReviewPrompt, REVIEW_SYSTEM_APPEND } from "./prompts";
 import { parseWorklist, type Worklist } from "./worklist";
 
 /**
+ * How a fix answers ONE hosted-review thread (issue #43, ADR-0042 §12). `rationale` and
+ * `verification` are required and non-empty by construction: a finding is never accepted —
+ * nor dismissed — because a bot raised it, so a disposition without the agent's own reasoning
+ * and the evidence behind it is not representable. Both are written into the reply body, where
+ * whoever reads the thread later can weigh them.
+ */
+export const hostedDispositionSchema: z.ZodType<HostedDisposition> = z
+  .object({
+    threadId: z.string().min(1),
+    disposition: z.enum(["fixed", "reasoned-invalid"]),
+    rationale: z.string().min(1),
+    verification: z.string().min(1),
+  })
+  .strict();
+
+/**
  * The fix session's structured-output contract: exactly `fixed` or `escalate` (with a
  * question). Lives here — the one owner of the fix attempt — so every provider validates
- * the same shape.
+ * the same shape. A `fixed` that addressed hosted-review threads carries one disposition per
+ * thread it answered; the harness replies and resolves exactly those, and only after the push
+ * is verified on the relevant head.
  */
 export const fixOutcomeSchema = z.union([
-  z.object({ outcome: z.literal("fixed") }).strict(),
+  z.object({ outcome: z.literal("fixed"), dispositions: z.array(hostedDispositionSchema).optional() }).strict(),
   z.object({ outcome: z.literal("escalate"), question: escalationQuestionSchema }).strict(),
 ]);
 
@@ -58,5 +77,8 @@ export async function fixWithBackend(
     { prompt, worktreePath: ctx.worktreePath, systemAppend: REVIEW_SYSTEM_APPEND, abortSignal: ctx.abortSignal },
     (text) => fixOutcomeSchema.parse(extractJsonObject(text)),
   );
-  return parsed.outcome === "fixed" ? { kind: "fixed" } : { kind: "escalate", question: parsed.question };
+  if (parsed.outcome === "escalate") {
+    return { kind: "escalate", question: parsed.question };
+  }
+  return { kind: "fixed", ...(parsed.dispositions ? { dispositions: parsed.dispositions } : {}) };
 }

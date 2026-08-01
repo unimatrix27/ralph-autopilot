@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RuntimeSnapshot, DaemonHealthView } from "../projection/snapshot";
+import { operatorActionFor } from "../daemon/anomaly-action";
+import { describeMasterRouteDefect } from "../master/route";
 import { healthUsageResponseSchema } from "./contract";
 import { buildHealthUsage, type AnomalyLogRow, type UsageMeterSnapshot } from "./health-usage";
 
@@ -109,12 +111,52 @@ describe("buildHealthUsage", () => {
       ["owner/b", 30],
     ]);
     const a12 = anomalies.find((a) => a.issue === 12)!;
-    expect(a12.reason).toBe("paused-label-missing-run"); // latest logged reason, not the stale one
+    expect(a12.reason).toContain("paused-label-missing-run"); // latest logged reason, not the stale one
+    expect(a12.reason).not.toContain("stale-earlier-reason");
     expect(a12.title).toBe("island a");
     expect(a12.since).toBe("2026-06-21T10:30:00.000Z");
     const b30 = anomalies.find((a) => a.issue === 30)!;
     expect(b30.reason).not.toBe(""); // a fallback, never blank
     expect(b30.since).toBeNull();
+  });
+
+  it("names the OPERATOR ACTION beside every recognised reason (issue #43)", () => {
+    // "Retain `daemon-anomaly` … it must name the operator action required." A bare enum
+    // tells the operator what broke, never what to do about it.
+    const snap = emptySnapshot();
+    snap.backlog.paused = [
+      { repo: "owner/a", issueNumber: 12, title: "island a", state: "daemon-anomaly" },
+      { repo: "owner/a", issueNumber: 13, title: "bad route", state: "daemon-anomaly" },
+      { repo: "owner/a", issueNumber: 14, title: "claim park", state: "daemon-anomaly" },
+    ];
+    const defect = describeMasterRouteDefect("tier-1-not-tools-capable");
+    const log: AnomalyLogRow[] = [
+      { repo: "owner/a", issueNumber: 12, data: { reason: "paused-label-missing-run" }, ts: "2026-06-21T10:30:00.000Z" },
+      // The master engine's own form: the reason carries the defect-exact fix text.
+      { repo: "owner/a", issueNumber: 13, data: { reason: `master-route-unconfigured: ${defect}` }, ts: "2026-06-21T10:00:00.000Z" },
+      // A reason outside the completeness vocabulary (a claim park) — passed through untouched.
+      { repo: "owner/a", issueNumber: 14, data: { reason: "claim-failed-after-3-attempts" }, ts: "2026-06-21T09:00:00.000Z" },
+    ];
+
+    const { anomalies } = buildHealthUsage(snap, log, meter(), { now: () => NOW, admitBelowPercent: 85 });
+
+    const a12 = anomalies.find((a) => a.issue === 12)!;
+    expect(a12.reason).toContain("paused-label-missing-run"); // the reason survives…
+    expect(a12.reason).toContain(operatorActionFor("paused-label-missing-run")); // …with its action
+    // The logged detail is the defect-exact text, so it wins over the generic both-defects action.
+    expect(anomalies.find((a) => a.issue === 13)!.reason).toContain(defect);
+    // An unrecognised reason is never guessed at — it renders exactly as logged.
+    expect(anomalies.find((a) => a.issue === 14)!.reason).toBe("claim-failed-after-3-attempts");
+  });
+
+  it("keeps the enriched reason contract-valid", () => {
+    const snap = emptySnapshot();
+    snap.backlog.paused = [{ repo: "owner/a", issueNumber: 12, title: "island", state: "daemon-anomaly" }];
+    const log: AnomalyLogRow[] = [
+      { repo: "owner/a", issueNumber: 12, data: { reason: "unclassified" }, ts: "2026-06-21T10:30:00.000Z" },
+    ];
+    const out = buildHealthUsage(snap, log, meter(), { now: () => NOW, admitBelowPercent: 85 });
+    expect(healthUsageResponseSchema.safeParse(out).success).toBe(true);
   });
 
   it("summarises a single default login with no streamed state as un-gated, not paused", () => {

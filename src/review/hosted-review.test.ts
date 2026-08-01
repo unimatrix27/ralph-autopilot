@@ -207,6 +207,43 @@ describe("hosted review — typed BLOCKED classification (issue #3430)", () => {
     expect(cause.kind === "threads-unavailable" && cause.reason).toBe("rate-limited");
   });
 
+  it("names an unresolved-OUTDATED conversation as the blocker instead of an unknown ruleset", () => {
+    // GitHub's "require conversation resolution" ruleset counts an unresolved thread whether or
+    // not the diff moved past it. Dropping outdated threads from the worklist entirely left
+    // BLOCKED with nothing to attribute it to — the #3430 shape one layer down, where the
+    // evidence again names the wrong (here: no) cause.
+    const worklist = buildHostedWorklist([thread({ isOutdated: true })], "abc1234");
+    expect(worklist.findings).toHaveLength(0);
+    expect(worklist.unresolvedStale.map((f) => f.threadId)).toEqual(["PRRT_1"]);
+    const cause = classifyMergeBlock({
+      merge: { state: "BLOCKED", reviewDecision: "APPROVED" },
+      worklist,
+      checks: green,
+    });
+    expect(cause.kind).toBe("hosted-review");
+    expect(cause.kind === "hosted-review" && cause.findings[0]!.finding).toContain("retry loop");
+  });
+
+  it("names an unresolved thread on an OLDER head the same way", () => {
+    const worklist = buildHostedWorklist([thread({ reviewedSha: "deadbee" })], "abc1234");
+    expect(worklist.unresolvedStale).toHaveLength(1);
+    expect(classifyMergeBlock({ merge: { state: "BLOCKED" }, worklist, checks: green }).kind).toBe("hosted-review");
+  });
+
+  it("keeps a RESOLVED outdated thread out of the stale bucket — it blocks nothing", () => {
+    const worklist = buildHostedWorklist([thread({ isResolved: true, isOutdated: true })], "abc1234");
+    expect(worklist.unresolvedStale).toHaveLength(0);
+    expect(hostedGateClean(worklist)).toBe(true);
+  });
+
+  it("does not let a stale conversation block a merge GitHub itself reports as CLEAN", () => {
+    // Symmetry with the above: the ruleset is the authority on whether an outdated thread
+    // counts. When branch protection is satisfied, re-opening superseded conversations would
+    // manufacture a repair loop out of nothing.
+    const worklist = buildHostedWorklist([thread({ isOutdated: true })], "abc1234");
+    expect(classifyMergeBlock({ merge: { state: "CLEAN" }, worklist }).kind).toBe("mergeable");
+  });
+
   it("fails closed on an unknown ruleset blocker rather than guessing", () => {
     const cause = classifyMergeBlock({
       merge: { state: "BLOCKED", reviewDecision: "APPROVED" },

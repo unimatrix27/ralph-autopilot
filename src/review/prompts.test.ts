@@ -191,6 +191,72 @@ describe("buildFixPrompt — sources findings from the PR (issue #47)", () => {
   });
 });
 
+describe("buildFixPrompt — the hosted-review worklist (issue #43)", () => {
+  const finding = {
+    threadId: "PRRT_codex",
+    latestCommentId: "PRRC_codex",
+    latestCommentHash: "ghijklmnopqrstuv",
+    reviewedSha: "head1",
+    severity: "P0" as const,
+    path: "src/review/review-loop.ts",
+    line: 1204,
+    side: "RIGHT" as const,
+    finding: "P0: the merge poll can burn its whole budget on a conversation blocker.",
+    evidence: "thread PRRT_codex by chatgpt-codex-connector (hosted-reviewer)",
+    authorType: "hosted-reviewer" as const,
+    author: "chatgpt-codex-connector",
+  };
+
+  const hostedPrompt = (over: Partial<Parameters<typeof buildFixPrompt>[0]["hosted"]> = {}): string =>
+    buildFixPrompt(
+      {
+        issue,
+        mode: "tdd",
+        phase: 0,
+        worklist,
+        behaviourPreserving: false,
+        hosted: { findings: [finding], humanThreads: [], headSha: "head1", ...over },
+      },
+      "npm run build",
+      "npm test",
+    );
+
+  it("names the exact thread, anchor and head the reply will be keyed on", () => {
+    const prompt = hostedPrompt();
+    expect(prompt).toContain("PRRT_codex");
+    expect(prompt).toContain("src/review/review-loop.ts:1204");
+    expect(prompt).toContain("head1");
+    // The finding verbatim — never a generic "the merge is blocked" (#3430).
+    expect(prompt).toContain("burn its whole budget on a conversation blocker");
+  });
+
+  it("requires an independent rationale AND its verification for every disposition", () => {
+    const prompt = hostedPrompt();
+    expect(prompt).toContain("dispositions");
+    expect(prompt).toContain("reasoned-invalid");
+    expect(prompt).toContain("rationale");
+    expect(prompt).toContain("verification");
+    // The binding rule, stated to the agent rather than merely enforced by the schema.
+    expect(prompt).toMatch(/not (accepted|valid).*because .*bot|bot .*(raised|recommended)/i);
+  });
+
+  it("tells the agent it may NOT resolve a human conversation", () => {
+    const prompt = hostedPrompt({ humanThreads: [{ ...finding, threadId: "PRRT_human", authorType: "human", author: "alice" }] });
+    expect(prompt).toContain("PRRT_human");
+    expect(prompt).toMatch(/never .*resolve|do not resolve/i);
+  });
+
+  it("leaves an ordinary fix prompt untouched — no hosted section, no disposition contract", () => {
+    const prompt = buildFixPrompt(
+      { issue, mode: "tdd", phase: 1, worklist, behaviourPreserving: false },
+      "npm run build",
+      "npm test",
+    );
+    expect(prompt).not.toContain("dispositions");
+    expect(prompt).not.toContain("PRRT_");
+  });
+});
+
 describe("buildHealGuidance (issue #9)", () => {
   it("combines the heal-card decision with the operator's answer", () => {
     const guidance = buildHealGuidance(

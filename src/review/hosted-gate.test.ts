@@ -90,9 +90,49 @@ describe("HostedReviewGate (issue #43)", () => {
     expect(verdict.kind).toBe("findings");
   });
 
-  it("reports clean when every thread is resolved or outdated", async () => {
+  it("reports clean when every thread is resolved or outdated ON THIS HEAD", async () => {
     github.setReviewThreads(50, [thread({ isResolved: true }), thread({ id: "PRRT_2", isOutdated: true })], HEAD);
     expect((await gate.observe(ctx)).kind).toBe("clean");
+  });
+
+  it("does not read 'every thread resolved on an OLD head' as the reviewer being happy (#43)", async () => {
+    // The state immediately after a repair: every thread the reviewer has is resolved/outdated
+    // and anchored to the PREVIOUS head, so it demonstrably has NOT looked at this one yet.
+    // Short-circuiting to `clean` here is exactly the "an empty read is the reviewer being
+    // happy" antapattern the module forbids — it would fire the merge before the re-review.
+    github.setReviewThreadSequence(50, [
+      {
+        kind: "threads",
+        threads: [thread({ isResolved: true, isOutdated: true, reviewedSha: "oldhead" })],
+        headSha: HEAD,
+      },
+      {
+        kind: "threads",
+        threads: [
+          thread({ isResolved: true, isOutdated: true, reviewedSha: "oldhead" }),
+          thread({
+            id: "PRRT_new",
+            reviewedSha: HEAD,
+            comments: [comment({ id: "PRRC_new", body: "P0: the repair broke the resolve path." })],
+          }),
+        ],
+        headSha: HEAD,
+      },
+    ]);
+
+    const verdict = await gate.observe(ctx);
+
+    expect(github.reviewThreadReads.length).toBeGreaterThan(1);
+    expect(verdict.kind).toBe("findings");
+    expect(verdict.kind === "findings" && verdict.worklist.findings.map((f) => f.threadId)).toEqual(["PRRT_new"]);
+  });
+
+  it("still short-circuits on the FIRST read when the repo has no hosted reviewer at all", async () => {
+    // An empty read is genuinely indistinguishable from "no hosted reviewer is configured", so
+    // it must not stall the merge for the whole observation budget on every repo.
+    github.setReviewThreads(50, [], HEAD);
+    expect((await gate.observe(ctx)).kind).toBe("clean");
+    expect(github.reviewThreadReads).toHaveLength(1);
   });
 
   it("defers (never escalates) when GitHub rate-limits the thread read", async () => {

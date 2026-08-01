@@ -20,6 +20,15 @@ import { parseConfig } from "../config/load";
 import type { Account } from "../config/schema";
 import type { RouteWorld } from "../providers/resolve";
 import type { TranscriptMessage } from "../store/events/transcript";
+import { AbortAwareAgentRunner } from "../testing/fake-agent";
+import { formatRalphAnswer } from "../hitl/answer";
+import { formatRalphQuestion, type EscalationQuestion } from "../review/escalation";
+import type {
+  HarnessEscalationInput,
+  HarnessEscalationResult,
+  MasterEscalationPort,
+} from "../master/harness-escalation";
+import { operatorActionFor } from "./anomaly-action";
 
 const silent = createLogger({ write: () => {} });
 
@@ -1300,5 +1309,238 @@ describe("Reconciler — CI poller (off-slot pre-review CI gate, ADR-0022 stage 
       // And the URL-form ref gates identically to #n: satisfied → launched.
       expect(store.getRunByIssue(5)).toBeDefined();
     });
+  });
+});
+
+/** A recording {@link MasterEscalationPort}: every harness escalation, in order, and no writes. */
+class RecordingEscalation implements MasterEscalationPort {
+  readonly calls: HarnessEscalationInput[] = [];
+  async escalate(input: HarnessEscalationInput): Promise<HarnessEscalationResult> {
+    this.calls.push(input);
+    return { kind: "queued", signature: "sig", promotedFrom: null, commentId: null };
+  }
+}
+
+const askedQuestion: EscalationQuestion = {
+  headline: "Which contract is authoritative?",
+  feature: "Ledger",
+  whereWeStand: "Two committed contracts disagree.",
+  decision: "Which one governs?",
+  stakes: "Every later session is bound by the answer.",
+  recommendation: "Keep the older one.",
+};
+
+describe("anomaly → master door (ADR-0042 / issue #43)", () => {
+  const isoT0 = "2026-06-01T00:00:00.000Z";
+  const t0 = Date.parse(isoT0);
+  let github: FakeGitHub;
+
+  beforeEach(() => {
+    github = new FakeGitHub();
+  });
+
+  it("spends NO master intervention on a rate-limited stranded answer, and self-heals it first", async () => {
+    // #132 + issue #43: the operator answered a MASTER's `ask_human`, but the
+    // `ready-for-agent` re-arm was rate-limited. That is a GitHub condition the daemon
+    // retries itself — it must not burn one of the two per-phase master interventions,
+    // and it must not flip the run off `awaiting-answer` (where the resume scan, which
+    // reads only `awaiting-answer`/`review-maxed`, would lose the operator's answer).
+    const store = openStore(MEMORY_DB).forRepo("owner/repo");
+    try {
+      github.seed({ number: 21, title: "answered but stranded", labels: [LABEL_AWAITING_ANSWER, "afk", "mode:tdd"] });
+      const run = store.upsertRun({ issueNumber: 21, mode: "tdd", branch: "ralph/21-x", prNumber: 210 });
+      await store.recordMasterInterventionStarted({
+        issueNumber: 21,
+        runId: run.id,
+        attempt: 1,
+        phase: "impl",
+        signature: "escalate|impl|blocked",
+      });
+      const question = await github.postComment(21, formatRalphQuestion(askedQuestion));
+      await store.recordMasterHumanQuestion({
+        issueNumber: 21,
+        runId: run.id,
+        attempt: 1,
+        phase: "impl",
+        headline: askedQuestion.headline,
+        commentId: question.id,
+      });
+      // The operator answered on the thread; the label swap-back never landed.
+      await github.postComment(21, formatRalphAnswer({ kind: "free-text", text: "the older one governs" }));
+
+      const escalation = new RecordingEscalation();
+      const worktrees = new FakeWorktreeManager();
+      const executor = new Executor({
+        store,
+        github,
+        worktrees,
+        agentRunner: new PrOpeningAgentRunner(github),
+        logger: silent,
+      });
+      let reconciler: Reconciler;
+      reconciler = new Reconciler({
+        store,
+        github,
+        executor,
+        worktrees,
+        logger: silent,
+        budget: budgetFor(() => reconciler.activeCount(), 5),
+        cap: 5,
+        priorityLabels: [],
+        targetRepo: "owner/repo",
+        reconcileIntervalSeconds: 30,
+        masterEscalation: escalation,
+      });
+
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+
+      // No master request of any kind — not from the anomaly door, not from adoption.
+      expect(escalation.calls).toEqual([]);
+      expect(store.readIssueStream(21).filter((e) => e.type === "MasterTriageRequested")).toEqual([]);
+      // The run stays exactly where the operator's answer can still find it…
+      expect(store.getRunByIssue(21)!.status).toBe("awaiting-answer");
+      // …the deterministic self-heal ran (the re-arm the rate limit dropped)…
+      expect(github.issues.get(21)!.labels).toContain(LABEL_READY);
+      // …and the island stays visible while it clears.
+      expect(github.issues.get(21)!.labels).toContain(LABEL_DAEMON_ANOMALY);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("names the operator action on the issue itself when it parks a daemon-anomaly", async () => {
+    // Issue #43: "`daemon-anomaly` … must name the operator action required." A label plus a
+    // noun in a log file is not an action.
+    const store = openStore(MEMORY_DB).forRepo("owner/repo");
+    try {
+      // A pause label with NO run row: rehydrate could not rebuild it, so an answer would
+      // resume nothing — `paused-label-missing-run`, an island with no master context.
+      github.seed({ number: 22, title: "no run behind it", labels: [LABEL_REVIEW_MAXED, "afk", "mode:tdd"] });
+      const { reconciler } = wire({ github, store, runner: new PrOpeningAgentRunner(github) });
+
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+
+      expect(github.issues.get(22)!.labels).toContain(LABEL_DAEMON_ANOMALY);
+      const posted = (github.comments.get(22) ?? []).map((c) => c.body);
+      const action = posted.find((b) => b.includes("Operator action"));
+      expect(action).toBeDefined();
+      expect(action).toContain("paused-label-missing-run");
+      expect(action).toContain(operatorActionFor("paused-label-missing-run"));
+
+      // Edge-triggered: a second tick over the same standing anomaly posts nothing more.
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+      expect((github.comments.get(22) ?? []).filter((c) => c.body.includes("Operator action"))).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("produces exactly ONE master request for a wedged run — the session-failure door's", async () => {
+    // Issue #43 requires "exactly one master request" per detected failure. A wedged run
+    // is aborted by the sweep and classified `run-wedged-past-lifetime` in the SAME tick;
+    // when the killed session settles, the executor's session-failure door escalates it
+    // with the real error. Two doors, one failure — the reconciler yields to the executor's,
+    // which carries strictly better evidence.
+    let clock = t0;
+    const store = openStore(MEMORY_DB, { now: () => new Date(clock).toISOString() }).forRepo("owner/repo");
+    try {
+      github.seed({ number: 23, title: "wedged" });
+      const escalation = new RecordingEscalation();
+      const runner = new AbortAwareAgentRunner();
+      const worktrees = new FakeWorktreeManager();
+      const executor = new Executor({
+        store,
+        github,
+        worktrees,
+        agentRunner: runner,
+        logger: silent,
+        masterEscalation: escalation,
+      });
+      let reconciler: Reconciler;
+      reconciler = new Reconciler({
+        store,
+        github,
+        executor,
+        worktrees,
+        logger: silent,
+        budget: budgetFor(() => reconciler.activeCount(), 1),
+        cap: 1,
+        priorityLabels: [],
+        targetRepo: "owner/repo",
+        reconcileIntervalSeconds: 30,
+        maxRunLifetimeMs: 1000,
+        masterEscalation: escalation,
+        now: () => new Date(clock),
+      });
+
+      await reconciler.tick(); // launches #23
+      expect(runner.started).toEqual([23]);
+
+      // Past the lifetime ceiling: the sweep aborts it and the completeness pass classifies
+      // it wedged. The anomaly door must NOT enqueue — the abort is already in flight.
+      clock = t0 + 5000;
+      await reconciler.tick();
+      expect(runner.aborted).toContain(23);
+      expect(escalation.calls).toEqual([]);
+      // …but it is still visibly surfaced while the kill settles.
+      expect(github.issues.get(23)!.labels).toContain(LABEL_DAEMON_ANOMALY);
+
+      // A re-entrant sweep on a later tick still enqueues nothing.
+      clock = t0 + 6000;
+      await reconciler.tick();
+      expect(escalation.calls).toEqual([]);
+
+      // The killed session finally dies → the session-failure door files the one request.
+      runner.die(23);
+      await reconciler.awaitInFlight();
+      expect(escalation.calls).toHaveLength(1);
+      expect(escalation.calls[0]).toMatchObject({ issueNumber: 23, source: "session-failed", phase: "impl" });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("still enqueues a master for an anomaly the daemon did NOT just abort", async () => {
+    // The wedge suppression is scoped to the abort, not to the anomaly door: an answered pause
+    // whose resume context was lost (#9 — nothing in flight, nothing aborted) still reaches a
+    // master.
+    const store = openStore(MEMORY_DB).forRepo("owner/repo");
+    try {
+      github.seed({ number: 24, title: "lost resume context", labels: [LABEL_READY, "afk", "mode:tdd"] });
+      await seedRun(store, { issueNumber: 24, mode: "tdd", status: "awaiting-answer", branch: "ralph/24-x" });
+      const escalation = new RecordingEscalation();
+      const worktrees = new FakeWorktreeManager();
+      const executor = new Executor({
+        store,
+        github,
+        worktrees,
+        agentRunner: new PrOpeningAgentRunner(github),
+        logger: silent,
+      });
+      let reconciler: Reconciler;
+      reconciler = new Reconciler({
+        store,
+        github,
+        executor,
+        worktrees,
+        logger: silent,
+        budget: budgetFor(() => reconciler.activeCount(), 5),
+        cap: 5,
+        priorityLabels: [],
+        targetRepo: "owner/repo",
+        reconcileIntervalSeconds: 30,
+        masterEscalation: escalation,
+      });
+
+      await reconciler.tick();
+      await reconciler.awaitInFlight();
+
+      expect(escalation.calls.map((c) => c.source)).toContain("anomaly");
+    } finally {
+      store.close();
+    }
   });
 });

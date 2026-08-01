@@ -12,6 +12,7 @@ import { Reconciler, type ReconcileBudget } from "../daemon/reconciler";
 import { Executor } from "../executor/executor";
 import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_MASTER_TRIAGE, LABEL_REVIEW_MAXED } from "../core/labels";
 import { RALPH_QUESTION_FENCE, formatRalphQuestion } from "../review/escalation";
+import { formatRalphAnswer } from "../hitl/answer";
 import { legacyHealCardComment } from "../testing/legacy-cards";
 import { seedRun } from "../testing/seed-run";
 import type { Issue, Run } from "../store/types";
@@ -53,6 +54,8 @@ const base = {
   masterAdjudicated: false,
   masterQueued: false,
   unansweredQuestion: false,
+  answeredStrandedPause: false,
+  masterAwaitingHuman: false,
 };
 
 describe("planAdoption (ADR-0042 migration)", () => {
@@ -111,8 +114,63 @@ describe("planAdoption (ADR-0042 migration)", () => {
       issue: issue({ labels: [LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED] }),
       run: run({ status: "review-maxed" }),
       unansweredQuestion: false,
+      answeredStrandedPause: true,
     });
     expect(plan?.kind).toBe("review-maxed");
+  });
+
+  it("adopts a PLAIN answered-but-stranded pause — the resumed owner is the master", () => {
+    // The contract this module states in its own header: an answered-but-stranded pause is
+    // not a live question, and after the cutover the owner that resumes it is a master. With
+    // no retired label to route on, it fell through every branch and was adopted by nothing —
+    // so the compensator re-armed it and the *worker* was handed a decision it could not make.
+    const plan = planAdoption({
+      ...base,
+      issue: issue({ labels: [LABEL_AWAITING_ANSWER] }),
+      run: run({ status: "awaiting-answer" }),
+      // The store's open-question index is stale by design for a stranded pause, so the
+      // comment ledger is what says "answered".
+      unansweredQuestion: true,
+      answeredStrandedPause: true,
+    });
+    expect(plan).toMatchObject({ kind: "answered-pause", source: "escalate", phase: "impl" });
+    expect(plan!.headline.toLowerCase()).toContain("answered");
+  });
+
+  it("routes an answered-but-stranded REVIEW-origin pause back into its own phase", () => {
+    const plan = planAdoption({
+      ...base,
+      issue: issue({ labels: [LABEL_AWAITING_ANSWER] }),
+      run: run({ status: "awaiting-answer" }),
+      healPhase: 2,
+      answeredStrandedPause: true,
+    });
+    expect(plan).toMatchObject({ kind: "answered-pause", phase: "review-2" });
+  });
+
+  it("leaves a MASTER's own answered question alone — its answer resumes that master", () => {
+    // A master `ask_human` already has master provenance in the stream; adopting it would
+    // append a SECOND request for one adjudication and spend a fresh intervention.
+    expect(
+      planAdoption({
+        ...base,
+        issue: issue({ labels: [LABEL_AWAITING_ANSWER] }),
+        run: run({ status: "awaiting-answer" }),
+        answeredStrandedPause: true,
+        masterAwaitingHuman: true,
+      }),
+    ).toBeNull();
+  });
+
+  it("leaves an UNANSWERED pause alone even when nothing else applies", () => {
+    expect(
+      planAdoption({
+        ...base,
+        issue: issue({ labels: [LABEL_AWAITING_ANSWER] }),
+        run: run({ status: "awaiting-answer" }),
+        unansweredQuestion: true,
+      }),
+    ).toBeNull();
   });
 
   it("leaves an already-queued or already-adjudicating run alone (no double request)", () => {
@@ -253,6 +311,55 @@ describe("the reconciler's adoption pass (ADR-0042 migration)", () => {
 
     expect(store.getRunByIssue(8)).toBeUndefined();
     expect((github.comments.get(8) ?? []).filter((c) => c.body.includes(RALPH_MASTER_REQUEST_FENCE))).toHaveLength(0);
+  });
+
+  it("adopts an answered-but-stranded pause and hands the resume to a master, not the worker", async () => {
+    // #132 on a pre-cutover build: the operator answered, the `ready-for-agent` re-arm was
+    // rate-limited, and the run is parked at `awaiting-answer` where nothing services it. The
+    // cutover's answer is that the resumed owner is a master — so the pause is adopted onto the
+    // master queue with the operator's reply preserved as evidence, and the compensator must
+    // NOT then re-arm it back into the worker's resume path.
+    github.seed({ number: 10, title: "Answered, stranded", labels: [LABEL_AWAITING_ANSWER, "afk", "mode:tdd"] });
+    const question = {
+      headline: "Which contract is authoritative?",
+      feature: "Ledger",
+      whereWeStand: "Two committed contracts disagree.",
+      decision: "Which one governs?",
+      stakes: "Every later session is bound by the answer.",
+      recommendation: "Keep the older one.",
+    };
+    const posted = await github.postComment(10, formatRalphQuestion(question));
+    await github.postComment(10, formatRalphAnswer({ kind: "free-text", text: "the older one governs" }));
+    const seeded = await seedRun(store, {
+      issueNumber: 10,
+      mode: "tdd",
+      status: "awaiting-answer",
+      branch: "ralph/10-x",
+      prNumber: 100,
+    });
+    // The open-question index the operator's answer never cleared — the stale half of #132.
+    store.setResumeContext(seeded.id, { question, commentId: posted.id }, "ralph/10-x");
+
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    expect(store.getRunByIssue(10)!.status).toBe("master-triage");
+    const requests = (github.comments.get(10) ?? []).filter((c) => c.body.includes(RALPH_MASTER_REQUEST_FENCE));
+    expect(requests).toHaveLength(1);
+    // The master is told the operator already replied and where the reply is.
+    expect(requests[0]!.body.toLowerCase()).toContain("answer");
+    // The pause label gives way to the queue marker, and the compensator did NOT re-arm a run
+    // that has left the pause (a `ready-for-agent` here would suppress the `master-triage`
+    // label effect and drop the escalation back into ordinary admission).
+    const labels = github.issues.get(10)!.labels;
+    expect(labels).toContain(LABEL_MASTER_TRIAGE);
+    expect(labels).not.toContain(LABEL_AWAITING_ANSWER);
+    expect(labels).not.toContain("ready-for-agent");
+
+    // Idempotent: a second tick appends no second request.
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+    expect(store.readIssueStream(10).filter((e) => e.type === "MasterTriageRequested")).toHaveLength(1);
   });
 
   it("survives a partial GitHub write — the request lands even when the label strip fails", async () => {

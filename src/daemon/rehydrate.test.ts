@@ -34,7 +34,9 @@ import {
   LABEL_READY,
   LABEL_REVIEW_MAXED,
 } from "../hitl/labels";
-import { LABEL_AWAITING_MERGE } from "../core/labels";
+import { LABEL_AWAITING_MERGE, LABEL_MASTER_TRIAGE } from "../core/labels";
+import { foldMasterHistory } from "../master/history";
+import { formatMasterRequestComment } from "../master/request";
 import { ReviewLoop, type MergeConfig } from "../review/review-loop";
 import type { Worklist } from "../review/worklist";
 import { Reconciler, type ReconcileBudget } from "./reconciler";
@@ -438,5 +440,130 @@ describe("startup reconciliation — cold store (AC2, AC4)", () => {
     expect(worktrees.attached.map((a) => a.branch)).toContain(branch);
     expect(store.getRunByIssue(15)!.status).toBe("merged");
     expect(github.merges.map((m) => m.prNumber)).toContain(pr.number);
+  });
+});
+
+describe("startup reconciliation — the master cutover's checkpoint PRs (ADR-0042)", () => {
+  let store: Store;
+  let github: FakeGitHub;
+
+  beforeEach(() => {
+    store = openStore(MEMORY_DB).forRepo("owner/repo");
+    github = new FakeGitHub();
+  });
+  afterEach(() => store.close());
+
+  it("never resurrects an `agent-stuck` terminal, even though its checkpoint PR is still open", async () => {
+    // The cutover made a WIP checkpoint (a draft PR carrying the launch marker) MANDATORY
+    // before any master escalation, and `terminalStuck` never closes it. So a master terminal
+    // now looks exactly like an in-flight review run to a cold rehydrate: open issue, open
+    // marker PR, no pause label. Rebuilding it as `running` would strip `agent-stuck` on the
+    // next tick (the status projection desires no label for `running`) and re-drive review on
+    // the surviving PR — resurrecting a decision a master already made. A terminal label is
+    // terminal, PR or no PR.
+    const branch = branchName(9, "Master said no");
+    github.seed({ number: 9, title: "Master said no", labels: [LABEL_AGENT_STUCK, "afk", "mode:tdd"] });
+    const pr = github.openPullRequest(branch, prBody(9, branch));
+    github.setCiGreen(pr.number);
+
+    const { reconciler, worktrees } = wire({ github, store, withReview: true });
+    await reconciler.rehydrate();
+    await reconciler.awaitInFlight();
+
+    expect(store.getRunByIssue(9)).toBeUndefined();
+    expect(worktrees.attached.map((a) => a.branch)).not.toContain(branch);
+
+    // …and a tick leaves the terminal alone: the label survives, review is never re-driven,
+    // and the issue is visibly parked for a human rather than surfaced as an island.
+    await reconciler.tick();
+    await reconciler.awaitInFlight();
+
+    expect(github.issues.get(9)!.labels).toContain(LABEL_AGENT_STUCK);
+    expect(github.issues.get(9)!.labels).not.toContain("daemon-anomaly");
+    expect(github.merges).toHaveLength(0);
+    expect(store.getRunByIssue(9)).toBeUndefined();
+  });
+
+  it("rebuilds the MASTER provenance of an outstanding `ask_human`, so the answer resumes the master", async () => {
+    // Only a master may ask a question after the cutover, and an answer must resume that
+    // master's checkpointed adjudication — never the worker that could not make the call.
+    // `awaitingHuman` is folded ONLY from `MasterHumanQuestionRequested`, so a cold rehydrate
+    // that rebuilt the pause as a bare worker escalation would silently re-route the answer.
+    const branch = branchName(16, "Master asked");
+    github.seed({ number: 16, title: "Master asked", labels: [LABEL_AWAITING_ANSWER, "afk", "complexity:1", "mode:tdd"] });
+    const pr = github.openPullRequest(branch, prBody(16, branch));
+    // The durable evidence a master escalation always leaves, then the master's question.
+    await github.postComment(
+      16,
+      formatMasterRequestComment({
+        source: "escalate",
+        lane: "impl",
+        phase: "impl",
+        issueNumber: 16,
+        runId: 1,
+        branch,
+        signature: "escalate|impl|blocked",
+        evidence: { headline: "blocked", recommendation: "look at the ledger", detail: "blocked" },
+      }),
+    );
+    void github.postComment(16, formatRalphQuestion(question));
+
+    const { reconciler } = wire({ github, store });
+    await reconciler.rehydrate();
+    await reconciler.awaitInFlight();
+
+    const run = store.getRunByIssue(16)!;
+    expect(run.status).toBe("awaiting-answer");
+    // The question is still servable by `ralph-answer`…
+    expect(store.listOpenQuestions().map((q) => q.issueNumber)).toEqual([16]);
+    // …and the fold now knows a MASTER is the one waiting on it, on a re-adoptable attempt.
+    const history = foldMasterHistory(store.readIssueStream(16));
+    expect(history.awaitingHuman).toEqual({ attempt: 1, phase: "impl" });
+    expect(history.interventions).toHaveLength(1);
+    expect(history.interventions[0]).toMatchObject({ attempt: 1, phase: "impl", signature: "escalate|impl|blocked" });
+  });
+
+  it("leaves a PRE-CUTOVER worker escalation as a worker pause — no master provenance invented", async () => {
+    // The discriminator is the master's own fenced request comment. A pre-cutover
+    // `awaiting-answer` has none, so its answer must still resume the worker.
+    const branch = branchName(17, "Worker asked");
+    github.seed({ number: 17, title: "Worker asked", labels: [LABEL_AWAITING_ANSWER, "afk", "mode:tdd"] });
+    github.openPullRequest(branch, prBody(17, branch));
+    void github.postComment(17, formatRalphQuestion(question));
+
+    const { reconciler } = wire({ github, store });
+    await reconciler.rehydrate();
+    await reconciler.awaitInFlight();
+
+    expect(store.getRunByIssue(17)!.status).toBe("awaiting-answer");
+    expect(foldMasterHistory(store.readIssueStream(17)).awaitingHuman).toBeNull();
+  });
+
+  it("ignores a master request that PRE-DATES nothing — a queued escalation with no question", async () => {
+    // A `master-triage` park (request comment, no question) must keep rebuilding as the
+    // queued escalation it is, not as an `awaiting-answer` pause.
+    const branch = branchName(18, "Queued");
+    github.seed({ number: 18, title: "Queued", labels: [LABEL_MASTER_TRIAGE, "afk", "complexity:1", "mode:tdd"] });
+    const pr = github.openPullRequest(branch, prBody(18, branch));
+    await github.postComment(
+      18,
+      formatMasterRequestComment({
+        source: "escalate",
+        lane: "impl",
+        phase: "impl",
+        issueNumber: 18,
+        runId: 1,
+        branch,
+        signature: "escalate|impl|blocked",
+        evidence: { headline: "blocked", recommendation: "x", detail: "blocked" },
+      }),
+    );
+    expect(pr.state).toBe("OPEN");
+
+    const { reconciler } = wire({ github, store });
+    await reconciler.rehydrate();
+
+    expect(store.getRunByIssue(18)!.status).toBe("master-triage");
+    expect(foldMasterHistory(store.readIssueStream(18)).pending).not.toBeNull();
   });
 });

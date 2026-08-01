@@ -18,6 +18,7 @@
  */
 import type { RuntimeSnapshot } from "../projection/snapshot";
 import type { UsageState } from "../core/usage";
+import { loggedAnomalyAction } from "../daemon/anomaly-action";
 import { toWireUsage } from "./usage-projection";
 import type {
   AnomalyItem,
@@ -110,11 +111,25 @@ function toDaemonHealth(snapshot: RuntimeSnapshot): DaemonHealth | null {
 }
 
 /**
+ * A logged reason with the operator action it requires appended (issue #43: a
+ * `daemon-anomaly` "must name the operator action required"). The reason alone tells an
+ * operator what broke and never what to do about it, and this view is the dashboard they
+ * read. A reason outside the completeness vocabulary (a claim park's
+ * `claim-failed-after-N-attempts`, a reason from a newer build) is passed through untouched —
+ * inventing an action for a reason this build cannot recognise would be worse than silence.
+ */
+function withOperatorAction(reason: string): string {
+  const action = loggedAnomalyAction(reason);
+  return action ? `${reason} — ${action}` : reason;
+}
+
+/**
  * The surfaced completeness islands: anchor on the **live** backlog (issues currently
  * parked under `daemon-anomaly` — the set a human must repair), enriched with the latest
- * logged reason + instant for each. The anomaly edge is logged once (the label is the
- * standing signal), so the reason is read from the unbounded anomaly log, not the
- * bounded recent-outcomes feed. Repo+issue ordered for a stable list.
+ * logged reason + instant for each, and with the operator action that reason requires. The
+ * anomaly edge is logged once (the label is the standing signal), so the reason is read from
+ * the unbounded anomaly log, not the bounded recent-outcomes feed. Repo+issue ordered for a
+ * stable list.
  */
 function toAnomalies(snapshot: RuntimeSnapshot, anomalyLog: AnomalyLogRow[]): AnomalyItem[] {
   // Latest reason per (repo, issue). The log is newest-first, so the first seen wins.
@@ -137,7 +152,7 @@ function toAnomalies(snapshot: RuntimeSnapshot, anomalyLog: AnomalyLogRow[]): An
       return {
         repo: p.repo,
         issue: p.issueNumber,
-        reason: logged?.reason ?? UNKNOWN_REASON,
+        reason: logged?.reason ? withOperatorAction(logged.reason) : UNKNOWN_REASON,
         title: p.title,
         since: logged?.ts ?? null,
       };

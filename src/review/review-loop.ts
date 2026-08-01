@@ -37,8 +37,15 @@
  *   --delete-branch`. The issue auto-closes via `Closes #n`; the lease frees.
  *
  * A fix agent that hits a finding implying a risky structural change calls
- * `escalate` instead of applying it blind: the loop checkpoints, posts a
- * `ralph-question`, swaps to `awaiting-answer`, and stops (resume-not-restart).
+ * `escalate` instead of applying it blind. After the triage cutover (ADR-0042) that does NOT
+ * page anyone: the loop checkpoints and hands the agent's question to a tier-1 **master**,
+ * which adjudicates it and asks a human only if it must. `awaiting-answer` means a human
+ * decision is genuinely being requested, and only a master's `ask-human` may request one.
+ *
+ * The merge tail also runs the **GitHub-hosted review gate** (issue #43, DESIGN §13a.2): the
+ * hosted reviewer's conversations are a first-class integration gate, distinct from CI, whose
+ * findings the ordinary fix lane addresses — replying and resolving each thread only once the
+ * fix behind it is pushed and verified — before anything reaches the master.
  */
 
 import { setTimeout as sleep } from "node:timers/promises";
@@ -57,18 +64,27 @@ import type { Logger } from "../log/logger";
 import type { ScopedStore } from "../store/store";
 import type { MasterLane, MasterRequestSource, Mode, Phase } from "../store/types";
 import { BranchDivergedError, type RebaseResult, type WorktreeManager } from "../executor/worktree";
-import { AgentOutputParseError, RunnerInfraError, type FixAgentRunner, type ReviewAgentRunner } from "./agents";
+import {
+  AgentOutputParseError,
+  RunnerInfraError,
+  type FixAgentRunner,
+  type FixContext,
+  type ReviewAgentRunner,
+} from "./agents";
 import type { EscalationQuestion } from "./escalation";
 import {
   harnessEvidence,
   reviewPhaseKey,
   type MasterEscalationPort,
+  type PreservedSourceFact,
 } from "../master/harness-escalation";
-import { HostedReviewGate, type HostedGateContext } from "./hosted-gate";
+import { alreadyRepliedTo, foldHostedGateState, HostedReviewGate, type HostedGateContext } from "./hosted-gate";
 import {
   describeMergeBlock,
   hostedFailureDetail,
   renderHostedWorklist,
+  type HostedDisposition,
+  type HostedFinding,
   type HostedWorklist,
   type MergeBlockCause,
 } from "./hosted-review";
@@ -187,6 +203,64 @@ type MergeReadiness =
   | { kind: "mergeable" }
   | { kind: "resync"; state: MergeStateStatus }
   | { kind: "stuck"; outcome: ReviewLoopOutcome };
+
+/**
+ * What one consultation of the GitHub-hosted review gate decided (issue #43).
+ *
+ * `repaired` is the arm that makes the gate *convergent*: the ordinary fix lane addressed the
+ * first hosted worklist, its dispositions were replied and resolved on a verified head, and the
+ * merge path re-reads. Without it the gate could only ever escalate, so a master repair
+ * re-entered phase 0, found the thread still open, escalated again, and exhausted its budget
+ * into a terminal-stuck — a loop with no exit that was not a human.
+ */
+type HostedDecision =
+  /** Nothing hosted stands in the way (or no gate is wired). */
+  | { kind: "clear" }
+  /** A fix ran and was disposed on a verified head — re-read the merge state. */
+  | { kind: "repaired" }
+  /** Handed to the master with typed evidence. */
+  | { kind: "stuck"; outcome: ReviewLoopOutcome }
+  /** The base moved under the head; only a re-rebase clears it. */
+  | { kind: "resync"; state: "BEHIND" | "DIRTY" }
+  /** GitHub rate-limited the read: defer, never escalate, never spend a master attempt. */
+  | { kind: "defer"; detail: string };
+
+/**
+ * The hosted fix lane's budget for ONE integration pass. Deliberately in-memory rather than a
+ * `(run, phase)` row: the durable anti-loop guard is the reply-hash fold (a finding whose
+ * content Ralph already answered is a repeat, whatever the process history), and counting
+ * hosted attempts in the phase-0 fix budget would let a conversation blocker eat the CI gate's.
+ */
+interface HostedFixState {
+  attempts: number;
+}
+
+/**
+ * The result of one hosted fix dispatch: the agent's dispositions, or a decision the loop has
+ * already settled (an `escalate`, or a container terminal degraded through the shared helper).
+ */
+type HostedFixRun =
+  | { kind: "fixed"; dispositions: HostedDisposition[] }
+  | { kind: "settled"; decision: HostedDecision };
+
+/**
+ * GitHub rate-limited the hosted-review read for the whole merge-readiness wait.
+ *
+ * Thrown rather than escalated, because a cap is a **wait**, not a fault (ADR-0042 §4): the
+ * executor's merge path already recognises a transient GitHub limit and leaves the run
+ * `awaiting-merge` for the next tick, which is exactly the defer/rotation semantics the ADR
+ * binds. Escalating instead would spend a master intervention on a condition that resolves
+ * itself AND — because the loop fell through to the generic merge-blocked arm — name a blocker
+ * that does not exist (`merge-not-mergeable state=CLEAN`), the same mis-attribution as #3430.
+ */
+export class HostedGateRateLimitedError extends Error {
+  constructor(readonly detail: string) {
+    // The wording matters: `isGitHubRateLimitError` is the single source of truth for "transient
+    // GitHub limit" and classifies by text, so this must read as one.
+    super(`GitHub rate limit on the hosted review read: ${detail}`);
+    this.name = "HostedGateRateLimitedError";
+  }
+}
 
 /** The terminal outcome of a single phase. */
 type PhaseOutcome =
@@ -761,8 +835,12 @@ export class ReviewLoop {
       rebaseConflict?: boolean;
       /** Set for a review-phase fix: the findings live in this PR's ralph-review comment. */
       reviewComment?: { prNumber: number; phase: Phase };
+      /** Set for a hosted-review fix: the reviewer's threads, with the identity a reply needs. */
+      hosted?: FixContext["hosted"];
     },
-  ): Promise<{ kind: "fixed" } | { kind: "escalated"; question: EscalationQuestion }> {
+  ): Promise<
+    { kind: "fixed"; dispositions?: HostedDisposition[] } | { kind: "escalated"; question: EscalationQuestion }
+  > {
     // A heal's operator guidance is scoped to the phase that maxed out: once the
     // loop advances past the re-entered phase the ruling is stale, so later phases
     // get a normal (unguided) fix attempt (issue #9).
@@ -782,6 +860,7 @@ export class ReviewLoop {
       behaviourPreserving: opts.behaviourPreserving,
       guidance,
       rebaseConflict: opts.rebaseConflict,
+      hosted: opts.hosted,
       logger: ctx.logger,
       abortSignal: ctx.abortSignal,
       transcriptSink: this.transcriptSink(ctx),
@@ -789,7 +868,7 @@ export class ReviewLoop {
     if (outcome.kind === "escalate") {
       return { kind: "escalated", question: outcome.question };
     }
-    return { kind: "fixed" };
+    return { kind: "fixed", ...(outcome.dispositions ? { dispositions: outcome.dispositions } : {}) };
   }
 
   /**
@@ -1259,20 +1338,36 @@ export class ReviewLoop {
    * only if it never clears within the CI budget park `review-maxed` (PR preserved,
    * healable) instead of racing the merge. Bounded by read count (not wall-clock) so it
    * terminates deterministically under a no-op sleep in tests and stays bounded in
-   * production. Skipped when CI gating is off (no required checks to wait on — the
-   * dogfood repo merges directly as before). Returns a terminal outcome if the head
-   * never became mergeable, else `null` (proceed to merge).
+   * production.
+   *
+   * With CI gating off there is no required check to wait on, so the poll is skipped — but the
+   * **hosted-review gate is not CI** and still runs ({@link hostedOnlyGate}). Conflating the two
+   * is how a `merge.waitForChecks: false` repo merged past unread review threads.
+   *
+   * Returns `mergeable`, a `resync` hand-back, or a `stuck` terminal — and throws
+   * {@link HostedGateRateLimitedError} when the wait ended still rate-limited, so the executor
+   * defers the run instead of the master being paid for a wait.
    */
   private async awaitMergeable(ctx: ReviewLoopContext): Promise<MergeReadiness> {
+    // The hosted reviewer is a gate of its own, DISTINCT from CI (DESIGN §13a.2). `waitForChecks`
+    // turns off the *required-check* wait; it does not turn off review threads. Returning
+    // `mergeable` here — as this did — merged every PR on such a repo past an unread hosted gate,
+    // because awaitMergeable is the sole caller of both hosted consultations.
+    const hostedFix: HostedFixState = { attempts: 0 };
     if (!this.deps.merge.waitForChecks) {
-      return { kind: "mergeable" };
+      return this.hostedOnlyGate(ctx, hostedFix);
     }
     const naps = this.deps.sleep ?? ((ms: number) => sleep(ms));
     const pollSeconds = Math.max(1, this.deps.merge.pollIntervalSeconds);
     const maxPolls = Math.max(1, Math.ceil((this.deps.merge.ciTimeoutMinutes * 60) / pollSeconds));
     let last: MergeStateStatus = "UNKNOWN";
+    // The detail of a hosted read the CURRENT poll deferred on, if any. A wait that ends while
+    // still rate-limited is a wait, not a merge failure (see {@link HostedGateRateLimitedError});
+    // reset every poll so a limit that cleared cannot excuse a later, genuine blocker.
+    let deferredBy: string | null = null;
     for (let poll = 0; poll < maxPolls; poll++) {
       ctx.abortSignal?.throwIfAborted();
+      deferredBy = null;
       const snapshot = await this.deps.github.readMergeStatus(ctx.prNumber);
       last = snapshot.state;
       ctx.logger.info("review.merge-status", { state: snapshot.state, poll });
@@ -1290,12 +1385,24 @@ export class ReviewLoop {
         // yet", never "the reviewer is happy"; an unreadable read fails closed; a rate-limit
         // defers by re-polling. The merge command stays unreachable until the reviewer has
         // observed the current head (or the bounded wait proves the repo has no hosted reviewer).
-        const hosted = await this.hostedObserveVerdict(ctx, snapshot);
-        if (hosted.kind !== "defer") {
+        const hosted = await this.hostedObserveVerdict(ctx, snapshot, hostedFix);
+        if (hosted.kind === "clear") {
+          return { kind: "mergeable" };
+        }
+        if (hosted.kind === "stuck") {
           return hosted;
+        }
+        if (hosted.kind === "resync") {
+          return { kind: "resync", state: hosted.state };
+        }
+        if (hosted.kind === "repaired") {
+          // The fix lane answered the worklist and its dispositions are on the threads: re-read
+          // the merge state now rather than sleeping out a poll on stale evidence.
+          continue;
         }
         // Rate-limited read: keep polling within the CI budget, exactly as the BLOCKED arm does,
         // rather than merging past an unread gate on transient evidence.
+        deferredBy = hosted.detail;
       }
       // The strict-up-to-date treadmill (#31): the base advanced under the rebased head (BEHIND)
       // or into a textual conflict (DIRTY). Neither self-clears by waiting — hand back to the
@@ -1311,14 +1418,31 @@ export class ReviewLoop {
       // so polling it would burn the entire CI budget and then blame CI for a green CI. This runs
       // on the FIRST blocked read, so the budget is never spent on a non-CI cause.
       if (snapshot.state === "BLOCKED") {
-        const typed = await this.hostedGateVerdict(ctx, snapshot);
-        if (typed) {
+        const typed = await this.hostedGateVerdict(ctx, snapshot, hostedFix);
+        if (typed.kind === "stuck") {
           return typed;
         }
+        if (typed.kind === "resync") {
+          return { kind: "resync", state: typed.state };
+        }
+        if (typed.kind === "repaired") {
+          continue;
+        }
+        if (typed.kind === "defer") {
+          deferredBy = typed.detail;
+        }
+        // `clear` — a pending required check (or no hosted gate): the poll below funds it.
       }
       if (poll < maxPolls - 1) {
         await naps(pollSeconds * 1000);
       }
+    }
+    // The wait ended while the hosted read was still rate-limited: that is a WAIT, not a merge
+    // failure. Defer it through the same path every transient GitHub limit takes, so no master
+    // attempt is spent and no phantom blocker is named (ADR-0042 §4).
+    if (deferredBy) {
+      ctx.logger.warn("review.merge-deferred-rate-limit", { pr: ctx.prNumber, polls: maxPolls });
+      throw new HostedGateRateLimitedError(deferredBy);
     }
     // BLOCKED/DRAFT/UNKNOWN past the CI budget: a required check that never greened (or a draft) —
     // hand it to the master with the blocker typed as far as the evidence allows.
@@ -1354,29 +1478,33 @@ export class ReviewLoop {
   private async hostedGateVerdict(
     ctx: ReviewLoopContext,
     snapshot: MergeStatusSnapshot,
-  ): Promise<MergeReadiness | null> {
+    hostedFix: HostedFixState,
+  ): Promise<HostedDecision> {
     const wired = this.hostedGateContext(ctx, snapshot);
     if (!wired) {
-      return null;
+      return { kind: "clear" };
     }
     const { cause, worklist } = await wired.gate.classify(wired.gateCtx, snapshot, await this.readChecksQuietly(ctx));
     if (cause.kind === "mergeable") {
-      return null;
+      return { kind: "clear" };
     }
     if (cause.kind === "required-checks" && cause.pending) {
       // The one cause waiting can cure — let the ordinary poll loop fund it.
-      return null;
+      return { kind: "clear" };
     }
     if (cause.kind === "behind-or-conflict") {
       return { kind: "resync", state: cause.state };
     }
     if (cause.kind === "threads-unavailable" && cause.reason === "rate-limited") {
       ctx.logger.warn("review.hosted-rate-limited", { pr: ctx.prNumber });
-      return null;
+      return { kind: "defer", detail: cause.detail };
+    }
+    if (cause.kind === "hosted-review" && worklist) {
+      return this.driveHostedFindings(ctx, wired, worklist, cause, hostedFix);
     }
     return {
       kind: "stuck",
-      outcome: await this.escalateHostedBlocker(ctx, cause, worklist, wired.head),
+      outcome: await this.escalateHostedBlocker(ctx, { cause, worklist, head: wired.head, attempts: hostedFix.attempts }),
     };
   }
 
@@ -1402,29 +1530,264 @@ export class ReviewLoop {
   private async hostedObserveVerdict(
     ctx: ReviewLoopContext,
     snapshot: MergeStatusSnapshot,
-  ): Promise<{ kind: "mergeable" } | { kind: "stuck"; outcome: ReviewLoopOutcome } | { kind: "defer" }> {
+    hostedFix: HostedFixState,
+  ): Promise<HostedDecision> {
     const wired = this.hostedGateContext(ctx, snapshot);
     if (!wired) {
-      return { kind: "mergeable" };
+      return { kind: "clear" };
     }
     const verdict = await wired.gate.observe(wired.gateCtx);
     switch (verdict.kind) {
       case "clean":
-        return { kind: "mergeable" };
+        return { kind: "clear" };
       case "defer":
         // GitHub rate limits defer through the existing rate-limit path — never a master attempt.
         ctx.logger.warn("review.hosted-rate-limited", { pr: ctx.prNumber });
-        return { kind: "defer" };
+        return { kind: "defer", detail: verdict.detail };
       case "findings":
-        return {
-          kind: "stuck",
-          outcome: await this.escalateHostedBlocker(ctx, verdict.cause, verdict.worklist, verdict.headSha),
-        };
+        return this.driveHostedFindings(
+          ctx,
+          { ...wired, head: verdict.headSha },
+          verdict.worklist,
+          verdict.cause,
+          hostedFix,
+        );
       case "blocked":
         return {
           kind: "stuck",
-          outcome: await this.escalateHostedBlocker(ctx, verdict.cause, null, verdict.headSha),
+          outcome: await this.escalateHostedBlocker(ctx, {
+            cause: verdict.cause,
+            worklist: null,
+            head: verdict.headSha,
+            attempts: hostedFix.attempts,
+          }),
         };
+    }
+  }
+
+  /**
+   * The merge-readiness gate for a repo with CI gating **off** (`merge.waitForChecks: false`).
+   * There is no required check to wait on, so there is no poll budget — but the hosted reviewer
+   * is not CI, and its conversations still block the merge under the repository's ruleset. Each
+   * round re-reads the head (a repair moves it) and re-observes; the rounds are bounded by the
+   * fix lane's own attempt budget, which every `repaired` spends exactly one of.
+   */
+  private async hostedOnlyGate(ctx: ReviewLoopContext, hostedFix: HostedFixState): Promise<MergeReadiness> {
+    if (!this.deps.hostedGate) {
+      return { kind: "mergeable" };
+    }
+    for (let round = 0; round <= this.deps.maxFixAttempts; round += 1) {
+      ctx.abortSignal?.throwIfAborted();
+      const snapshot = await this.deps.github.readMergeStatus(ctx.prNumber);
+      // Base movement is the integration loop's job, not the gate's — hand it back to re-rebase.
+      if (snapshot.state === "BEHIND" || snapshot.state === "DIRTY") {
+        return { kind: "resync", state: snapshot.state };
+      }
+      const hosted = await this.hostedObserveVerdict(ctx, snapshot, hostedFix);
+      switch (hosted.kind) {
+        case "clear":
+          return { kind: "mergeable" };
+        case "stuck":
+          return hosted;
+        case "resync":
+          return { kind: "resync", state: hosted.state };
+        case "defer":
+          // A cap is a wait: defer exactly as the polled path does (never a master attempt).
+          throw new HostedGateRateLimitedError(hosted.detail);
+        case "repaired":
+          break; // re-read the (moved) head and re-observe
+      }
+    }
+    ctx.logger.warn("review.hosted-gate-unsettled", { pr: ctx.prNumber, attempts: hostedFix.attempts });
+    return {
+      kind: "stuck",
+      outcome: await this.escalateToMaster(ctx, {
+        phase: CI_PHASE,
+        worklist: mergeBlockedWorklist("UNKNOWN"),
+        attempts: hostedFix.attempts,
+        source: "hosted-review",
+        lane: "merge",
+        headline: "The GitHub-hosted review gate never settled on a stable head",
+        detail: "hosted-gate-unsettled after the fix lane's attempt budget",
+      }),
+    };
+  }
+
+  /**
+   * The **ordinary fix lane over a hosted worklist** (issue #43 AC, ADR-0042 §11–§13). The
+   * first worklist is work, not an escalation: the fix agent is handed the actual findings with
+   * their thread identity, anchor and head, and its dispositions are replied and resolved on the
+   * thread — but only once the push behind them is verified.
+   *
+   * Everything that cannot converge goes to the master **before any human question**:
+   *  - **conflicting findings** — a human or unclassifiable-bot conversation alongside the
+   *    hosted ones. The lane could answer every hosted finding perfectly and the merge would
+   *    still be held, because resolving those is not Ralph's to do;
+   *  - **a materially unchanged thread after a claimed fix** — every finding is one this run
+   *    already replied to at the same content hash, so the repair did not take;
+   *  - **an unverified claim** — `fixed` on a head that never moved is not a fix, and a reply is
+   *    a GitHub write that cannot be taken back;
+   *  - **exhausted fix attempts**.
+   */
+  private async driveHostedFindings(
+    ctx: ReviewLoopContext,
+    wired: { gate: HostedReviewGate; gateCtx: HostedGateContext; head: string | null },
+    worklist: HostedWorklist,
+    cause: MergeBlockCause & { kind: "hosted-review" },
+    state: HostedFixState,
+  ): Promise<HostedDecision> {
+    const head = wired.head;
+    const toMaster = async (verification: string): Promise<HostedDecision> => ({
+      kind: "stuck",
+      outcome: await this.escalateHostedBlocker(ctx, {
+        cause,
+        worklist,
+        head,
+        attempts: state.attempts,
+        verification,
+      }),
+    });
+
+    if (worklist.humanThreads.length > 0 || worklist.unknownBotThreads.length > 0) {
+      return toMaster(
+        `conflicting conversations: ${worklist.humanThreads.length} human and ` +
+          `${worklist.unknownBotThreads.length} unclassifiable-bot thread(s) alongside ` +
+          `${cause.findings.length} hosted finding(s) — resolution authority is split`,
+      );
+    }
+
+    // The durable repeat guard: a finding whose CURRENT content Ralph already replied to on this
+    // run is the same failure however many heads have gone by since (the reply facts are folded
+    // from the append-only stream, so a restart mid-lane reconstructs it exactly).
+    const replied = foldHostedGateState(this.deps.store.readIssueStream(ctx.issue.number));
+    const fresh = cause.findings.filter((f) => !alreadyRepliedTo(replied, f));
+    if (fresh.length === 0) {
+      return toMaster(
+        "materially unchanged after a claimed fix: every finding was already replied to on this run at the same content hash",
+      );
+    }
+    if (state.attempts >= this.deps.maxFixAttempts) {
+      return toMaster(`exhausted ${state.attempts} hosted fix attempt(s); the findings are still open`);
+    }
+
+    state.attempts += 1;
+    ctx.logger.info("review.hosted-fix-attempt", {
+      pr: ctx.prNumber,
+      attempt: state.attempts,
+      findings: fresh.length,
+    });
+    this.setPhase(ctx, fixPhase(CI_PHASE));
+    const run = await this.runHostedFix(ctx, worklist, fresh, head, state);
+    if (run.kind === "settled") {
+      return run.decision;
+    }
+
+    // Only dispositions that answer a finding actually in this worklist count — an agent cannot
+    // resolve a thread by naming an id the gate never showed it.
+    const dispositions = run.dispositions.filter((d) => fresh.some((f) => f.threadId === d.threadId));
+    if (dispositions.length === 0) {
+      return toMaster(
+        "the fix lane returned no disposition for any hosted finding, so nothing on the thread was answered",
+      );
+    }
+
+    // "Pushed and verified on the relevant head" (ADR-0042 §13) — read origin, do not take the
+    // agent's word for it.
+    const pushedHead = await this.readRemoteHeadQuietly(ctx);
+    if (dispositions.some((d) => d.disposition === "fixed") && (pushedHead === null || pushedHead === head)) {
+      return toMaster(
+        `a claimed fix was not verified on the head: origin/${ctx.branch} still reads ` +
+          `${pushedHead ?? "unreadable"} against the reviewed head ${head ?? "(unreported)"}`,
+      );
+    }
+    const replyHead = pushedHead ?? head;
+    if (!replyHead) {
+      return toMaster("no head could be named for the reply, so nothing was written to the thread");
+    }
+
+    for (const disposition of dispositions) {
+      const finding = fresh.find((f) => f.threadId === disposition.threadId)!;
+      const result = await wired.gate.disposeFinding(wired.gateCtx, finding, {
+        disposition: disposition.disposition,
+        rationale: disposition.rationale,
+        verification: disposition.verification,
+        headSha: replyHead,
+      });
+      if (result.kind === "refused") {
+        // A human/unclassifiable-bot thread never reaches here (the conflict guard above catches
+        // it), so this is a defence in depth — log it rather than pretend it was disposed.
+        ctx.logger.warn("review.hosted-dispose-refused", {
+          thread: disposition.threadId,
+          reason: result.reason,
+        });
+      }
+    }
+    return { kind: "repaired" };
+  }
+
+  /**
+   * Dispatch ONE hosted fix attempt, degrading a container terminal exactly as
+   * {@link boundedFixLoop} does. This path calls {@link runFix} directly, so — like the
+   * single-shot rebase resolve (#273) — it must replicate that degradation itself: an uncaught
+   * wall-clock kill or infra fault here would escape to the failure guard and terminalize the run
+   * to `agent-stuck` with the PR auto-closed, orphaning fully-reviewed work over a conversation.
+   */
+  private async runHostedFix(
+    ctx: ReviewLoopContext,
+    worklist: HostedWorklist,
+    fresh: HostedFinding[],
+    head: string | null,
+    state: HostedFixState,
+  ): Promise<HostedFixRun> {
+    const infraState = { retries: 0 };
+    for (;;) {
+      try {
+        const outcome = await this.runFix(ctx, {
+          phase: CI_PHASE,
+          worklist: hostedBlockerWorklist({ kind: "hosted-review", findings: fresh }),
+          behaviourPreserving: false,
+          hosted: { findings: fresh, humanThreads: worklist.humanThreads, headSha: head },
+        });
+        if (outcome.kind === "escalated") {
+          // Straight to the master (never a human question) — see {@link escalate}.
+          return {
+            kind: "settled",
+            decision: { kind: "stuck", outcome: await this.escalate(ctx, CI_PHASE, outcome.question) },
+          };
+        }
+        return { kind: "fixed", dispositions: outcome.dispositions ?? [] };
+      } catch (err) {
+        const degraded = this.degradeContainerFault(ctx, err, infraState, {
+          phase: CI_PHASE,
+          terminalAttempts: () => state.attempts,
+          onParseFailure: (parseErr) => {
+            ctx.logger.warn("review.agent-output-unparseable", {
+              phase: CI_PHASE,
+              attempts: parseErr.attempts,
+              error: parseErr.lastError,
+            });
+            return parseFailureWorklist(parseErr);
+          },
+        });
+        if (degraded.kind === "retry") {
+          continue;
+        }
+        const settled = await this.settle(ctx, CI_PHASE, degraded.outcome);
+        return {
+          kind: "settled",
+          decision: { kind: "stuck", outcome: settled ?? { kind: "master-triage", phase: CI_PHASE } },
+        };
+      }
+    }
+  }
+
+  /** origin/&lt;branch&gt;'s current head, or null when it cannot be read. Never throws. */
+  private async readRemoteHeadQuietly(ctx: ReviewLoopContext): Promise<string | null> {
+    try {
+      return await this.deps.worktrees.remoteBranchHead(ctx.worktreePath, ctx.branch);
+    } catch (err) {
+      ctx.logger.warn("review.remote-head-failed", { branch: ctx.branch, error: String(err) });
+      return null;
     }
   }
 
@@ -1453,24 +1816,38 @@ export class ReviewLoop {
     return { gate, gateCtx, head };
   }
 
-  /** Escalate a typed hosted/human/ruleset merge blocker with its actual evidence. */
+  /**
+   * Escalate a typed hosted/human/ruleset merge blocker with its actual evidence.
+   *
+   * `verification` is not decoration: the hosted failure signature is **thread identity + latest
+   * finding content + verification result** (ADR-0042 §16). Dropping it — as this did — left the
+   * signature as thread-id + path, so a materially NEW comment on the same thread signed
+   * identically, `evaluateMasterBudget` reported `repeatedSignature`, and the master was forced
+   * into a final adjudication instead of a fresh recovery. A changed head SHA still normalizes
+   * away, which is the property that must be kept.
+   */
   private async escalateHostedBlocker(
     ctx: ReviewLoopContext,
-    cause: MergeBlockCause,
-    worklist: HostedWorklist | null,
-    head: string | null,
+    input: {
+      cause: MergeBlockCause;
+      worklist: HostedWorklist | null;
+      head: string | null;
+      /** Hosted fix attempts already spent on this gate pass — reported honestly, never a constant. */
+      attempts: number;
+      /** What the last repair claimed, and whether it actually changed the finding. */
+      verification?: string;
+    },
   ): Promise<ReviewLoopOutcome> {
+    const { cause, worklist, head, verification } = input;
     const findings = cause.kind === "hosted-review" ? cause.findings : [];
-    // The signature is built from thread identity + latest finding content + verification, so a
-    // push that changes only the head SHA cannot present the same failure as a new one.
     const detail =
       findings.length > 0
-        ? hostedFailureDetail({ findings })
-        : `merge-blocked ${cause.kind}: ${describeMergeBlock(cause)}`;
+        ? hostedFailureDetail({ findings, ...(verification ? { verification } : {}) })
+        : `merge-blocked ${cause.kind}: ${describeMergeBlock(cause)}${verification ? ` | ${verification}` : ""}`;
     return this.escalateToMaster(ctx, {
       phase: CI_PHASE,
       worklist: hostedBlockerWorklist(cause),
-      attempts: 1,
+      attempts: input.attempts,
       source: cause.kind === "hosted-review" ? "hosted-review" : "merge",
       lane: "merge",
       headline: `Merge gated by the GitHub-hosted review: ${describeMergeBlock(cause)}`,
@@ -1479,6 +1856,7 @@ export class ReviewLoop {
         ? {
             extraEvidence: [
               `Head under review: \`${head ?? "(unreported)"}\``,
+              ...(verification ? ["", `What the harness already tried: ${verification}`] : []),
               "",
               renderHostedWorklist(worklist),
             ].join("\n"),
@@ -1554,6 +1932,12 @@ export class ReviewLoop {
       detail?: string;
       /** Extra evidence appended verbatim — e.g. a rendered hosted-review worklist. */
       extraEvidence?: string;
+      /**
+       * The pre-cutover facts this transition must preserve as history (ADR-0042 §2).
+       * Defaults to the phase's `ReviewMaxed`; a source that never had one (a worker
+       * `escalate`) passes `[]` rather than fabricating a fact that did not happen.
+       */
+      sourceFacts?: readonly PreservedSourceFact[];
     },
   ): Promise<ReviewLoopOutcome> {
     const { store } = this.deps;
@@ -1570,6 +1954,7 @@ export class ReviewLoop {
           ? "CI gate maxed out (could not get checks green)"
           : `Phase-${phase} ${concern} review maxed out after ${attempts} fix attempt(s)`);
     const detail = input.detail ?? (blockers.join(" ; ") || headline);
+    const sourceFacts: readonly PreservedSourceFact[] = input.sourceFacts ?? [{ kind: "review-maxed", phase }];
 
     // The `ReviewMaxed` fact is preserved as history for phase exhaustion — the source fact
     // ADR-0042 requires be kept — and the request is committed with it.
@@ -1582,7 +1967,7 @@ export class ReviewLoop {
       branch: ctx.branch,
       prNumber: ctx.prNumber,
       issue: ctx.issue,
-      sourceFacts: [{ kind: "review-maxed", phase }],
+      sourceFacts,
       evidence: harnessEvidence({
         headline,
         detail,
@@ -1600,7 +1985,7 @@ export class ReviewLoop {
       logger: ctx.logger,
     });
 
-    if (!escalated) {
+    if (!escalated && sourceFacts.some((f) => f.kind === "review-maxed")) {
       // No master wired: keep the `ReviewMaxed` fact so history and the projection still
       // record the exhaustion. Deliberately NOT a heal-card — the cutover removed that
       // surface, and manufacturing one here would re-create the state it retired.
@@ -1645,13 +2030,42 @@ export class ReviewLoop {
     });
   }
 
-  /** Escalate terminal: checkpoint, post a ralph-question, swap to awaiting-answer. */
+  /**
+   * A review/fix agent called `escalate`. After the triage cutover this is **not** a human
+   * question (ADR-0042 §7/§8, DESIGN §13a): `awaiting-answer` means a human decision is
+   * requested, and only a master's `ask-human` may request one. A fix agent refusing to apply
+   * a risky structural change blind — or a rebase-conflict resolve refusing to guess at a
+   * structural divergence — is precisely a diagnosable, issue-scoped fault with a branch, a PR
+   * and a transcript behind it, so it enters the master queue with the agent's own question
+   * carried through as evidence. The master adjudicates it, and asks a human only if it must.
+   *
+   * The legacy checkpoint survives for exactly one configuration: **no master wired**. That is
+   * the pre-cutover unit fixture (production always wires one), and with no adjudicator
+   * available the alternative would be to strand the run with no durable pause at all.
+   */
   private async escalate(
     ctx: ReviewLoopContext,
     phase: Phase,
     question: EscalationQuestion,
   ): Promise<ReviewLoopOutcome> {
     const { store, github } = this.deps;
+    if (this.deps.masterEscalation) {
+      return this.escalateToMaster(ctx, {
+        phase,
+        worklist: escalationWorklist(question),
+        attempts: store.getFixAttempts(ctx.runId, phase),
+        source: "escalate",
+        lane: "fix",
+        // An escalate has no pre-cutover harness fact of its own (`ReviewMaxed` belongs to
+        // phase exhaustion, and fabricating one here would lie about what happened).
+        sourceFacts: [],
+        headline: question.headline,
+        // The signature's raw material: the same refusal on the same decision must read as the
+        // same failure, so the loop budget binds on a fix agent that keeps escalating.
+        detail: `fix-escalate: ${question.headline} :: ${question.decision}`,
+        extraEvidence: escalationEvidence(question),
+      });
+    }
     // The review/fix path already has a PR, so it records the escalation directly
     // (the impl-agent path additionally checkpoints WIP to a draft PR first).
     await recordEscalation(store, github, {
@@ -1777,6 +2191,45 @@ function hostedBlockerWorklist(cause: MergeBlockCause): Worklist {
       },
     ],
   };
+}
+
+/**
+ * The master-request worklist for a fix agent's `escalate` (ADR-0042 §8). The agent's own
+ * question is the finding: it names the decision it refused to take blind, which is what the
+ * master must adjudicate — a generic "the fix agent escalated" would strip exactly the content
+ * that makes the refusal actionable.
+ */
+function escalationWorklist(question: EscalationQuestion): Worklist {
+  return {
+    items: [
+      {
+        severity: "P0",
+        title: question.headline,
+        detail: `${question.decision}\n\nStakes: ${question.stakes}`,
+        source: "review",
+      },
+    ],
+  };
+}
+
+/**
+ * The full escalation question as master evidence. Rendered as plain prose, deliberately NOT
+ * as a `ralph-question` fence: the fence is what `ralph-answer` indexes for a human, and only
+ * a master's `ask-human` may create one (ADR-0042 §8).
+ */
+function escalationEvidence(question: EscalationQuestion): string {
+  return [
+    "The fix agent refused to apply a change blind and escalated. Its question, verbatim:",
+    "",
+    `- Feature: ${question.feature}`,
+    `- Where we stand: ${question.whereWeStand}`,
+    `- Decision: ${question.decision}`,
+    ...(question.options && question.options.length > 0
+      ? [`- Options: ${question.options.map((o) => `\`${o}\``).join(" | ")}`]
+      : []),
+    `- Stakes: ${question.stakes}`,
+    `- The agent's own recommendation: ${question.recommendation}`,
+  ].join("\n");
 }
 
 /**

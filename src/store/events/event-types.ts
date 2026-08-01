@@ -178,19 +178,57 @@ export type ComplexityPromoted = Event<
   "ComplexityPromoted",
   { tier: ComplexityTier; from?: ComplexityTier | null }
 >;
-/** A numbered master intervention began (a fresh highest-tier session, ADR-0008). */
+/**
+ * A numbered master intervention began (a fresh highest-tier session, ADR-0008).
+ *
+ * `source` / `lane` / `headline` are optional and additive (ADR-0026): starting a session
+ * takes the request off the queue, so without them nothing on the stream still says *what* is
+ * being adjudicated while the session runs — which is exactly when an operator asks. They
+ * restate the serviced request rather than deriving it, so a reader never has to scan backwards
+ * past an arbitrary number of events to name a running triage. Absent on pre-cutover streams.
+ */
 export type MasterInterventionStarted = Event<
   "MasterInterventionStarted",
-  { runId: string; attempt: number; phase: string; signature: string }
+  {
+    runId: string;
+    attempt: number;
+    phase: string;
+    signature: string;
+    source?: MasterRequestSource;
+    lane?: MasterLane;
+    headline?: string;
+  }
 >;
 /**
  * The master chose exactly one of the five resolutions (ADR-0041) — the master's **own**
  * conclusion, stated with its rationale, which is what gets injected/persisted regardless
  * of what the worker recommended.
+ *
+ * Recorded **before** the resolution's effect runs, which makes two optional fields
+ * load-bearing (ADR-0042, the outcome→effect restart boundary):
+ *
+ *  - `conclusion` — the master's reading of the situation, as distinct from `rationale` (why
+ *    *this* resolution follows from it). Both are required on the outcome contract; only the
+ *    rationale used to survive, so the operator surface documented as showing "the latest
+ *    conclusion" could never show one.
+ *  - `outcome` — the full validated outcome payload, so a daemon that dies between the decision
+ *    and its effect replays the adjudication the master actually made instead of spending a
+ *    fresh session to reach a possibly different one. Opaque here on purpose: the store does not
+ *    know the master's outcome grammar, and `master/outcome.ts` re-validates it on replay.
+ *
+ * Both are absent on pre-cutover streams, so every reader must stay tolerant.
  */
 export type MasterResolutionSelected = Event<
   "MasterResolutionSelected",
-  { runId: string; attempt: number; phase: string; resolution: MasterResolution; rationale: string }
+  {
+    runId: string;
+    attempt: number;
+    phase: string;
+    resolution: MasterResolution;
+    rationale: string;
+    conclusion?: string;
+    outcome?: Record<string, unknown>;
+  }
 >;
 /** A numbered master intervention finished (closes the attempt span opened above). */
 export type MasterInterventionCompleted = Event<

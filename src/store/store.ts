@@ -538,25 +538,51 @@ export class Store {
     });
   }
 
-  /** Append `MasterInterventionStarted` — a numbered master session began. */
+  /**
+   * Append `MasterInterventionStarted` — a numbered master session began. The serviced
+   * request's `source`/`lane`/`headline` ride along so the operator surface can still name what
+   * is being adjudicated once the request has left the queue (ADR-0042).
+   */
   async recordMasterInterventionStarted(
     repo: string,
     issueNumber: number,
-    input: { runId: number; attempt: number; phase: string; signature: string },
+    input: {
+      runId: number;
+      attempt: number;
+      phase: string;
+      signature: string;
+      source?: MasterRequestSource;
+      lane?: MasterLane;
+      headline?: string;
+    },
   ): Promise<void> {
     await this.appendIssueEvent(repo, issueNumber, {
       type: "MasterInterventionStarted",
-      data: { runId: String(input.runId), attempt: input.attempt, phase: input.phase, signature: input.signature },
+      data: {
+        runId: String(input.runId),
+        attempt: input.attempt,
+        phase: input.phase,
+        signature: input.signature,
+        ...(input.source !== undefined ? { source: input.source } : {}),
+        ...(input.lane !== undefined ? { lane: input.lane } : {}),
+        ...(input.headline !== undefined ? { headline: input.headline } : {}),
+      },
     });
   }
 
   /**
-   * Append `MasterResolutionSelected` + `MasterInterventionCompleted` in one commit. One
-   * adjudication is one operator-visible event even though two facts model it (the decision
-   * and the closing of the attempt span), so live consumers must see them as one batch —
-   * exactly the {@link recordReviewMaxedQuestion} discipline.
+   * Append `MasterResolutionSelected` — the decision, recorded **before** its effect runs.
+   *
+   * The order is the point (ADR-0042). Recording the decision first means a daemon that dies
+   * while applying it replays the adjudication the master actually made; recording it after
+   * would mean re-running a fresh session to reach a possibly different one, and a crash between
+   * the two writes used to close the attempt span with nothing having happened — a run wedged in
+   * `master-triage` that no tick could ever pick up again.
+   *
+   * `outcome` is the validated payload the effect needs to be replayable; `conclusion` is the
+   * master's own reading, which the operator surface reports.
    */
-  async recordMasterInterventionResolved(
+  async recordMasterResolutionSelected(
     repo: string,
     issueNumber: number,
     input: {
@@ -565,29 +591,43 @@ export class Store {
       phase: string;
       resolution: MasterResolution;
       rationale: string;
+      conclusion?: string;
+      outcome?: Record<string, unknown>;
     },
   ): Promise<void> {
-    await this.events.appendToIssue(repo, issueNumber, [
-      {
-        type: "MasterResolutionSelected",
-        data: {
-          runId: String(input.runId),
-          attempt: input.attempt,
-          phase: input.phase,
-          resolution: input.resolution,
-          rationale: input.rationale,
-        },
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "MasterResolutionSelected",
+      data: {
+        runId: String(input.runId),
+        attempt: input.attempt,
+        phase: input.phase,
+        resolution: input.resolution,
+        rationale: input.rationale,
+        ...(input.conclusion !== undefined ? { conclusion: input.conclusion } : {}),
+        ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
       },
-      {
-        type: "MasterInterventionCompleted",
-        data: {
-          runId: String(input.runId),
-          attempt: input.attempt,
-          phase: input.phase,
-          resolution: input.resolution,
-        },
+    });
+  }
+
+  /**
+   * Append `MasterInterventionCompleted` — closes the attempt span, **after** the resolution's
+   * effect has landed. Until this lands the intervention stays `inProgress`, which is what makes
+   * the outcome→effect window recoverable rather than a silent wedge.
+   */
+  async recordMasterInterventionCompleted(
+    repo: string,
+    issueNumber: number,
+    input: { runId: number; attempt: number; phase: string; resolution: MasterResolution },
+  ): Promise<void> {
+    await this.appendIssueEvent(repo, issueNumber, {
+      type: "MasterInterventionCompleted",
+      data: {
+        runId: String(input.runId),
+        attempt: input.attempt,
+        phase: input.phase,
+        resolution: input.resolution,
       },
-    ]);
+    });
   }
 
   // ---- hosted-review gate facts (issue #43) -----------------------------
@@ -1583,18 +1623,32 @@ export class ScopedStore {
     attempt: number;
     phase: string;
     signature: string;
+    source?: MasterRequestSource;
+    lane?: MasterLane;
+    headline?: string;
   }): Promise<void> {
     return this.store.recordMasterInterventionStarted(this.repo, input.issueNumber, input);
   }
-  recordMasterInterventionResolved(input: {
+  recordMasterResolutionSelected(input: {
     issueNumber: number;
     runId: number;
     attempt: number;
     phase: string;
     resolution: MasterResolution;
     rationale: string;
+    conclusion?: string;
+    outcome?: Record<string, unknown>;
   }): Promise<void> {
-    return this.store.recordMasterInterventionResolved(this.repo, input.issueNumber, input);
+    return this.store.recordMasterResolutionSelected(this.repo, input.issueNumber, input);
+  }
+  recordMasterInterventionCompleted(input: {
+    issueNumber: number;
+    runId: number;
+    attempt: number;
+    phase: string;
+    resolution: MasterResolution;
+  }): Promise<void> {
+    return this.store.recordMasterInterventionCompleted(this.repo, input.issueNumber, input);
   }
   recordDecisionPublished(input: {
     issueNumber: number;

@@ -6,6 +6,7 @@ import BetterSqlite3 from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { MEMORY_DB, openStore, Store } from "./store";
+import { foldMasterHistory } from "../master/history";
 
 const REPO = "acme/widgets";
 
@@ -933,5 +934,139 @@ describe("run complexity tier (issue #278)", () => {
     expect(store.getRunByIssue(43)?.tier).toBe(2);
     store.upsertRun({ issueNumber: 43, mode: "tdd" });
     expect(store.getRunByIssue(43)?.tier).toBeNull();
+  });
+});
+
+/**
+ * Issue #43: "Existing event schemas remain readable; add new event versions/types rather than
+ * rewriting recorded history. **Rebuild from the append-only log produces the same master queues
+ * and labels.**"
+ *
+ * The read model is a derived view (ADR-0021/0027). These tests are what makes that a property
+ * rather than a claim: they drive the real master lifecycle through the store, throw the
+ * projection away, re-derive it from the log alone, and demand the same answers.
+ */
+describe("rebuild from the append-only log (ADR-0021, issue #43)", () => {
+
+  it("re-derives the same master queue and status labels from the log alone", async () => {
+    const store = openStore(MEMORY_DB);
+    const scoped = store.forRepo(REPO);
+
+    // Queued triage, still awaiting a session.
+    const queued = scoped.upsertRun({ issueNumber: 61, mode: "tdd", branch: "ralph/61-a" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 61,
+      runId: queued.id,
+      source: "ci",
+      phase: "review-0",
+      lane: "ci",
+      signature: "ci|review-0|red",
+      headline: "CI never greened",
+      sourceFacts: [{ kind: "review-maxed", phase: 0 }],
+    });
+
+    // Adjudicated to a human question — the one state that means a human is needed.
+    const asked = scoped.upsertRun({ issueNumber: 62, mode: "tdd", branch: "ralph/62-b" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 62,
+      runId: asked.id,
+      source: "escalate",
+      phase: "impl",
+      lane: "impl",
+      signature: "escalate|impl|contract",
+      headline: "Which contract is authoritative?",
+    });
+    await scoped.recordMasterInterventionStarted({
+      issueNumber: 62,
+      runId: asked.id,
+      attempt: 1,
+      phase: "impl",
+      signature: "escalate|impl|contract",
+      source: "escalate",
+      lane: "impl",
+      headline: "Which contract is authoritative?",
+    });
+    await scoped.recordMasterHumanQuestion({
+      issueNumber: 62,
+      runId: asked.id,
+      attempt: 1,
+      phase: "impl",
+      headline: "Which contract is authoritative?",
+      commentId: 991,
+    });
+
+    // Adjudicated to the terminal — reachable only from a completed master adjudication.
+    const terminal = scoped.upsertRun({ issueNumber: 63, mode: "tdd", branch: "ralph/63-c" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 63,
+      runId: terminal.id,
+      source: "stuck",
+      phase: "impl",
+      lane: "impl",
+      signature: "stuck|impl|no-green-build",
+      headline: "No green build",
+      sourceFacts: [{ kind: "run-stuck", reason: "no-green-build" }],
+    });
+    await scoped.recordMasterInterventionStarted({
+      issueNumber: 63,
+      runId: terminal.id,
+      attempt: 1,
+      phase: "impl",
+      signature: "stuck|impl|no-green-build",
+    });
+    await scoped.recordMasterStuck({
+      issueNumber: 63,
+      runId: terminal.id,
+      attempt: 1,
+      reason: "depends on a prerequisite that does not exist",
+    });
+
+    const before = {
+      masterQueue: scoped.listRunsByStatus("master-triage").map((r) => r.issueNumber),
+      awaiting: scoped.listRunsByStatus("awaiting-answer").map((r) => r.issueNumber),
+      stuck: scoped.listRunsByStatus("agent-stuck").map((r) => r.issueNumber),
+    };
+    expect(before).toEqual({ masterQueue: [61], awaiting: [62], stuck: [63] });
+
+    // Throw the derived view away and rebuild it from the log alone.
+    const rebuilt = store.events.rebuildIssueProjection();
+    expect(rebuilt).toBe(3);
+
+    expect({
+      masterQueue: scoped.listRunsByStatus("master-triage").map((r) => r.issueNumber),
+      awaiting: scoped.listRunsByStatus("awaiting-answer").map((r) => r.issueNumber),
+      stuck: scoped.listRunsByStatus("agent-stuck").map((r) => r.issueNumber),
+    }).toEqual(before);
+
+    // …and the master fold — the queue's own contents, not just its membership — survives too.
+    const history = foldMasterHistory(store.events.readIssueStream(REPO, 61));
+    expect(history.pending).toMatchObject({ source: "ci", phase: "review-0", headline: "CI never greened" });
+    // The preserved source fact is still history, exactly as appended (ADR-0042).
+    expect(store.events.readIssueStream(REPO, 61).map((e) => e.type)).toEqual([
+      "ReviewMaxed",
+      "MasterTriageRequested",
+    ]);
+    store.close();
+  });
+
+  it("is idempotent — rebuilding twice lands on the same rows", async () => {
+    const store = openStore(MEMORY_DB);
+    const scoped = store.forRepo(REPO);
+    const run = scoped.upsertRun({ issueNumber: 64, mode: "tdd", branch: "ralph/64-d" });
+    await scoped.recordHarnessMasterTriage({
+      issueNumber: 64,
+      runId: run.id,
+      source: "merge",
+      phase: "review-0",
+      lane: "merge",
+      signature: "merge|review-0|blocked",
+      headline: "Merge blocked",
+    });
+
+    store.events.rebuildIssueProjection();
+    const once = scoped.listRunsByStatus("master-triage").map((r) => r.issueNumber);
+    store.events.rebuildIssueProjection();
+    expect(scoped.listRunsByStatus("master-triage").map((r) => r.issueNumber)).toEqual(once);
+    store.close();
   });
 });

@@ -13,6 +13,7 @@ import type { Issue, PrComment } from "../github/types";
 import type { Mode, Phase } from "../store/types";
 import type { Worklist } from "./worklist";
 import type { EscalationQuestion } from "./escalation";
+import type { HostedFinding } from "./hosted-review";
 import type { RalphAnswer } from "../hitl/answer";
 import type { FixContext } from "./agents";
 
@@ -142,6 +143,67 @@ const FIX_OUTCOME_CONTRACT = [
 ];
 
 /**
+ * The output contract for a fix that is answering the GitHub-hosted reviewer (issue #43). It
+ * REPLACES {@link FIX_OUTCOME_CONTRACT} on a hosted fix rather than being appended to it: the
+ * harness replies to and resolves exactly the threads named here, so an agent that reports a
+ * bare `fixed` has answered nothing the gate can act on.
+ */
+const HOSTED_FIX_OUTCOME_CONTRACT = [
+  "Output ONLY one of these JSON objects as the final message, fenced as ```json:",
+  '```json',
+  '{ "outcome": "fixed", "dispositions": [ { "threadId": "…", "disposition": "fixed", "rationale": "…", "verification": "…" } ] }',
+  "```",
+  "or, to escalate:",
+  '```json',
+  '{ "outcome": "escalate", "question": { "headline": "…", "feature": "…", "whereWeStand": "…", "decision": "…", "options": ["…"], "stakes": "…", "recommendation": "…" } }',
+  "```",
+  "Rules for `dispositions`:",
+  '- One entry per thread you answered, keyed by the EXACT `threadId` above. A thread with no entry is left open and blocks the merge.',
+  '- `disposition` is `fixed` (you changed the code and PUSHED it) or `reasoned-invalid` (the finding does not hold).',
+  "- `rationale` is YOUR OWN reasoning and `verification` is the evidence it rests on (the test you added and its result, the trace you followed, the command you ran). Both are published verbatim in the reply on the thread.",
+  "- Do NOT claim `fixed` unless the change is committed and pushed: the harness verifies the branch actually moved before it replies, and an unverified claim goes to a master session instead.",
+  "It MUST be valid JSON: every key and string value in double quotes, NEVER backticks as delimiters. A backtick, quote, or newline may appear only INSIDE a double-quoted, JSON-escaped string.",
+];
+
+/** One hosted finding, rendered with the exact context a disposition needs. */
+function hostedFindingLines(f: HostedFinding): string[] {
+  const anchor = f.path ? `${f.path}${f.line !== null ? `:${f.line}` : ""}` : "(no file anchor)";
+  return [
+    `- threadId: \`${f.threadId}\` — ${anchor} (reviewed head \`${f.reviewedSha ?? "unreported"}\`, by ${f.author})`,
+    `  finding: ${f.finding.trim().replace(/\s+/g, " ")}`,
+  ];
+}
+
+/**
+ * The hosted-review section of a fix prompt (issue #43, ADR-0042 §11/§12/§14). Three things
+ * are load-bearing and none of them can be inferred from a generic worklist: the thread
+ * identity the reply is keyed on, the head the finding was raised against, and the rule that a
+ * bot finding is neither accepted nor dismissed on the strength of who raised it.
+ */
+function hostedSection(hosted: NonNullable<FixPromptContext["hosted"]>): string[] {
+  const lines = [
+    "GitHub's hosted reviewer (Codex) has open conversations on this PR. They are gating the merge — the repository blocks merging while a conversation is unresolved.",
+    `They were raised against head \`${hosted.headSha ?? "(unreported)"}\`.`,
+    "",
+    "Hosted reviewer findings — answer EVERY one:",
+    ...hosted.findings.flatMap(hostedFindingLines),
+    "",
+    "A finding is NOT valid because a bot raised it, and NOT invalid because a bot raised it. Judge each one on the code:",
+    "- If it is right, fix it and push.",
+    "- If it is wrong, say why in your own words and show the verification that proves it. `reasoned-invalid` without that reasoning is a silent dismissal and is not acceptable.",
+    "- If answering it would need a risky structural change you should not make blind, `escalate` instead of guessing.",
+  ];
+  if (hosted.humanThreads.length > 0) {
+    lines.push(
+      "",
+      "Human-authored conversations (context only — you may implement and explain, but these are NEVER auto-resolved; approval and resolution belong to a human reviewer):",
+      ...hosted.humanThreads.flatMap(hostedFindingLines),
+    );
+  }
+  return lines;
+}
+
+/**
  * Fix prompt for a rebase conflict (issue #41 / ADR-0014, containerised by #273). A sibling PR
  * merged into base while this PR was under review and the two touch the same code, so the branch
  * must be rebased onto base. Under the container model the fix agent runs in a fresh clone of
@@ -216,6 +278,7 @@ export type FixPromptContext = Pick<
   | "guidance"
   | "rebaseConflict"
   | "reviewComment"
+  | "hosted"
 >;
 
 /** Build the user prompt for a fix attempt; the agent outputs a JSON outcome. */
@@ -224,7 +287,7 @@ export function buildFixPrompt(
   buildCommand: string,
   testCommand: string,
 ): string {
-  const { issue, mode, phase, worklist, behaviourPreserving, baseBranch, guidance, rebaseConflict, reviewComment } =
+  const { issue, mode, phase, worklist, behaviourPreserving, baseBranch, guidance, rebaseConflict, reviewComment, hosted } =
     ctx;
   // A rebase-conflict fix is a different job (start + resolve the rebase; the runner pushes),
   // so it gets its own prompt rather than the generic "commit and push" gate.
@@ -255,6 +318,8 @@ export function buildFixPrompt(
     // fix agent applies it rather than re-deriving the maxed-out decision blind.
     ...(guidance ? ["Operator guidance:", guidance, ""] : []),
     ...sourcing,
+    // The hosted reviewer's own threads, with the identity a reply/resolution is keyed on.
+    ...(hosted ? [...hostedSection(hosted), ""] : []),
     "Worklist (gating items — resolve every one):",
     worklistDigest(worklist),
     "",
@@ -266,6 +331,6 @@ export function buildFixPrompt(
     "",
     "If a finding implies a risky structural change (e.g. 'delete this whole layer') that you should not apply blind, call `escalate` instead of applying it.",
     "",
-    ...FIX_OUTCOME_CONTRACT,
+    ...(hosted ? HOSTED_FIX_OUTCOME_CONTRACT : FIX_OUTCOME_CONTRACT),
   ].join("\n");
 }

@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 import { parseConfig, resolveTargets } from "../config/load";
 import type { Issue } from "../github/types";
 import { buildImplPrompt, SYSTEM_APPEND } from "./prompts";
-import { buildStuckCardQuestion } from "./stuck";
-import type { StuckHealGuidance } from "../hitl/heal-readmit";
 
 const config = resolveTargets(
   parseConfig({
@@ -108,32 +106,14 @@ describe("SYSTEM_APPEND — binding rules", () => {
   });
 });
 
-describe("buildImplPrompt — heal re-admission threads operator guidance (#86, AC3)", () => {
-  const stuckHeal: StuckHealGuidance = {
-    question: buildStuckCardQuestion({
-      category: "futility",
-      reason: "the spec contradicts the data model",
-    }),
-    answer: { kind: "free-text", text: "Split the schema migration into its own issue first, then retry" },
-  };
-
-  it("a fresh impl prompt without heal carries no previous-attempt block", () => {
+describe("buildImplPrompt — the #86 heal block is gone (ADR-0042 / #43)", () => {
+  it("an impl prompt is built from the issue alone — no previous-attempt guidance block", () => {
+    // `agent-stuck` is a terminal only a master may select, so no operator answer can ever
+    // post-date a stuck-card and there is no guidance to weave in. The prompt takes no such
+    // argument any more; this pins that the block cannot return by any other route either.
     const prompt = buildImplPrompt(issue, "tdd", "ralph/6-x", config);
-    expect(prompt).not.toContain("a previous attempt stopped");
-  });
-
-  it("with heal, the prompt carries why the last attempt stopped AND the operator's guidance", () => {
-    const prompt = buildImplPrompt(issue, "tdd", "ralph/6-x", config, stuckHeal);
-    // Why it stopped — the stuck-card category + the agent's reason, verbatim.
-    expect(prompt.toLowerCase()).toContain("a previous attempt stopped");
-    expect(prompt).toContain("futility");
-    expect(prompt).toContain("the spec contradicts the data model");
-    // The operator's guidance — the load-bearing part of #86.
-    expect(prompt).toContain("Split the schema migration into its own issue first, then retry");
-    // It is a fresh start, not a resume — no claim of a WIP branch to continue.
-    expect(prompt.toLowerCase()).toContain("no prior wip branch");
-    // The issue body and the mode gate are still present (heal augments, not replaces).
+    expect(prompt.toLowerCase()).not.toContain("a previous attempt stopped");
+    expect(prompt.toLowerCase()).not.toContain("operator guidance");
     expect(prompt).toContain("Some body");
-    expect(prompt).toContain("npm test");
   });
 });

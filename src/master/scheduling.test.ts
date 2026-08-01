@@ -350,6 +350,94 @@ describe("master scheduling in the reconcile tick (ADR-0041)", () => {
       cold.close();
     });
 
+    it("resumes the MASTER for an answer that arrives after a cold-store restart", async () => {
+      // A master asked, the operator answered, and the daemon lost its store in between. The
+      // provenance that routes the answer (`MasterHumanQuestionRequested`) lives only in the
+      // store, so rehydrate must rebuild it from GitHub — otherwise the answer is handed to
+      // the worker that could not make the decision (issue #43: "one answer resumes the same
+      // master checkpoint").
+      await seedQueued(3, "queued master");
+      agent.push({
+        outcome: {
+          resolution: "ask-human",
+          conclusion: "Only a human can pick.",
+          rationale: "The call is a product one.",
+          question: {
+            headline: "Which contract is authoritative?",
+            feature: "Widget",
+            whereWeStand: "Two contracts disagree.",
+            decision: "Pick one.",
+            stakes: "Downstream consumers depend on it.",
+            recommendation: "Pick v2.",
+          },
+        },
+        decisions: [],
+      });
+      const warm = wire();
+      await warm.reconciler.tick();
+      await warm.reconciler.awaitInFlight();
+      expect(store.getRunByIssue(3)!.status).toBe("awaiting-answer");
+      // One more tick so the level-triggered label effect lands on GitHub — the desired
+      // state a cold restart re-derives from.
+      await warm.reconciler.tick();
+      await warm.reconciler.awaitInFlight();
+      expect(github.issues.get(3)!.labels).toContain("awaiting-answer");
+
+      // Cold restart: a brand-new store, rebuilt from the (untouched) GitHub thread.
+      const cold = openStore(MEMORY_DB).forRepo(REPO);
+      try {
+        const rebuilt = await rehydrateRunsFromGitHub(github, cold, silent);
+        expect(rebuilt).toEqual([3]);
+        expect(cold.getRunByIssue(3)!.status).toBe("awaiting-answer");
+        expect(foldMasterHistory(cold.readIssueStream(3)).awaitingHuman).not.toBeNull();
+
+        // The operator answers and re-arms, exactly as `ralph-answer` does.
+        await github.postComment(3, formatRalphAnswer({ kind: "free-text", text: "v2 is authoritative." }));
+        github.issues.get(3)!.labels.push("ready-for-agent");
+        agent.push(resolvedOutcome);
+
+        const worktrees = new FakeWorktreeManager();
+        const runner = new PrOpeningAgentRunner(github);
+        const executor = new Executor({ store: cold, github, worktrees, agentRunner: runner, logger: silent });
+        const engine = new MasterEngine({
+          store: cold,
+          github,
+          agent,
+          pipeline,
+          logger: silent,
+          targetRepo: REPO,
+          baseBranch: "master",
+          routing,
+          routeWorld,
+        });
+        let reconciler: Reconciler;
+        reconciler = new Reconciler({
+          store: cold,
+          github,
+          executor,
+          worktrees,
+          logger: silent,
+          budget: budgetFor(() => reconciler.activeCount(), 5),
+          cap: 5,
+          priorityLabels: [],
+          targetRepo: REPO,
+          reconcileIntervalSeconds: 30,
+          masterEngine: engine,
+          masterLease: new MasterLease(),
+        });
+
+        await reconciler.tick();
+        await reconciler.awaitInFlight();
+
+        // A SECOND master session ran, with the answer injected — and no worker was resumed.
+        expect(agent.sessions).toHaveLength(2);
+        expect(agent.sessions[1]!.prompt).toContain("v2 is authoritative.");
+        expect(runner.runs.map((r) => r.issue.number)).not.toContain(3);
+      } finally {
+        cold.close();
+      }
+    });
+
     it("never duplicates a session when the daemon died mid-intervention", async () => {
       await seedQueued(3, "queued master");
       // The daemon started the intervention and died before its outcome landed.

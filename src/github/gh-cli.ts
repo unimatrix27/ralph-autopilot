@@ -209,6 +209,13 @@ const REVIEW_THREAD_COMMENT_PAGE_SIZE = 30;
  * cannot see (issue #43).
  */
 export const REVIEW_THREAD_MAX_PAGES = 20;
+/**
+ * Hard cap on the per-thread COMMENT cursor loop, mirroring {@link REVIEW_THREAD_MAX_PAGES}.
+ * A thread deeper than this fails the whole read closed rather than yielding a wrong "latest
+ * comment": that comment's id is the reply idempotency key and its hash is the repeat guard's
+ * material-change key, so a half-read thread is a fail-open the gate cannot detect (issue #43).
+ */
+export const REVIEW_THREAD_COMMENT_MAX_PAGES = 20;
 
 /**
  * The thread-aware read the hosted-review gate needs. Flat issue/review comments carry no
@@ -225,6 +232,7 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$f
           id isResolved isOutdated path line diffSide
           resolvedBy{ login }
           comments(first:$comments){
+            pageInfo{ hasNextPage endCursor }
             nodes{
               id databaseId body createdAt
               originalCommit{ oid }
@@ -232,6 +240,27 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$f
               author{ login __typename }
             }
           }
+        }
+      }
+    }
+  }
+}`;
+
+/**
+ * The per-thread comment cursor (issue #43). The thread query above requests only the first
+ * page of each thread's comments; a deeper thread is finished here, so the LAST comment the
+ * gate reads is genuinely the last one GitHub has.
+ */
+const THREAD_COMMENTS_QUERY = `query($threadId:ID!,$comments:Int!,$after:String){
+  node(id:$threadId){
+    ... on PullRequestReviewThread {
+      comments(first:$comments,after:$after){
+        pageInfo{ hasNextPage endCursor }
+        nodes{
+          id databaseId body createdAt
+          originalCommit{ oid }
+          commit{ oid }
+          author{ login __typename }
         }
       }
     }
@@ -261,17 +290,105 @@ export function isPermissionError(err: unknown): boolean {
   );
 }
 
+/** One page of a thread's comments, plus the anchor and cursor read off it. */
+interface ParsedCommentPage {
+  comments: ReviewThreadComment[];
+  /** The commit the FIRST comment carrying one was written against — the thread's anchor. */
+  reviewedSha: string | null;
+  hasNextPage: boolean;
+  endCursor: string | null;
+}
+
+/** Parse a GraphQL `comments{ pageInfo nodes }` connection into domain comments. */
+function parseCommentConnection(
+  connection: { pageInfo?: { hasNextPage?: unknown; endCursor?: unknown }; nodes?: unknown[] } | null | undefined,
+): ParsedCommentPage {
+  const nodes = Array.isArray(connection?.nodes) ? connection.nodes : [];
+  const comments: ReviewThreadComment[] = [];
+  let reviewedSha: string | null = null;
+  for (const raw of nodes) {
+    const c = raw as {
+      id?: unknown;
+      databaseId?: unknown;
+      body?: unknown;
+      createdAt?: unknown;
+      author?: { login?: unknown; __typename?: unknown } | null;
+      commit?: { oid?: unknown } | null;
+      originalCommit?: { oid?: unknown } | null;
+    } | null;
+    if (!c || typeof c.id !== "string") {
+      continue;
+    }
+    const oid = c.commit?.oid ?? c.originalCommit?.oid;
+    if (reviewedSha === null && typeof oid === "string") {
+      reviewedSha = oid;
+    }
+    const login = typeof c.author?.login === "string" ? c.author.login : "";
+    comments.push({
+      id: c.id,
+      databaseId: typeof c.databaseId === "number" ? c.databaseId : null,
+      author: login,
+      // GitHub reports a bot actor as `__typename: "Bot"`; an App-authored comment can also
+      // arrive with a `[bot]` login suffix. Both are checked because mis-reading a bot as a
+      // human would make its thread permanently un-resolvable.
+      authorIsBot: c.author?.__typename === "Bot" || login.endsWith("[bot]"),
+      body: typeof c.body === "string" ? c.body : "",
+      createdAt: typeof c.createdAt === "string" ? c.createdAt : "",
+    });
+  }
+  const pageInfo = connection?.pageInfo ?? {};
+  return {
+    comments,
+    reviewedSha,
+    hasNextPage: pageInfo.hasNextPage === true,
+    endCursor: typeof pageInfo.endCursor === "string" ? pageInfo.endCursor : null,
+  };
+}
+
+/**
+ * Parse one follow-up page of a single thread's comments (the {@link THREAD_COMMENTS_QUERY}
+ * response). Exported for the same reason as {@link parseReviewThreadsPage}: this translation
+ * decides what "the latest comment" is, and the gate keys reply idempotency on it.
+ */
+export function parseThreadCommentsPage(out: string): ParsedCommentPage {
+  if (out.trim().length === 0) {
+    return { comments: [], reviewedSha: null, hasNextPage: false, endCursor: null };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    return { comments: [], reviewedSha: null, hasNextPage: false, endCursor: null };
+  }
+  const node = (parsed as { data?: { node?: unknown } })?.data?.node as
+    | { comments?: { pageInfo?: { hasNextPage?: unknown; endCursor?: unknown }; nodes?: unknown[] } }
+    | null
+    | undefined;
+  return parseCommentConnection(node?.comments);
+}
+
 /**
  * Parse one page of the review-threads response into the port's shape. Exported so the
  * adapter contract is testable against recorded GraphQL payloads with no network.
+ *
+ * `truncatedComments` names every thread whose comment list did NOT fit in one page, so the
+ * caller can finish it with {@link THREAD_COMMENTS_QUERY} rather than mistake a half-read
+ * thread for a complete one (issue #43).
  */
 export function parseReviewThreadsPage(out: string): {
   threads: ReviewThread[];
   headSha: string | null;
   hasNextPage: boolean;
   endCursor: string | null;
+  truncatedComments: Array<{ threadId: string; endCursor: string }>;
 } {
-  const empty = { threads: [] as ReviewThread[], headSha: null, hasNextPage: false, endCursor: null };
+  const empty = {
+    threads: [] as ReviewThread[],
+    headSha: null,
+    hasNextPage: false,
+    endCursor: null,
+    truncatedComments: [] as Array<{ threadId: string; endCursor: string }>,
+  };
   if (out.trim().length === 0) {
     return empty;
   }
@@ -294,6 +411,7 @@ export function parseReviewThreadsPage(out: string): {
   const pageInfo = pr.reviewThreads?.pageInfo ?? {};
   const nodes = Array.isArray(pr.reviewThreads?.nodes) ? pr.reviewThreads.nodes : [];
   const threads: ReviewThread[] = [];
+  const truncatedComments: Array<{ threadId: string; endCursor: string }> = [];
   for (const node of nodes) {
     const t = node as {
       id?: unknown;
@@ -303,43 +421,14 @@ export function parseReviewThreadsPage(out: string): {
       line?: unknown;
       diffSide?: unknown;
       resolvedBy?: { login?: unknown } | null;
-      comments?: { nodes?: unknown[] };
+      comments?: { pageInfo?: { hasNextPage?: unknown; endCursor?: unknown }; nodes?: unknown[] };
     } | null;
     if (!t || typeof t.id !== "string") {
       continue;
     }
-    const commentNodes = Array.isArray(t.comments?.nodes) ? t.comments.nodes : [];
-    const comments: ReviewThreadComment[] = [];
-    let reviewedSha: string | null = null;
-    for (const raw of commentNodes) {
-      const c = raw as {
-        id?: unknown;
-        databaseId?: unknown;
-        body?: unknown;
-        createdAt?: unknown;
-        author?: { login?: unknown; __typename?: unknown } | null;
-        commit?: { oid?: unknown } | null;
-        originalCommit?: { oid?: unknown } | null;
-      } | null;
-      if (!c || typeof c.id !== "string") {
-        continue;
-      }
-      const oid = c.commit?.oid ?? c.originalCommit?.oid;
-      if (reviewedSha === null && typeof oid === "string") {
-        reviewedSha = oid;
-      }
-      const login = typeof c.author?.login === "string" ? c.author.login : "";
-      comments.push({
-        id: c.id,
-        databaseId: typeof c.databaseId === "number" ? c.databaseId : null,
-        author: login,
-        // GitHub reports a bot actor as `__typename: "Bot"`; an App-authored comment can also
-        // arrive with a `[bot]` login suffix. Both are checked because mis-reading a bot as a
-        // human would make its thread permanently un-resolvable.
-        authorIsBot: c.author?.__typename === "Bot" || login.endsWith("[bot]"),
-        body: typeof c.body === "string" ? c.body : "",
-        createdAt: typeof c.createdAt === "string" ? c.createdAt : "",
-      });
+    const page = parseCommentConnection(t.comments);
+    if (page.hasNextPage && page.endCursor) {
+      truncatedComments.push({ threadId: t.id, endCursor: page.endCursor });
     }
     threads.push({
       id: t.id,
@@ -348,9 +437,9 @@ export function parseReviewThreadsPage(out: string): {
       path: typeof t.path === "string" ? t.path : null,
       line: typeof t.line === "number" ? t.line : null,
       side: t.diffSide === "LEFT" || t.diffSide === "RIGHT" ? t.diffSide : null,
-      reviewedSha,
+      reviewedSha: page.reviewedSha,
       resolvedBy: typeof t.resolvedBy?.login === "string" ? t.resolvedBy.login : null,
-      comments,
+      comments: page.comments,
     });
   }
   return {
@@ -358,6 +447,7 @@ export function parseReviewThreadsPage(out: string): {
     headSha,
     hasNextPage: pageInfo.hasNextPage === true,
     endCursor: typeof pageInfo.endCursor === "string" ? pageInfo.endCursor : null,
+    truncatedComments,
   };
 }
 
@@ -1085,6 +1175,7 @@ export class GhCliClient implements GitHubClient {
   async readReviewThreads(prNumber: number): Promise<ReviewThreadsRead> {
     const { owner, name } = splitRepo(this.repo);
     const threads: ReviewThread[] = [];
+    const truncated: Array<{ threadId: string; endCursor: string }> = [];
     let headSha: string | null = null;
     let after: string | null = null;
     for (let page = 0; page < REVIEW_THREAD_MAX_PAGES; page += 1) {
@@ -1111,26 +1202,20 @@ export class GhCliClient implements GitHubClient {
       try {
         out = await this.gh(args);
       } catch (err) {
-        if (isGitHubRateLimitError(err)) {
-          return { kind: "unavailable", reason: "rate-limited", detail: "GitHub rate limit on reviewThreads" };
-        }
-        if (isPermissionError(err)) {
-          return {
-            kind: "unavailable",
-            reason: "permissions",
-            detail: "gh lacks the GraphQL scope to read pull-request review threads",
-          };
-        }
-        return { kind: "unavailable", reason: "error", detail: String(err).slice(0, 300) };
+        return this.threadReadFailure(err);
       }
       const parsed = parseReviewThreadsPage(out);
       if (page === 0 && parsed.threads.length === 0 && parsed.headSha === null && out.trim().length === 0) {
         return { kind: "unavailable", reason: "error", detail: "gh api graphql returned nothing" };
       }
       threads.push(...parsed.threads);
+      truncated.push(...parsed.truncatedComments);
       headSha = headSha ?? parsed.headSha;
       if (!parsed.hasNextPage || !parsed.endCursor) {
-        return { kind: "threads", threads, headSha };
+        // Finish any thread whose comments did not fit in one page BEFORE reporting success:
+        // the latest comment is the finding's current statement, so a half-read thread is a
+        // wrong answer the gate cannot detect (issue #43).
+        return this.completeThreadComments(threads, truncated, headSha);
       }
       after = parsed.endCursor;
     }
@@ -1144,6 +1229,81 @@ export class GhCliClient implements GitHubClient {
       reason: "error",
       detail: `review threads exceeded ${REVIEW_THREAD_MAX_PAGES} pages; read is incomplete`,
     };
+  }
+
+  /**
+   * Cursor the remaining comments of every thread the first page truncated, appending them in
+   * order so the thread's LAST comment is genuinely GitHub's last. Fails the whole read closed
+   * on an overrun or a gh fault, exactly as the thread-level loop does: `latestCommentId` is
+   * the reply idempotency key and `latestCommentHash` is the repeat guard's material-change
+   * key, so a silently truncated thread is a fail-open — the gate would reply to a superseded
+   * finding and read an unchanged hash as "the reviewer stopped complaining" (issue #43).
+   */
+  private async completeThreadComments(
+    threads: ReviewThread[],
+    truncated: ReadonlyArray<{ threadId: string; endCursor: string }>,
+    headSha: string | null,
+  ): Promise<ReviewThreadsRead> {
+    for (const { threadId, endCursor } of truncated) {
+      const thread = threads.find((t) => t.id === threadId);
+      if (!thread) {
+        continue;
+      }
+      let after: string | null = endCursor;
+      let complete = false;
+      for (let page = 0; page < REVIEW_THREAD_COMMENT_MAX_PAGES && after; page += 1) {
+        let out: string;
+        try {
+          out = await this.gh([
+            "api",
+            "graphql",
+            "-f",
+            `query=${THREAD_COMMENTS_QUERY}`,
+            "-f",
+            `threadId=${threadId}`,
+            "-F",
+            `comments=${REVIEW_THREAD_COMMENT_PAGE_SIZE}`,
+            "-f",
+            `after=${after}`,
+          ]);
+        } catch (err) {
+          return this.threadReadFailure(err);
+        }
+        const parsed = parseThreadCommentsPage(out);
+        thread.comments.push(...parsed.comments);
+        if (thread.reviewedSha === null) {
+          thread.reviewedSha = parsed.reviewedSha;
+        }
+        after = parsed.hasNextPage ? parsed.endCursor : null;
+        if (!after) {
+          complete = true;
+          break;
+        }
+      }
+      if (!complete) {
+        return {
+          kind: "unavailable",
+          reason: "error",
+          detail: `thread ${threadId} comments exceeded ${REVIEW_THREAD_COMMENT_MAX_PAGES} pages; read is incomplete`,
+        };
+      }
+    }
+    return { kind: "threads", threads, headSha };
+  }
+
+  /** Classify a gh failure during a thread read into the port's typed `unavailable` reasons. */
+  private threadReadFailure(err: unknown): ReviewThreadsRead {
+    if (isGitHubRateLimitError(err)) {
+      return { kind: "unavailable", reason: "rate-limited", detail: "GitHub rate limit on reviewThreads" };
+    }
+    if (isPermissionError(err)) {
+      return {
+        kind: "unavailable",
+        reason: "permissions",
+        detail: "gh lacks the GraphQL scope to read pull-request review threads",
+      };
+    }
+    return { kind: "unavailable", reason: "error", detail: String(err).slice(0, 300) };
   }
 
   async replyToReviewThread(input: { threadId: string; body: string }): Promise<{ id: string }> {

@@ -70,7 +70,7 @@ import type {
 } from "../github/types";
 import type { Logger } from "../log/logger";
 import type { ScopedStore } from "../store/store";
-import type { BacklogView, DaemonError, Run, RunStatus } from "../store/types";
+import type { BacklogView, DaemonError, MasterLane, PausedStatus, Run, RunStatus } from "../store/types";
 import type { Executor, PickedIssue } from "../executor/executor";
 import type { WorktreeManager } from "../executor/worktree";
 import { scanPausedRuns, type ResumableRun } from "../hitl/resume";
@@ -88,8 +88,9 @@ import {
   type Classification,
   type IssueSnapshot,
 } from "./completeness";
+import { formatAnomalyActionComment } from "./anomaly-action";
 import { harnessEvidence, type MasterEscalationPort } from "../master/harness-escalation";
-import { ADOPTED_LABELS, hasMasterAdjudication, planAdoption } from "../master/adoption";
+import { ADOPTED_LABELS, hasMasterAdjudication, planAdoption, type AdoptionPlan } from "../master/adoption";
 
 /**
  * Human-attention labels other than `daemon-anomaly` — the paused/terminal labels
@@ -150,6 +151,17 @@ const STATE_EFFECT_LABEL_CREATE: Record<string, LabelCreateOptions> = {
 const STATE_EFFECT_LABELS: readonly string[] = Object.values(STATUS_EFFECT_LABEL);
 
 /**
+ * The two **paused** run statuses — the ones {@link scanPausedRuns} services and the only ones
+ * for which re-arming `ready-for-agent` means anything. Declared wide so `.includes(run.status)`
+ * accepts any {@link RunStatus}, with its members pinned to `PausedStatus` so the list can never
+ * drift from the store's own vocabulary.
+ */
+const PAUSED_RUN_STATUSES: readonly RunStatus[] = [
+  "awaiting-answer",
+  "review-maxed",
+] satisfies readonly PausedStatus[];
+
+/**
  * The single daemon-set state label the status projection *desires* for an issue
  * (issue #82, ADR-0027), or `null` for none. The pure core of the effect outbox: the
  * reconciler's per-tick diff and the completeness overlay both read it, so the label
@@ -193,6 +205,16 @@ function desiredStateLabel(status: RunStatus | null, labels: readonly string[]):
 function overlayStateLabels(labels: readonly string[], desired: string | null): string[] {
   const base = labels.filter((l) => !STATE_EFFECT_LABELS.includes(l));
   return desired ? [...base, desired] : base;
+}
+
+/**
+ * The interrupted lane one adoption re-enters (ADR-0042 migration). A `review-maxed` park and
+ * a review-origin answered pause were both interrupted in the review loop (their phase key is
+ * `review-N`); everything else was interrupted in implementation. Derived from the plan's own
+ * phase key so the lane and the phase can never disagree.
+ */
+function adoptionLane(plan: AdoptionPlan): MasterLane {
+  return plan.kind === "review-maxed" || plan.phase.startsWith("review-") ? "review" : "impl";
 }
 
 /** Default consecutive-claim-failure budget before an issue is surfaced as a daemon anomaly. */
@@ -414,6 +436,17 @@ export class Reconciler {
    * resolves.
    */
   private modingPass: Promise<void> = Promise.resolve();
+
+  /**
+   * The issues whose wedged in-flight run this tick's sweep actively terminated (issue #61).
+   * Repopulated from scratch at the top of every {@link sweep}, and read by the anomaly door so
+   * a wedge produces **exactly one** master request (issue #43): the sweep's abort is already
+   * on its way, and when the killed session settles the executor's session-failure door files
+   * the request with the real error behind it. Enqueuing here as well would append a second
+   * request for one failure — and since the master fold keeps only the LAST pending request,
+   * the anomaly's evidence would be silently dropped anyway.
+   */
+  private readonly terminatedWedged = new Set<number>();
 
   private readonly maxRunLifetimeMs: number;
   /** CI-timeout budget (ms) for the off-slot pre-review CI gate (ADR-0022 stage 1). */
@@ -967,7 +1000,7 @@ export class Reconciler {
     // serviced (ADR-0042 migration): they were parked by a build whose servicing code no
     // longer exists, so an unadopted one is acted on by nothing. Idempotent — a second pass
     // over an adopted issue appends nothing.
-    await this.adoptPreCutoverStates(issues);
+    await this.adoptPreCutoverStates(issues, new Set(strandedAnswered.map((s) => s.issue.number)));
 
     // Master escalation outranks fresh admission (ADR-0041): a run that has already been
     // worked, checkpointed, and handed up is worth more than one not yet started. Serviced
@@ -1114,6 +1147,10 @@ export class Reconciler {
    * so the run loop is a no-op and only the worktree GC runs.
    */
   private async sweep(): Promise<void> {
+    // Rebuilt every tick: a wedge the sweep aborted is re-aborted (harmlessly) on every
+    // subsequent tick while its session settles, so the set is repopulated for exactly as
+    // long as the completeness pass can still classify the run `run-wedged-past-lifetime`.
+    this.terminatedWedged.clear();
     for (const run of this.deps.store.listRuns()) {
       if (!isNonTerminalStatus(run.status)) {
         continue; // terminal (merged / agent-stuck) — nothing to sweep.
@@ -1194,6 +1231,9 @@ export class Reconciler {
    * controller (and `terminate` returns `false` once the session has settled out).
    */
   private terminateWedged(run: Run): void {
+    // Claim the wedge for the session-failure door before the completeness pass runs: the
+    // abort is in flight, and its settle is what carries the real error to the master.
+    this.terminatedWedged.add(run.issueNumber);
     const terminated = this.deps.executor.terminate(run.id);
     this.deps.logger.warn("sweep.wedged-run-terminated", {
       issue: run.issueNumber,
@@ -1291,6 +1331,17 @@ export class Reconciler {
       classified.add(issue.number);
       const run = store.getRunByIssue(issue.number);
       const isInFlight = inFlight.has(issue.number);
+      // Self-heal the #132 wedge BEFORE anything decides to escalate it: an answered pause
+      // whose `ready-for-agent` re-arm was rate-limited is a GitHub condition, not a fault
+      // (issue #43 — a rate limit must never consume a master attempt). Re-issuing that one
+      // label write is the cheap deterministic fix, so it goes first and the classification
+      // below then surfaces the still-stranded run as the standing signal. Guarded on the
+      // run STILL being paused: `answeredParked` was resolved at the top of the tick, and an
+      // adoption since then may have moved the run onto the master queue — where re-adding
+      // `ready-for-agent` would suppress the `master-triage` label effect.
+      if (run && answeredParked.has(issue.number) && PAUSED_RUN_STATUSES.includes(run.status)) {
+        await this.reArmAnsweredPause(issue.number, run);
+      }
       // Deliver the daemon-set state-label effect (issue #82, ADR-0027): diff the
       // projection's desired label against the actual GitHub labels and apply the
       // difference idempotently. A failed write retries next tick; a label dropped
@@ -1322,14 +1373,6 @@ export class Reconciler {
         masterUnroutable: run?.status === "master-triage" && this.masterRouteUnconfigured(),
       };
       await this.reconcileAnomalyLabel(issue.number, effectiveLabels, classifyIssueState(snapshot), run ?? null);
-      // Self-heal the #132 wedge in the same pass that surfaces it: an answered pause
-      // never re-armed to `ready-for-agent` (a rate-limited resume re-arm). Re-add the
-      // intake label idempotently so `scanPausedRuns` resumes it next tick; the
-      // `daemon-anomaly` above keeps it visible until the re-arm lands. A still-failing
-      // write is simply retried on the next tick — retry-until-it-lands (#132 AC1).
-      if (run && answeredParked.has(issue.number)) {
-        await this.reArmAnsweredPause(issue.number, run);
-      }
     }
 
     // Every run whose issue is NOT in the open set: a `running` / paused run whose
@@ -1557,10 +1600,20 @@ export class Reconciler {
       if (hasLabel) {
         return; // already surfaced; the label persists as the standing signal.
       }
+      let labelled = false;
       try {
         await github.addLabel(issueNumber, LABEL_DAEMON_ANOMALY, LABEL_DAEMON_ANOMALY_CREATE);
+        labelled = true;
       } catch (err) {
         logger.error("daemon.anomaly-label-failed", { issue: issueNumber, error: String(err) });
+      }
+      // Name the operator action on the issue itself (issue #43): `daemon-anomaly` is the one
+      // state whose owner is a human, so it must say what that human should DO — a bare
+      // classification enum in a log file is a diagnosis, not an action. Posted only once the
+      // label landed, so a failed label write retries the whole edge next tick rather than
+      // accumulating duplicate comments; the label's presence is what makes the edge single.
+      if (labelled) {
+        await this.postAnomalyAction(issueNumber, classification.reason);
       }
       logger.warn("daemon.anomaly", {
         issue: issueNumber,
@@ -1608,7 +1661,7 @@ export class Reconciler {
    * A partial GitHub failure is safe: the request fact is what the queue reads, so a failed
    * label strip simply leaves the retired label for the next tick's diff to remove.
    */
-  private async adoptPreCutoverStates(issues: readonly Issue[]): Promise<void> {
+  private async adoptPreCutoverStates(issues: readonly Issue[], answeredStranded: Set<number>): Promise<void> {
     const escalation = this.deps.masterEscalation;
     if (!escalation) {
       return;
@@ -1632,6 +1685,10 @@ export class Reconciler {
         // An outstanding master question is a live question by construction; for a
         // worker-origin pause the resume scan already told us whether it is answered.
         unansweredQuestion: this.deps.store.listOpenQuestions().some((q) => q.issueNumber === issue.number),
+        // …and the same scan's `strandedAnswered` verdict is the comment-ledger truth that
+        // overrides that (still-open) index for an answered-but-never-re-armed pause (#132).
+        answeredStrandedPause: answeredStranded.has(issue.number),
+        masterAwaitingHuman: history.awaitingHuman !== null,
       });
       if (!plan) {
         continue;
@@ -1641,7 +1698,7 @@ export class Reconciler {
           issueNumber: issue.number,
           runId: run.id,
           source: plan.source,
-          lane: plan.kind === "review-maxed" ? "review" : "impl",
+          lane: adoptionLane(plan),
           phase: plan.phase,
           branch: run.branch,
           prNumber: run.prNumber,
@@ -1650,9 +1707,14 @@ export class Reconciler {
             headline: plan.headline,
             detail: plan.detail,
             attemptedFixes:
-              "This run was parked by a pre-cutover build, which posted a heal/stuck card and waited " +
-              "for an operator. That servicing path no longer exists; the card and its evidence are " +
-              "still on the issue thread above.",
+              plan.kind === "answered-pause"
+                ? "This run escalated to a human on a pre-cutover build and the operator ANSWERED — the " +
+                  "`ralph-answer` comment is on the issue thread above. The re-arm that would have resumed " +
+                  "the worker never landed, and after the cutover that answer is yours to act on: treat it " +
+                  "as authoritative human input, not as a suggestion."
+                : "This run was parked by a pre-cutover build, which posted a heal/stuck card and waited " +
+                  "for an operator. That servicing path no longer exists; the card and its evidence are " +
+                  "still on the issue thread above.",
             uncertainty:
               "Whether the original blocker still holds — the base branch has very likely moved since.",
           }),
@@ -1706,6 +1768,15 @@ export class Reconciler {
     if (!escalation || !run || !anomalyEnqueuesMaster(reason, true)) {
       return false;
     }
+    // One wedge, one request (issue #43). This tick's sweep already aborted the run's live
+    // session; when that kill settles, the executor's session-failure door escalates it under
+    // `(impl, session-failed)` carrying the actual error. Filing a second request here under
+    // `(reconcile, anomaly)` would pass the door's `(phase, signature)` dedupe — different
+    // phase — and the master fold keeps only the LAST pending request, so this one's evidence
+    // would be dropped on the floor while still counting as a request.
+    if (reason === "run-wedged-past-lifetime" && this.terminatedWedged.has(issueNumber)) {
+      return false;
+    }
     // A run already parked on the master queue (or being adjudicated) must not be re-queued by
     // the anomaly pass — the escalation door dedupes by (phase, signature), and this second
     // guard keeps the common case free of a GitHub read.
@@ -1748,6 +1819,32 @@ export class Reconciler {
       this.deps.logger.warn("daemon.anomaly-escalation-failed", { issue: issueNumber, error: String(err) });
       return false;
     }
+  }
+
+  /**
+   * Post the operator action for a freshly-parked `daemon-anomaly` (issue #43). For a
+   * `master-route-unconfigured` the live route status carries the *defect-exact* text (the
+   * engine's `describeMasterRouteDefect`) — strictly better than the generic both-defects
+   * action the reason alone can give — so it is passed through when available. Best-effort: a failed
+   * comment must never break the completeness pass, and the label + log still surface the
+   * island.
+   */
+  private async postAnomalyAction(issueNumber: number, reason: AnomalyReason): Promise<void> {
+    const detail = reason === "master-route-unconfigured" ? this.masterRouteDefectDetail() : null;
+    try {
+      await this.deps.github.postComment(issueNumber, formatAnomalyActionComment(reason, detail));
+    } catch (err) {
+      this.deps.logger.warn("daemon.anomaly-action-comment-failed", {
+        issue: issueNumber,
+        error: String(err),
+      });
+    }
+  }
+
+  /** The live tier-1 route defect's actionable text, or null when the route is fine/unwired. */
+  private masterRouteDefectDetail(): string | null {
+    const status = this.deps.masterEngine?.routeStatus();
+    return status?.kind === "unconfigured" ? status.detail : null;
   }
 
   /**

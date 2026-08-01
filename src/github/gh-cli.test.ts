@@ -1202,7 +1202,7 @@ function reviewThreadsPage(opts: {
 }
 
 /** A minimal well-formed thread node with a single bot comment — for pagination-shape tests. */
-function threadNode(id: string): unknown {
+function threadNode(id: string, comments?: { hasNextPage?: boolean; endCursor?: string | null; nodes?: unknown[] }): unknown {
   return {
     id,
     isResolved: false,
@@ -1212,7 +1212,8 @@ function threadNode(id: string): unknown {
     diffSide: "RIGHT",
     resolvedBy: null,
     comments: {
-      nodes: [
+      pageInfo: { hasNextPage: comments?.hasNextPage ?? false, endCursor: comments?.endCursor ?? null },
+      nodes: comments?.nodes ?? [
         {
           id: `${id}_c`,
           databaseId: 1,
@@ -1223,6 +1224,31 @@ function threadNode(id: string): unknown {
         },
       ],
     },
+  };
+}
+
+/** One `node(id:…){ … comments }` follow-up page, as `gh api graphql` prints it. */
+function threadCommentsPage(opts: { hasNextPage?: boolean; endCursor?: string | null; nodes?: unknown[] }): string {
+  return JSON.stringify({
+    data: {
+      node: {
+        comments: {
+          pageInfo: { hasNextPage: opts.hasNextPage ?? false, endCursor: opts.endCursor ?? null },
+          nodes: opts.nodes ?? [],
+        },
+      },
+    },
+  });
+}
+
+/** A comment node on the wire. */
+function commentNode(id: string, body: string): unknown {
+  return {
+    id,
+    databaseId: 2,
+    body,
+    createdAt: "2026-08-01T00:00:00Z",
+    author: { login: "chatgpt-codex-connector", __typename: "Bot" },
   };
 }
 
@@ -1354,8 +1380,24 @@ describe("parseReviewThreadsPage (the hosted-review wire → domain translation,
     expect({ hasNextPage: none.hasNextPage, endCursor: none.endCursor }).toEqual({ hasNextPage: false, endCursor: null });
   });
 
+  it("lifts per-thread comment truncation so a deep thread is never silently half-read (#43)", () => {
+    // A thread with more comments than one page holds: the LATEST comment is the finding's
+    // current statement and the idempotency key for reply, so a truncated comment list is a
+    // wrong "latest comment" — detectable only if `comments.pageInfo` is lifted here.
+    const parsed = parseReviewThreadsPage(
+      reviewThreadsPage({
+        headRefOid: "head1",
+        nodes: [
+          threadNode("PRRT_deep", { hasNextPage: true, endCursor: "CCUR1" }),
+          threadNode("PRRT_shallow"),
+        ],
+      }),
+    );
+    expect(parsed.truncatedComments).toEqual([{ threadId: "PRRT_deep", endCursor: "CCUR1" }]);
+  });
+
   it("is tolerant: blank / unparseable / missing PR / id-less nodes never throw or fabricate", () => {
-    const empty = { threads: [], headSha: null, hasNextPage: false, endCursor: null };
+    const empty = { threads: [], headSha: null, hasNextPage: false, endCursor: null, truncatedComments: [] };
     expect(parseReviewThreadsPage("")).toEqual(empty);
     expect(parseReviewThreadsPage("   ")).toEqual(empty);
     expect(parseReviewThreadsPage("not json")).toEqual(empty);
@@ -1461,6 +1503,67 @@ describe("GhCliClient.readReviewThreads pagination loop (#43)", () => {
     const read = await client.readReviewThreads(50);
     expect(read.kind).toBe("unavailable");
     expect(read.kind === "unavailable" && read.reason).toBe("error");
+  });
+
+  // Thread-level pagination is not enough: a thread deeper than one comment page yields a WRONG
+  // "latest comment", and the latest comment's id/hash is both the reply idempotency key and the
+  // material-change key of the repeat guard (issue #43). So comments are cursored too.
+  it("follows the COMMENT cursor so the latest comment is the real latest (#43)", async () => {
+    const { client, calls } = pagingClient([
+      reviewThreadsPage({
+        headRefOid: "head1",
+        nodes: [threadNode("PRRT_deep", { hasNextPage: true, endCursor: "CCUR1", nodes: [commentNode("c1", "P1: first statement")] })],
+      }),
+      threadCommentsPage({ hasNextPage: true, endCursor: "CCUR2", nodes: [commentNode("c2", "still wrong")] }),
+      threadCommentsPage({ hasNextPage: false, endCursor: null, nodes: [commentNode("c3", "P0: and now differently wrong")] }),
+    ]);
+
+    const read = await client.readReviewThreads(50);
+
+    expect(read.kind).toBe("threads");
+    const comments = read.kind === "threads" ? read.threads[0]!.comments : [];
+    expect(comments.map((c) => c.id)).toEqual(["c1", "c2", "c3"]);
+    expect(comments[comments.length - 1]!.body).toContain("differently wrong");
+    // Page 0 is the threads query; the follow-ups are the per-thread comment cursor.
+    expect(calls).toHaveLength(3);
+    expect(calls[1]!.some((a) => a.startsWith("query=") && a.includes("PullRequestReviewThread"))).toBe(true);
+    expect(calls[1]!).toContain("threadId=PRRT_deep");
+    expect(calls[1]!).toContain("after=CCUR1");
+    expect(calls[2]!).toContain("after=CCUR2");
+  });
+
+  it("fails closed when a thread's comments overrun the page cap — never a wrong 'latest comment'", async () => {
+    // Every comment page reports another: consistent with the thread-level cap, a read that
+    // cannot prove it saw the newest comment is `unavailable`, not a truncated success.
+    const { client } = pagingClient([
+      reviewThreadsPage({
+        headRefOid: "head1",
+        nodes: [threadNode("PRRT_deep", { hasNextPage: true, endCursor: "CCUR", nodes: [commentNode("c1", "first")] })],
+      }),
+      threadCommentsPage({ hasNextPage: true, endCursor: "CCUR", nodes: [commentNode("cN", "more")] }),
+    ]);
+
+    const read = await client.readReviewThreads(50);
+
+    expect(read.kind).toBe("unavailable");
+    expect(read.kind === "unavailable" && read.reason).toBe("error");
+    expect(read.kind === "unavailable" && read.detail).toContain("incomplete");
+  });
+
+  it("surfaces a rate limit hit while cursoring comments as a defer, not a partial thread", async () => {
+    const err = Object.assign(new Error("gh failed"), { stderr: "API rate limit already exceeded" });
+    const { client } = pagingClient(
+      [
+        reviewThreadsPage({
+          headRefOid: "head1",
+          nodes: [threadNode("PRRT_deep", { hasNextPage: true, endCursor: "CCUR1", nodes: [commentNode("c1", "first")] })],
+        }),
+        err,
+      ],
+      { rateLimitRetries: 0 },
+    );
+    const read = await client.readReviewThreads(50);
+    expect(read.kind === "unavailable" && read.reason).toBe("rate-limited");
   });
 });
 

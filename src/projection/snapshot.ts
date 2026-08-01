@@ -314,16 +314,24 @@ export function buildSnapshot(store: Store, options: SnapshotOptions = {}): Runt
         return {
           repo: run.repo,
           issueNumber: run.issueNumber,
-          headline: open ? "" : (history.pending?.headline ?? ""),
+          // A *running* intervention names itself from the request it is servicing, which
+          // `MasterInterventionStarted` restates — the queue entry is gone by then, and blanking
+          // these is what used to hide the source at exactly the moment an operator asks what the
+          // master is working on. A pre-cutover span recorded none, so the pending entry (and
+          // then the empty string) still backstops it.
+          headline: open?.headline ?? history.lastRequest?.headline ?? "",
           since: run.updatedAt,
-          source: open ? null : (history.pending?.source ?? null),
-          lane: open ? null : (history.pending?.lane ?? null),
+          source: open?.source ?? history.lastRequest?.source ?? null,
+          lane: open?.lane ?? history.lastRequest?.lane ?? null,
           phase: open?.phase ?? history.pending?.phase ?? null,
           attempt: open?.attempt ?? inPhase.length + 1,
           budget: MAX_MASTER_INTERVENTIONS_PER_PHASE,
           running: open !== null,
           route: store.getRunRoute(run.id),
-          latestConclusion: decided?.rationale ?? null,
+          // The master's own reading of the situation, which is what a human needs to rule.
+          // The rationale is why *that* resolution followed from it — a fallback for a
+          // pre-cutover attempt that recorded no conclusion, not a synonym.
+          latestConclusion: decided?.conclusion ?? decided?.rationale ?? null,
         };
       }),
     reviewMaxed: toQueue("review-maxed"),

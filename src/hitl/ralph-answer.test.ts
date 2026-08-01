@@ -216,72 +216,124 @@ describe("RalphAnswerService (AC6 — review-maxed heal-cards flow through the s
   });
 });
 
-describe("RalphAnswerService (#86 — agent-stuck stuck-cards are healable through the same queue)", () => {
-  /** Seed an `agent-stuck` issue carrying an open stuck-card (#85). */
+describe("RalphAnswerService (ADR-0042 §7 — `agent-stuck` is terminal and is NOT answerable)", () => {
+  /** Seed an `agent-stuck` issue carrying a (pre-cutover) stuck-card. */
   function seedStuck(github: FakeGitHub, number: number, createdAt: string, reason = "looped on the same assertion"): void {
     github.seed({
       number,
       title: `Issue ${number}`,
       createdAt,
-      // Post-pickup label set: `ready-for-agent` was removed on claim; the stuck
-      // terminal added `agent-stuck`.
+      // Post-pickup label set: `ready-for-agent` was removed on claim; the terminal
+      // adjudication added `agent-stuck`.
       labels: [LABEL_AGENT_STUCK, "afk", "mode:tdd"],
     });
     void github.postComment(number, formatRalphQuestion(buildStuckCardQuestion({ category: "fix-iterations", reason })));
   }
 
-  it("lists an agent-stuck issue carrying an open stuck-card (AC1)", async () => {
+  it("does NOT list an agent-stuck issue, even when it carries a ralph-question card", async () => {
     const github = new FakeGitHub();
     seedStuck(github, 30, "2026-02-10T00:00:00Z", "the migration never type-checked");
     const service = new RalphAnswerService(github);
 
-    const item = await service.next();
-    expect(item!.issue.number).toBe(30);
-    expect(item!.label).toBe(LABEL_AGENT_STUCK);
-    // The surfaced question is the stuck-card — its reason is readable to the operator.
-    expect(item!.question.whereWeStand).toContain("the migration never type-checked");
+    // The card is readable evidence on the issue; it is not a question anyone may answer.
+    expect(await service.next()).toBeNull();
+    expect(await service.list()).toEqual([]);
   });
 
-  it("orders stuck-cards FIFO alongside awaiting-answer/review-maxed (AC1)", async () => {
+  it("does NOT list the master's own terminal card (MasterStuck)", async () => {
     const github = new FakeGitHub();
-    // A stuck issue (older) and an escalation (newer) — oldest first, regardless of kind.
+    github.seed({
+      number: 36,
+      title: "Issue 36",
+      createdAt: "2026-02-10T00:00:00Z",
+      labels: [LABEL_AGENT_STUCK, "afk", "mode:tdd"],
+    });
+    // Verbatim shape of the card `master/engine.ts` posts alongside `MasterStuck` — the
+    // terminal's own self-explaining card is exactly what would otherwise make the terminal
+    // servable, un-terminalizing a completed adjudication into a fresh worker run.
+    void github.postComment(
+      36,
+      formatRalphQuestion({
+        headline: "Master concluded this run cannot be completed",
+        feature: "Master escalation (ADR-0041)",
+        whereWeStand: "A fresh highest-tier master session investigated this run independently.",
+        decision: "How should this issue be disposed of?",
+        options: [
+          "Re-scope the issue (edit it and re-label `ready-for-agent`)",
+          "Provide guidance and re-enable the run (heal)",
+          "Close the issue",
+        ],
+        stakes: "No pull request will merge from this run.",
+        recommendation: "Read the master's conclusion, then re-scope or close.",
+      }),
+    );
+    const service = new RalphAnswerService(github);
+
+    expect(await service.list()).toEqual([]);
+    expect(await service.next()).toBeNull();
+  });
+
+  it("skips the terminal while still serving the answerable pauses FIFO", async () => {
+    const github = new FakeGitHub();
+    // A terminal (older) and an escalation (newer): only the escalation is a question.
     seedStuck(github, 31, "2026-02-09T00:00:00Z");
     seedEscalation(github, 32, "2026-02-11T00:00:00Z");
     const service = new RalphAnswerService(github);
 
     const queue = await service.list();
-    expect(queue.map((q) => q.issue.number)).toEqual([31, 32]);
+    expect(queue.map((q) => q.issue.number)).toEqual([32]);
   });
 
-  it("does NOT surface a bare agent-stuck issue that carries no stuck-card (AC6)", async () => {
+  it("does NOT surface a bare agent-stuck issue that carries no card", async () => {
     const github = new FakeGitHub();
-    // An `agent-stuck` terminal with no stuck-card (e.g. a crash-discarded orphan).
+    // An `agent-stuck` terminal with no card (e.g. a crash-discarded orphan).
     github.seed({ number: 33, labels: [LABEL_AGENT_STUCK, "afk", "mode:tdd"] });
     const service = new RalphAnswerService(github);
 
     expect(await service.next()).toBeNull();
   });
 
-  it("answering a stuck-card swaps agent-stuck → ready-for-agent through one patch (AC2)", async () => {
+  it("refuses a targeted answer to an agent-stuck terminal, informatively and without writing", async () => {
     const github = new FakeGitHub();
     seedStuck(github, 34, "2026-02-10T00:00:00Z");
+    const before = github.comments.get(34)!.length;
     const service = new RalphAnswerService(github);
 
-    const served = await service.serveOne(async () => "Regenerate the lockfile, then retry the migration");
-    expect(served!.issue.number).toBe(34);
+    const result = await service.submitForIssue((await github.getIssue(34))!, {
+      kind: "free-text",
+      text: "Regenerate the lockfile, then retry the migration",
+    });
 
-    // The answer comment is durable and parseable.
-    const answer = parseRalphAnswer((github.comments.get(34) ?? []).at(-1)!.body)!;
-    expect(answer).toEqual({ kind: "free-text", text: "Regenerate the lockfile, then retry the migration" });
+    // The refusal names the terminal, why it is terminal, and what the operator can actually do.
+    expect(result.kind).toBe("terminal-not-answerable");
+    if (result.kind === "terminal-not-answerable") {
+      expect(result.label).toBe(LABEL_AGENT_STUCK);
+      expect(result.message).toContain(LABEL_AGENT_STUCK);
+      expect(result.message).toContain("master");
+      expect(result.message).toContain(LABEL_READY);
+    }
 
-    // The label patch swaps agent-stuck for ready-for-agent (re-admit, never picked up
-    // as a stale paused run).
+    // Nothing was written: no answer comment, no label swap, the terminal still stands.
+    expect(github.comments.get(34)!).toHaveLength(before);
+    expect(github.labelPatches).toEqual([]);
     const labels = github.issues.get(34)!.labels;
-    expect(labels).toContain(LABEL_READY);
-    expect(labels).not.toContain(LABEL_AGENT_STUCK);
-    expect(github.labelPatches).toEqual([{ issue: 34, remove: [LABEL_AGENT_STUCK], add: [LABEL_READY] }]);
+    expect(labels).toContain(LABEL_AGENT_STUCK);
+    expect(labels).not.toContain(LABEL_READY);
+  });
 
-    // Once answered, the queue no longer serves it (AC5 — one at a time, drains).
-    expect(await service.next()).toBeNull();
+  it("never serves a terminal through the one-at-a-time loop, so the CLI cannot answer it", async () => {
+    const github = new FakeGitHub();
+    seedStuck(github, 35, "2026-02-10T00:00:00Z");
+    const service = new RalphAnswerService(github);
+
+    let prompted = false;
+    const served = await service.serveOne(async () => {
+      prompted = true;
+      return "heal it";
+    });
+
+    expect(served).toBeNull();
+    expect(prompted).toBe(false);
+    expect(github.labelPatches).toEqual([]);
   });
 });

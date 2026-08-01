@@ -46,7 +46,7 @@ import {
   type AnswerPortResult,
   type InboxEntry,
 } from "./inbox";
-import { consequenceForAnswerableLabel } from "../hitl/labels";
+import { consequenceForAnswerableLabel, LABEL_READY } from "../hitl/labels";
 import type { VapidIdentity } from "../notify/webpush";
 import { executePowerAction } from "./power-actions";
 import { executeRoutingEdit, getEffectiveRouting, type RoutingControlPort } from "./routing-actions";
@@ -364,6 +364,18 @@ export function createWebPorts(deps: {
         return { kind: "no-open-question", error: `no open question for ${body.repo}#${body.issue}` };
       }
       const question = await openQuestionForIssue(github, issue);
+      // A master-selected terminal is refused with the reason, not with an indistinguishable
+      // "nothing here" (ADR-0042 §7) — the operator needs to know the daemon stopped deliberately
+      // and that re-scoping the issue, not answering it, is the way back in.
+      if (question.kind === "terminal") {
+        return {
+          kind: "no-open-question",
+          error:
+            `${body.repo}#${body.issue} is parked on \`${question.label}\`, a terminal selected by a ` +
+            `completed master adjudication. There is no question to answer: re-scope the issue and ` +
+            `re-label it \`${LABEL_READY}\` to hand it back, or close it.`,
+        };
+      }
       if (question.kind !== "open") {
         return { kind: "no-open-question", error: `no open question for ${body.repo}#${body.issue}` };
       }

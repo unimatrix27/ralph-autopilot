@@ -141,7 +141,7 @@ export class ContainerAgentRunner implements AgentRunner {
     // a fresh container hosts a fresh session, same as a first run (ADR-0008 / ADR-0038).
     const prompt = ctx.resume
       ? buildResumePrompt(issue, mode, branch, this.deps.config, ctx.resume)
-      : buildImplPrompt(issue, mode, branch, this.deps.config, ctx.stuckHeal);
+      : buildImplPrompt(issue, mode, branch, this.deps.config);
     // The tier's session-budget deltas (issue #278), resolved DAEMON-side from the same live
     // routing the route came from (falling back to the loaded config when routing is unwired)
     // so the runner applies, never re-derives. Only set fields ride the dispatch — an empty

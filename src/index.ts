@@ -640,8 +640,9 @@ export {
   isAwaitingAnswerLabel,
 } from "./hitl/labels";
 export type { AnswerableLabel, AnswerConsequence, AwaitingAnswerLabel } from "./hitl/labels";
-export { findStuckHealGuidance } from "./hitl/heal-readmit";
-export type { StuckHealGuidance } from "./hitl/heal-readmit";
+// The #86 stuck-heal lane is retired in full (ADR-0042 / issue #43): `agent-stuck` is a
+// terminal, not an answerable pause, so neither the detector nor the guidance shape it wove
+// into the impl prompt exists — one condition, exactly one lifecycle.
 export {
   RALPH_ANSWER_FENCE,
   resolveAnswer,

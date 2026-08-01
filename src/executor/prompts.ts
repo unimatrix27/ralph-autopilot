@@ -14,7 +14,6 @@ import type { Mode } from "../store/types";
 import { buildLaunchMarker } from "../github/marker";
 import type { EscalationQuestion } from "../review/escalation";
 import type { RalphAnswer } from "../hitl/answer";
-import type { StuckHealGuidance } from "../hitl/heal-readmit";
 
 /** Appended to the claude_code system prompt for every impl session. */
 export const SYSTEM_APPEND = [
@@ -74,42 +73,13 @@ function modeInstructions(mode: Mode, config: TargetConfig): string {
 }
 
 /**
- * The heal block woven into a *re-admitted* impl prompt (#86). A prior attempt on
- * this issue bounded out (`agent-stuck`) and the operator answered its stuck-card
- * through `ralph-answer`, re-admitting the issue for a fresh run. The stuck run kept
- * no WIP branch, so this is a clean start — but the new agent must begin knowing why
- * the last attempt stopped (the stuck-card's category + the agent's reason) and what
- * the operator wants done differently (the answer). Without this the re-admitted
- * agent retries blind, exactly the dead end #86 removes.
+ * Build the user prompt for an impl session — always a fresh start from the issue
+ * itself. There is no re-admission guidance block: the #86 stuck-heal lane is retired
+ * (ADR-0042), `agent-stuck` is a terminal only a master may select, and a re-admitted
+ * issue starts from its (re-scoped) body. A *resume* is the other module
+ * ({@link buildResumePrompt}) — that one continues a WIP branch.
  */
-function stuckHealBlock(stuckHeal: StuckHealGuidance): string[] {
-  return [
-    "--- a previous attempt stopped; the operator has given guidance ---",
-    "An earlier run on this issue stopped before opening a PR. There is no prior WIP branch —",
-    "you are starting fresh — but begin by reading why it stopped and what to do differently:",
-    "",
-    stuckHeal.question.headline,
-    stuckHeal.question.whereWeStand,
-    "",
-    "Operator guidance:",
-    stuckHeal.answer.text,
-    "--- end previous-attempt guidance ---",
-    "",
-  ];
-}
-
-/**
- * Build the user prompt for an impl session. When `stuckHeal` is present the issue
- * is being **re-admitted** after a stuck terminal the operator healed (#86): the
- * operator's guidance is woven in so the fresh agent does not retry blind.
- */
-export function buildImplPrompt(
-  issue: Issue,
-  mode: Mode,
-  branch: string,
-  config: TargetConfig,
-  stuckHeal?: StuckHealGuidance,
-): string {
+export function buildImplPrompt(issue: Issue, mode: Mode, branch: string, config: TargetConfig): string {
   const marker = buildLaunchMarker({ issueNumber: issue.number, branch });
   return [
     `Implement GitHub issue #${issue.number} of ${config.targetRepo}, end to end.`,
@@ -120,7 +90,6 @@ export function buildImplPrompt(
     issue.body,
     "--- end issue body ---",
     "",
-    ...(stuckHeal ? stuckHealBlock(stuckHeal) : []),
     modeInstructions(mode, config),
     "",
     "You are already on the correct git worktree and branch — implement, commit, and push here.",

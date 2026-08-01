@@ -28,10 +28,11 @@ Concretely, before the first tick a **startup reconciliation** rebuilds runtime
 state from GitHub. It re-derives in-flight runs from the open PRs carrying the
 `<!-- ralph-launch: … -->` marker: each orphaned `running` run is re-attached and
 its review re-driven if its PR survives, else marked terminal with its worktree
-removed; a paused run (`awaiting-answer` / `review-maxed`) is re-indexed — run
-row, open-question entry, resume context — so it resumes once answered even on a
-cold (lost) store. No orphaned worktrees or silently-abandoned runs survive a
-restart.
+removed; a paused run (`awaiting-answer`, or a queued `master-triage` rebuilt from its
+`ralph-master-request` comment) is re-indexed — run row, open-question entry, resume
+context — so it resumes once answered or adjudicated even on a cold (lost) store. A
+pre-cutover `review-maxed` park still rehydrates and is adopted into master triage
+(§13a.3). No orphaned worktrees or silently-abandoned runs survive a restart.
 
 Shutdown is the mirror image: a `SIGTERM`/`SIGINT` (or `ralph-daemon --drain`)
 **drains** rather than aborting — it stops starting/resuming agents but lets the
@@ -115,7 +116,8 @@ Two hard ceilings bound every agent: a **wall-clock** of 1 hour (daemon kills �
 
 The wall-clock wraps **every** SDK session — impl, resume, review, and fix — not
 just the impl/resume one, so a hung review/fix session is bounded too (it
-surfaces as `review-maxed` rather than `agent-stuck`, since that path has a PR).
+surfaces as a review-phase maxout — master triage, PR preserved — rather than
+`agent-stuck`, since that path has a PR).
 On the **Claude** provider the kill is *hard*: the SDK spawns the `claude` CLI
 through `spawnClaudeCodeProcess` as its own process-group leader, so on overrun the
 daemon aborts the `query()` **and** SIGKILLs the whole process group — reaping every
@@ -183,13 +185,13 @@ principle on the merge side, auto-merge.)
 **Phase 0 — CI gate (await CI *before* review).** After the PR opens, poll
 `gh pr checks <pr>` until every check is terminal. **Red** → skip review, treat the
 failing checks as the fix worklist, run the bounded fix loop, push, re-await CI;
-still red (or a timeout) → `review-maxed` (ci) + heal-card. **Green / no checks** →
+still red (or a timeout) → **master triage** (source `ci`). **Green / no checks** →
 proceed. Gating on CI first means review/fix budget is never spent on a PR that
 does not even compile; on a repo with no checks this is a no-op.
 ([ADR-0014](adr/0014-harness-owned-ci-gated-rebase-aware-merge.md))
 
 CI in flight is **transient**, so the gate waits for a **stably-terminal, latest**
-verdict before manufacturing the `review-maxed` human-attention state
+verdict before spending the phase's exhaustion terminal
 ([ADR-0033](adr/0033-ci-gate-stably-terminal-latest-verdict.md), same principle as the
 usage-limit guard [ADR-0023](adr/0023-usage-limit-guard.md)): `classifyChecks` collapses
 multiple runs of one check name to the **latest** (by `startedAt`/`completedAt`), so a
@@ -213,13 +215,24 @@ superseding [ADR-0005](adr/0005-two-phase-local-review.md))
 rubric). The review agent applies it to the diff **and ingests any automated PR
 comments already present** (Codex, `@claude`, etc.), then emits a **worklist**. Up to three
 **fix attempts**; the fix agent applies `P0`+`P1` items, builds+tests green,
-pushes. Clean → advance. Three attempts still blocked → `review-maxed`
-(correctness) + heal-card, **stop** (never enter Phase 2 on behaviourally-wrong
+pushes. Clean → advance. Three attempts still blocked → **master triage** (source
+`review-maxed`, correctness), **stop** (never enter Phase 2 on behaviourally-wrong
 code).
 
 **Phase 2 — behaviour-conserving thermo** (the hardcoded thermo-nuclear structural rubric). Same shape,
-behaviour-preserving fixes only. Clean → done. Maxout → `review-maxed` (quality) +
-heal-card.
+behaviour-preserving fixes only. Clean → done. Maxout → **master triage** (source
+`review-maxed`, quality).
+
+Since **ADR-0042** a maxed-out phase reaches no human. Every exhaustion terminal here —
+the CI gate, phase 1, phase 2, an exhausted rebase, a merge preparation that never became
+mergeable — appends a **master-triage request** through the one escalation door
+(`master/harness-escalation.ts`, §13a.1), carrying the remaining blockers as evidence.
+`review-maxed` survives as the *event* (the `ReviewMaxed` fact, appended in the **same
+commit** as the request) and as the request's source name; it is never a label, never a
+heal-card and never a question. The latest projection is `master-triage`, so no reader
+observes an intermediate human-facing state, and the maxed-out phase is kept in the
+resume context so a master's `resolved-and-continue` re-enters the loop exactly where it
+stopped (resume-not-restart, §6).
 
 Consolidation is folded into the review agent (it produces the deduped, ranked
 worklist) — there is no separate "decide what to implement" agent. A fix agent
@@ -276,8 +289,9 @@ and hard-syncs the local ref to `origin/<branch>` instead of tripping the diverg
 which otherwise fires on the daemon's own legitimate push and orphans the reviewed PR (issue 21).
 The divergence guard stays fully intact for a divergence the daemon **cannot** attribute to its
 own push (a hand force-push / unknown rewrite): rather than terminalize to `agent-stuck` with the
-reviewed PR auto-closed, that case parks **healable** (`review-maxed` + heal-card, PR preserved)
-so a human resolves it and re-enables the run. Then,
+reviewed PR auto-closed, that case parks **recoverable** (master triage, source `rebase`, PR
+preserved) so a master — or, if it cannot, the human it asks — resolves the divergence and the
+run re-enables. Then,
 keyed on whether the branch **moved**: a no-op rebase merges directly; a moved
 branch (base advanced under a reviewed branch) is **re-reviewed under the lease**
 (net diff taken against `origin/<branch>`, so a conflict resolution that changed the
@@ -302,11 +316,12 @@ building on [ADR-0014](adr/0014-harness-owned-ci-gated-rebase-aware-merge.md), w
 superseded the auto-merge *mechanism* of [ADR-0009](adr/0009-auto-merge.md))
 
 Success terminal = *merged + issue closed*. `ready-for-human` is therefore **not**
-a success state; the human-attention states are `agent-stuck`, `awaiting-answer`,
-`review-maxed`, and — as the catch-all that makes a dead state impossible to hide —
-`daemon-anomaly` (§9a).
+a success state; the human-attention states are `awaiting-answer`, `agent-stuck` (both
+reachable only through a master, §13a) and — as the catch-all that makes a dead state
+impossible to hide — the operator-owned `daemon-anomaly` (§9a). Every other issue-scoped
+failure parks on the daemon-owned `master-triage`, which is not one of them.
 
-The four **daemon-set** state labels (`awaiting-answer`, `review-maxed`, `agent-stuck`,
+The **daemon-set** state labels (`awaiting-answer`, `master-triage`, `agent-stuck`,
 `awaiting-merge`) are not written imperatively at the transition points. They are
 level-triggered **effects** of the run-status projection: each tick the reconciler diffs
 the desired set (derived from status) against the actual GitHub labels and applies the
@@ -315,10 +330,12 @@ difference idempotently, generalising the outbox `reconcileAnomalyLabel` already
 accepted, and the completeness pass (§9a) compares against the projection's *desired* set
 so that latency never raises a false island. The **intake** labels (`ready-for-agent`,
 `afk`, `hitl`, `mode:*`) and `ralph-answer`'s `awaiting-answer → ready-for-agent` swap-back
-stay human/CLI-set; the pickup claim's `ready-for-agent` removal stays inline.
+stay human/CLI-set; the pickup claim's `ready-for-agent` removal stays inline. The retired
+`review-maxed` stays in the *strip* set only so an adopted pre-cutover park is cleared on the
+same tick it becomes `master-triage` (§13a.3).
 ([ADR-0027](adr/0027-reconciler-as-outbox.md))
 
-## 6. Human input — the escalate / heal path
+## 6. Human input — the escalate / answer path
 
 When an agent needs a decision it calls **`escalate`** — a custom tool, never
 Claude's built-in `AskUserQuestion`. It is asynchronous: checkpoint the WIP branch
@@ -468,9 +485,10 @@ issue. Whenever an issue lands in a (label set × run status) combination that *
 path classifies**, it becomes a silent **island** — acted on by nothing, seen by no
 one. Under auto-merge (§5, [ADR-0009](adr/0009-auto-merge.md)) every island is
 silent until a human happens to look; the original build shipped two (legacy issue 8 —
-a crash abandons in-flight runs; legacy issue 9 — an answered `review-maxed` heal nothing
-resumes). Point-fixing islands does not prevent the next one, so the daemon makes a
-dead state impossible to *hide*, always visible within one tick:
+a crash abandons in-flight runs; legacy issue 9 — an answered pre-cutover
+`review-maxed` heal nothing resumes). Point-fixing islands does not prevent the
+next one, so the daemon makes a dead state impossible to *hide*, always visible
+within one tick:
 
 1. **Completeness invariant** (`src/daemon/completeness.ts`). Each tick a single,
    **total** pure function classifies every OPEN issue and every non-terminal run
@@ -781,7 +799,7 @@ Container dispatch/result schemas grow additively (`kind: "master"`, `escalation
 question the daemon never asked for, the master path is gated on a **declared runner
 capability**: the image stamps `io.ralph.runner-capabilities`, the daemon reads it
 pre-dispatch, and a stale image fails with one precise, actionable error naming the missing
-capability — never a generic no-result → review-maxed cascade. The onboarding smoke test gates
+capability — never a generic no-result → exhaustion cascade. The onboarding smoke test gates
 on the same label.
 
 Deliberately out of scope *for §13*: automatic triage of `review-maxed`, CI/merge/rebase failures

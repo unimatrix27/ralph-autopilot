@@ -40,8 +40,13 @@ export type EscalationQuestionWire = z.infer<typeof escalationQuestionWireSchema
 
 /**
  * The human-attention label an answerable issue carries — the wire mirror of the canonical
- * label names (`awaiting-answer` / `review-maxed` / `agent-stuck`). It is the index into the
- * `ralph-answer` queue and the determinant of what answering *does* (see {@link inboxConsequenceSchema}).
+ * label names. It is the index into the `ralph-answer` queue and the determinant of what
+ * answering *does* (see {@link inboxConsequenceSchema}).
+ *
+ * `agent-stuck` is retained in the enum but is **never emitted** post-cutover: ADR-0042 §7 makes it
+ * a terminal only a completed master adjudication may select, and the queue refuses to serve it, so
+ * no card can carry it. The value stays so a client parsing a pre-cutover payload still validates
+ * (ADR-0026: widen readers, never rewrite recorded history).
  */
 export const INBOX_ATTENTION_LABELS = ["awaiting-answer", "review-maxed", "agent-stuck"] as const;
 export const inboxAttentionLabelSchema = z.enum(INBOX_ATTENTION_LABELS);
@@ -50,10 +55,12 @@ export type InboxAttentionLabelWire = z.infer<typeof inboxAttentionLabelSchema>;
 /**
  * What answering this question does to the run — the consequence the UI states plainly so the
  * operator is never lied to about immediacy (ADR-0032: no faked immediacy):
- *   - `resume-from-wip` — `awaiting-answer` (an impl escalation) and `review-maxed` (a heal-card)
- *     both resume the *paused* run from its checkpointed WIP branch next tick;
- *   - `readmit-fresh` — `agent-stuck` (a stuck-card) re-admits a *fresh* run with the operator's
- *     guidance injected (#86), not a resume.
+ *   - `resume-from-wip` — `awaiting-answer` (an impl escalation) and `review-maxed` (a legacy
+ *     pre-cutover park) both resume the *paused* run from its checkpointed WIP branch next tick.
+ *     Post-cutover this is the only consequence a live card can carry.
+ *   - `readmit-fresh` — pre-cutover only: the retired `agent-stuck` stuck-card re-admitted a
+ *     *fresh* run with the operator's guidance injected (#86). No path emits it any more; kept
+ *     for back-compatible parsing alongside its label (ADR-0042 §7).
  */
 export const INBOX_CONSEQUENCES = ["resume-from-wip", "readmit-fresh"] as const;
 export const inboxConsequenceSchema = z.enum(INBOX_CONSEQUENCES);

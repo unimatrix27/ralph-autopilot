@@ -293,10 +293,14 @@ function DeepLinks({ card }: { card: InboxCard }) {
   );
 }
 
-/** The plain-language consequence of answering — what the daemon does, and when (ADR-0032). */
+/**
+ * The plain-language consequence of answering — what the daemon does, and when (ADR-0032).
+ *
+ * Every card in the Inbox is a *paused* run, so answering always resumes it from its
+ * checkpointed WIP. The `agent-stuck` terminal is never listed here (ADR-0042 §7): a completed
+ * master adjudication selected it, so no answer re-admits anything — an operator re-scopes the
+ * issue (re-label it `ready-for-agent`) or closes it through the power actions instead.
+ */
 function consequenceText(card: InboxCard, seconds: number): string {
-  if (card.consequence === "readmit-fresh") {
-    return `Answering re-admits a fresh run with your guidance injected. The daemon picks it up next tick (~${seconds}s).`;
-  }
   return `Answering ${inboxResumeTargetText(card.phase)} next tick (~${seconds}s).`;
 }

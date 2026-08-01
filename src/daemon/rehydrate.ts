@@ -22,16 +22,33 @@
  * the rows so both warm- and cold-store crashes converge on that one pass.
  */
 
-import { LABEL_AWAITING_CI, LABEL_AWAITING_MERGE, LABEL_MASTER_TRIAGE, readMode, readTier } from "../core/labels";
+import {
+  LABEL_AGENT_STUCK,
+  LABEL_AWAITING_CI,
+  LABEL_AWAITING_MERGE,
+  LABEL_MASTER_TRIAGE,
+  readMode,
+  readTier,
+} from "../core/labels";
 import { parseMasterRequestComment, type MasterRequestPayload } from "../master/request";
 import { parseLaunchMarker } from "../github/marker";
-import type { GitHubClient } from "../github/types";
+import type { GitHubClient, PrComment } from "../github/types";
 import type { Logger } from "../log/logger";
 import { latestRalphQuestion } from "../hitl/answer";
 import { LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED, LABEL_READY } from "../hitl/labels";
 import type { EscalationQuestion } from "../review/escalation";
 import type { ScopedStore } from "../store/store";
 import type { PausedStatus, Phase, ResumePayload } from "../store/types";
+
+/**
+ * The attempt number a rebuilt master `ask-human` is re-adopted under. A cold store has no
+ * record of which of the two per-phase attempts asked — nothing on GitHub carries it — so the
+ * rebuild pins the first. That is the conservative reconstruction in the direction that matters:
+ * re-adopting attempt 1 spends no fresh budget (`readoptedAttemptBudget`) and still forbids a
+ * second `ask-human` on it, so the answered master cannot re-ask; at worst the phase keeps one
+ * more autonomous attempt than it had, which is strictly better than losing the answer.
+ */
+const REBUILT_MASTER_ATTEMPT = 1;
 
 /** The paused-run state a rebuilt run is reconstructed into, derived from GitHub. */
 interface PausedReconstruction {
@@ -40,6 +57,14 @@ interface PausedReconstruction {
   commentId: number;
   /** The review phase recovered from a review-origin pause's hidden marker (issue #9); else `null`. */
   phase: Phase | null;
+  /**
+   * The master request the outstanding question was asked *under*, or `null` for a pre-cutover
+   * worker escalation. After the cutover `ask_human` is the master's alone and every master
+   * session is preceded by its own fenced `ralph-master-request` comment, so "a request comment
+   * pre-dates the live question" is exactly the provenance test — and it is the only one that
+   * survives a lost store (ADR-0042).
+   */
+  masterRequest: MasterRequestPayload | null;
 }
 
 /**
@@ -68,6 +93,19 @@ export async function rehydrateRunsFromGitHub(
     const issue = await github.getIssue(issueNumber);
     if (!issue || issue.state !== "OPEN") {
       continue; // concluded (merged/closed) while the daemon was down — nothing to rebuild.
+    }
+    // A terminal label is terminal, PR or no PR (ADR-0042). Before the cutover an `agent-stuck`
+    // issue had no marker PR, so it could never reach this loop; the cutover made a WIP
+    // checkpoint mandatory before every escalation and `terminalStuck` deliberately leaves that
+    // draft PR open, so a master's terminal now looks exactly like an in-flight review run
+    // here. Rebuilding it as `running` would strip the `agent-stuck` label on the next tick
+    // (the status projection desires none for `running`) and re-drive review on the surviving
+    // PR — resurrecting a decision a master already made. `agent-stuck` is a human-attention
+    // state with no run row to rebuild: the completeness pass classifies it `awaiting-human`
+    // off the label alone, so skipping it here surfaces nothing and loses nothing.
+    if (issue.labels.includes(LABEL_AGENT_STUCK)) {
+      logger.info("rehydrate.terminal-skipped", { issue: issueNumber, prNumber: pr.number });
+      continue;
     }
     const mode = readMode(issue.labels) ?? "tdd";
     const paused = await reconstructPaused(github, issueNumber, issue.labels);
@@ -121,13 +159,38 @@ export async function rehydrateRunsFromGitHub(
       // off a cold store exactly as it would have off the live one (issue #10:
       // key the resume to *this* question's comment id, so a stale prior answer
       // in the heal-loop thread is not injected).
-      await store.addQuestion({
-        issueNumber,
-        runId: run.id,
-        kind: paused.status === "review-maxed" ? "heal-card" : "escalate",
-        headline: paused.question.headline,
-        commentId: paused.commentId,
-      });
+      if (paused.masterRequest) {
+        // A MASTER asked this question (ADR-0042), so the answer must resume the master's
+        // checkpointed adjudication — not the worker that could not make the call. The fold
+        // reads `awaitingHuman` ONLY from `MasterHumanQuestionRequested`, and re-adopting the
+        // asking attempt additionally needs its `MasterInterventionStarted`, so both are
+        // re-appended in the order the live path wrote them. Without this the rebuilt pause is
+        // indistinguishable from a pre-cutover worker escalation and the operator's answer is
+        // routed to the worker.
+        await store.recordMasterInterventionStarted({
+          issueNumber,
+          runId: run.id,
+          attempt: REBUILT_MASTER_ATTEMPT,
+          phase: paused.masterRequest.phase,
+          signature: paused.masterRequest.signature,
+        });
+        await store.recordMasterHumanQuestion({
+          issueNumber,
+          runId: run.id,
+          attempt: REBUILT_MASTER_ATTEMPT,
+          phase: paused.masterRequest.phase,
+          headline: paused.question.headline,
+          commentId: paused.commentId,
+        });
+      } else {
+        await store.addQuestion({
+          issueNumber,
+          runId: run.id,
+          kind: paused.status === "review-maxed" ? "heal-card" : "escalate",
+          headline: paused.question.headline,
+          commentId: paused.commentId,
+        });
+      }
       store.setResumeContext(run.id, reconstructResumePayload(paused), marker.branch);
       if (paused.status === "review-maxed") {
         // The status projection folds the heal-card's `Escalated` (from `addQuestion`) into
@@ -191,9 +254,28 @@ async function reconstructMasterRequest(
   github: GitHubClient,
   issueNumber: number,
 ): Promise<MasterRequestPayload | null> {
-  const comments = await github.listIssueComments(issueNumber);
+  return latestMasterRequestBefore(await github.listIssueComments(issueNumber), null);
+}
+
+/**
+ * The latest parseable `ralph-master-request` in a thread, optionally restricted to comments
+ * that PRE-DATE `beforeCommentId`. The bounded form is the master-provenance test for an
+ * outstanding question: after the cutover every master session is preceded by its own request
+ * comment and only a master may then post a `ralph-question`, so "a request comment precedes
+ * the live question" identifies a master-authored question exactly — while a pre-cutover worker
+ * escalation, which has no request comment at all, correctly reads as worker-authored.
+ * Comment ids order the thread here, the same correlation `latestAnswerAfter` uses.
+ */
+function latestMasterRequestBefore(
+  comments: readonly PrComment[],
+  beforeCommentId: number | null,
+): MasterRequestPayload | null {
   for (let i = comments.length - 1; i >= 0; i -= 1) {
-    const payload = parseMasterRequestComment(comments[i]!.body);
+    const comment = comments[i]!;
+    if (beforeCommentId !== null && comment.id >= beforeCommentId) {
+      continue;
+    }
+    const payload = parseMasterRequestComment(comment.body);
     if (payload) {
       return payload;
     }
@@ -225,7 +307,8 @@ async function reconstructPaused(
     return null;
   }
 
-  const latest = latestRalphQuestion(await github.listIssueComments(issueNumber));
+  const comments = await github.listIssueComments(issueNumber);
+  const latest = latestRalphQuestion(comments);
   if (!latest) {
     // No parseable question: a `ready-for-agent` PR with no open question is an
     // in-flight review run, not a pause.
@@ -236,6 +319,13 @@ async function reconstructPaused(
     question: latest.question,
     commentId: latest.commentId,
     phase: latest.phase,
+    // Only an `awaiting-answer` pause can be a master `ask_human`: a `review-maxed` park is a
+    // pre-cutover heal-card by construction (no live path posts one), so its question is never
+    // master-authored even if a request comment happens to sit earlier in the thread.
+    masterRequest:
+      (labelStatus ?? "awaiting-answer") === "awaiting-answer"
+        ? latestMasterRequestBefore(comments, latest.commentId)
+        : null,
   };
 }
 

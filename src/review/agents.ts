@@ -15,6 +15,7 @@ import type { Issue, PrComment } from "../github/types";
 import type { Logger } from "../log/logger";
 import type { Mode, Phase } from "../store/types";
 import type { EscalationQuestion } from "./escalation";
+import type { HostedDisposition, HostedFinding } from "./hosted-review";
 import type { Worklist } from "./worklist";
 import type { TranscriptSink } from "../executor/transcript-sink";
 
@@ -112,6 +113,22 @@ export interface FixContext {
    */
   rebaseConflict?: boolean;
   /**
+   * The GitHub-hosted reviewer's own conversations on this PR (issue #43), when the fix is
+   * addressing them. Carries the *exact* thread context — thread id, path/line, the finding
+   * verbatim, and the head the reviewer looked at — because a reply and a resolution are
+   * thread-keyed GitHub writes: an agent that cannot name the thread cannot dispose of it, and
+   * a generic "the merge is blocked" is the #3430 defect restated.
+   *
+   * `humanThreads` are carried for context only. They are never auto-resolved, so a fix that
+   * addresses one still leaves the merge to the repository's human-review policy.
+   */
+  hosted?: {
+    findings: HostedFinding[];
+    humanThreads: HostedFinding[];
+    /** The head the findings were observed on — what a reply names, and what a fix must move. */
+    headSha: string | null;
+  };
+  /**
    * Operator guidance injected when a review-origin pause resumes this phase
    * (issue #9): the operator answered the heal-card / escalation, and the fix agent
    * applies that ruling as it resolves the worklist. Scoped to the re-entered phase
@@ -129,9 +146,15 @@ export interface FixContext {
  * build+test stayed green, the branch was pushed) or `escalate` (a risky
  * structural change the agent refused to apply blind). There is deliberately no
  * "partially fixed" / "deferred" outcome — the no-deferral rule (CONTEXT).
+ *
+ * `dispositions` is not a third outcome and not a hedge: it is how a `fixed` names *which
+ * hosted-review threads* it answered and on what grounds, so the harness can reply and resolve
+ * exactly those (issue #43). Absent on every non-hosted fix, and an empty list on a hosted one
+ * means the agent answered nothing — a claim the harness routes to the master rather than
+ * treating as progress.
  */
 export type FixOutcome =
-  | { kind: "fixed" }
+  | { kind: "fixed"; dispositions?: HostedDisposition[] }
   | { kind: "escalate"; question: EscalationQuestion };
 
 /** Runs one fix attempt against a worklist. */

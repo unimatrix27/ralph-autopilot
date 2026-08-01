@@ -53,6 +53,20 @@ export class FakeMasterPipeline implements MasterPipelinePort {
     conclusion: string;
   }> = [];
   readonly retried: Array<{ issueNumber: number; action: string; brief: string }> = [];
+  /**
+   * Make the next hand-back throw — the effect-boundary crash. The master's outcome is already
+   * durable when the effect runs, so what the *next* tick does with it is the restart-recovery
+   * contract (ADR-0042: recover exactly once; repeat no pushed commit, comment or retry).
+   */
+  failNext: Error | null = null;
+
+  private throwIfArmed(): void {
+    const armed = this.failNext;
+    if (armed) {
+      this.failNext = null;
+      throw armed;
+    }
+  }
 
   async continueRun(input: {
     run: { issueNumber: number };
@@ -61,6 +75,7 @@ export class FakeMasterPipeline implements MasterPipelinePort {
     brief: string;
     conclusion: string;
   }): Promise<void> {
+    this.throwIfArmed();
     this.continued.push({
       issueNumber: input.run.issueNumber,
       resolution: input.resolution,
@@ -75,6 +90,7 @@ export class FakeMasterPipeline implements MasterPipelinePort {
     action: string;
     brief: string;
   }): Promise<void> {
+    this.throwIfArmed();
     this.retried.push({ issueNumber: input.run.issueNumber, action: input.action, brief: input.brief });
   }
 }
