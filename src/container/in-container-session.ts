@@ -36,7 +36,10 @@ import type { FixOutcome } from "../review/agents";
 import type { ProviderName, TargetConfig } from "../config/schema";
 import type { Assignment, SessionProfile } from "./assignment";
 import { CONTAINER_CODEX_HOME, MODEL_ENV_VAR, PROVIDER_ENV_VAR, ZAI_TOKEN_ENV_NAME_VAR } from "./docker-runner";
-import type { FixSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerFinalizeInput, RunnerFinalizer, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
+import { MASTER_SYSTEM_APPEND } from "../master/prompt";
+import { parseMasterSessionResult } from "../master/outcome";
+import { createMasterGuardrailsHook } from "../master/guardrails";
+import type { FixSessionHost, MasterSessionHost, ReviewSessionHost, RunnerEscalation, RunnerEscalationInput, RunnerFinalizeInput, RunnerFinalizer, RunnerWorkspace, SessionHost, SessionHostInput, WorkspaceCloner } from "./runner";
 
 /**
  * Run a git subcommand in `cwd`, returning stdout (throws with stderr on a non-zero exit).
@@ -384,6 +387,47 @@ export function createReviewSessionHost(
 }
 
 /**
+ * A {@link MasterSessionHost} that runs one master adjudication *inside the container*
+ * (ADR-0041). It is deliberately the **same** structured-output contract the review/fix hosts
+ * use — one prompt in, one validated object out — so the master inherits the entire container
+ * lifecycle unchanged: transcript capture, the wall clock, the injected route, secret redaction,
+ * and cleanup. What differs is capability, not plumbing: the session runs agentically over the
+ * cloned WIP worktree (read, edit, run tests, commit and push the issue branch, inspect GitHub),
+ * and the harness invariants it must not cross are enforced by the master guardrails hook and by
+ * simply never handing it merge/close.
+ *
+ * The system append is the master's, not a review rubric: it states the adjudicate-don't-relay
+ * rule, the binding invariants, and the exactly-one-outcome contract.
+ */
+export function createMasterSessionHost(
+  config: TargetConfig,
+  route: InContainerRoute,
+  deps: ContainerSessionDeps = {},
+): MasterSessionHost {
+  return {
+    adjudicate(input) {
+      // The master runs on tier 1 by construction, so its session budget is the tier's.
+      const profiled = withProfileOverride(config, input.assignment.profile);
+      const backend = structuredBackendForRoute(profiled, route, input.transcriptSink, deps, input.onRateLimit);
+      return runStructuredWithBackend(
+        backend,
+        {
+          prompt: input.assignment.prompt,
+          worktreePath: input.workspacePath,
+          systemAppend: MASTER_SYSTEM_APPEND,
+          // The harness invariants, layered ON TOP of the always-on git guardrails: no merge
+          // or close, no CI bypass, no branch but this issue's, no host/supervisor control
+          // (ADR-0041). Advisory like every PreToolUse hook — the real boundary is that the
+          // daemon simply never hands a master session `mergePullRequest` / `closeIssue`.
+          extraHooks: [createMasterGuardrailsHook({ branch: input.assignment.branch })],
+        },
+        (text) => parseMasterSessionResult(extractJsonObject(text)),
+      );
+    },
+  };
+}
+
+/**
  * Land a rebase-conflict resolution the **runner** owns (issue #273): after the fix agent rebased
  * the branch onto base in its clone and reported `fixed`, re-fetch base (a sibling may have
  * merged again mid-session), refuse if the rebase left no net work (the #241 data-loss guard —
@@ -438,7 +482,8 @@ export function createFixSessionHost(
 ): FixSessionHost {
   return {
     async fix(input): Promise<FixOutcome> {
-      const backend = structuredBackendForRoute(config, route, input.transcriptSink, deps, input.onRateLimit);
+      const profiled = withProfileOverride(config, input.assignment.profile);
+      const backend = structuredBackendForRoute(profiled, route, input.transcriptSink, deps, input.onRateLimit);
       const parsed = await runStructuredWithBackend(
         backend,
         { prompt: input.assignment.prompt, worktreePath: input.workspacePath, systemAppend: REVIEW_SYSTEM_APPEND },
@@ -539,6 +584,25 @@ export function createRunnerEscalation(config: RunnerEscalationConfig): RunnerEs
         throw new Error(`gh did not return a numeric comment id for issue #${assignment.issueNumber}`);
       }
       return prNumber !== undefined ? { commentId, prNumber } : { commentId };
+    },
+
+    /**
+     * The master-escalation checkpoint (ADR-0041): steps 1–2 of {@link publish} and **not** step
+     * 3. The WIP is pushed and the draft PR ensured so the master has a diff to read, but no
+     * `ralph-question` is posted — the daemon queues a master triage request from the relayed
+     * question instead. This method has no comment-posting path at all, which is the point:
+     * the "only the master creates a human question" invariant is structural here, not a flag.
+     */
+    async checkpoint(input: RunnerEscalationInput): Promise<{ prNumber?: number }> {
+      const { assignment, question, workspacePath } = input;
+      runGit(["add", "-A"], workspacePath);
+      runGit(
+        ["commit", "-m", `[WIP] #${assignment.issueNumber} checkpoint (master escalation)`, "--allow-empty"],
+        workspacePath,
+      );
+      runGit(["push", "--set-upstream", "origin", assignment.branch], workspacePath);
+      const prNumber = ensureDraftPr(runGh, config.repo, host, assignment, question);
+      return prNumber !== undefined ? { prNumber } : {};
     },
   };
 }

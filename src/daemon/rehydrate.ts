@@ -22,7 +22,8 @@
  * the rows so both warm- and cold-store crashes converge on that one pass.
  */
 
-import { LABEL_AWAITING_CI, LABEL_AWAITING_MERGE, readMode, readTier } from "../core/labels";
+import { LABEL_AWAITING_CI, LABEL_AWAITING_MERGE, LABEL_MASTER_TRIAGE, readMode, readTier } from "../core/labels";
+import { parseMasterRequestComment, type MasterRequestPayload } from "../master/request";
 import { parseLaunchMarker } from "../github/marker";
 import type { GitHubClient } from "../github/types";
 import type { Logger } from "../log/logger";
@@ -82,7 +83,25 @@ export async function rehydrateRunsFromGitHub(
     // (which would re-review from scratch). `awaiting-merge` wins if both somehow
     // appear: it is strictly further along (past CI + review).
     const awaitingCi = !paused && !awaitingMerge && issue.labels.includes(LABEL_AWAITING_CI);
-    const status = paused?.status ?? (awaitingMerge ? "awaiting-merge" : awaitingCi ? "awaiting-ci" : "running");
+    // A run queued for master escalation carries the durable `master-triage` label plus a
+    // fenced `ralph-master-request` comment holding its whole evidence payload (ADR-0041).
+    // Both are needed: the label says *that* it is queued, the comment says *what* the master
+    // must adjudicate. Rebuilding from the comment is what makes "GitHub is the source of
+    // truth" real for the master queue — a lost store re-derives the escalation rather than
+    // silently dropping it back into ordinary admission.
+    const masterRequest =
+      !paused && !awaitingMerge && !awaitingCi && issue.labels.includes(LABEL_MASTER_TRIAGE)
+        ? await reconstructMasterRequest(github, issueNumber)
+        : null;
+    const status =
+      paused?.status ??
+      (awaitingMerge
+        ? "awaiting-merge"
+        : awaitingCi
+          ? "awaiting-ci"
+          : masterRequest
+            ? "master-triage"
+            : "running");
 
     // The run row holds only non-derived bookkeeping; the rebuilt status is re-established
     // as an event below (issue #83 dropped the `runs.status` column). rehydrate only ever
@@ -122,6 +141,23 @@ export async function rehydrateRunsFromGitHub(
     } else if (awaitingCi) {
       // A run parked on the off-slot CI gate: `CiAwaited` projects `awaiting-ci`.
       await store.recordCiAwaited({ runId: run.id, issueNumber });
+    } else if (masterRequest) {
+      // A queued master escalation: `MasterTriageRequested` projects `master-triage`, and
+      // exactly ONE is appended per rebuilt run — so the recovered queue holds exactly one
+      // pending intervention and no session can be duplicated (ADR-0041).
+      await store.recordMasterTriageRequested({
+        runId: run.id,
+        issueNumber,
+        source: masterRequest.source,
+        phase: masterRequest.phase,
+        lane: masterRequest.lane,
+        signature: masterRequest.signature,
+        headline: masterRequest.evidence.headline,
+        ...(masterRequest.evidence.recommendation !== undefined
+          ? { recommendation: masterRequest.evidence.recommendation }
+          : {}),
+        prNumber: pr.number,
+      });
     }
     // An in-flight review run carries no status fact: its stream folds to `none`, which the
     // run-read defaults to `running` — the status the reconciler's orphan pass re-drives.
@@ -142,6 +178,27 @@ export async function rehydrateRunsFromGitHub(
     rebuilt.push(issueNumber);
   }
   return rebuilt;
+}
+
+/**
+ * Recover a queued master escalation's durable request payload from the issue thread — the
+ * LATEST `ralph-master-request` comment, since a run may have escalated more than once and
+ * only the most recent one is outstanding. `null` when the label is present but no parseable
+ * request is: the run is then rebuilt as `running` and the ordinary orphan pass re-drives it,
+ * which is the right failure mode (visible work, not a queued escalation nobody can read).
+ */
+async function reconstructMasterRequest(
+  github: GitHubClient,
+  issueNumber: number,
+): Promise<MasterRequestPayload | null> {
+  const comments = await github.listIssueComments(issueNumber);
+  for (let i = comments.length - 1; i >= 0; i -= 1) {
+    const payload = parseMasterRequestComment(comments[i]!.body);
+    if (payload) {
+      return payload;
+    }
+  }
+  return null;
 }
 
 /**

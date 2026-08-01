@@ -1,3 +1,4 @@
+import type { HookCallbackMatcher } from "@anthropic-ai/claude-agent-sdk";
 /**
  * The one provider seam (issue #131, ADR-0033). Everything a structured harness
  * session needs from an LLM provider reduces to a single operation: *run a fresh,
@@ -25,6 +26,12 @@ export interface SessionRequest {
    * Omit to inherit the backend's default behaviour.
    */
   systemAppend?: string;
+  /**
+   * Extra `PreToolUse` hooks layered on top of the always-on git guardrails for this session
+   * (ADR-0041): the master's harness-invariant hook rides here, so a master session is
+   * *more* constrained than a worker, never differently constrained.
+   */
+  extraHooks?: HookCallbackMatcher[];
   /** The run's parent abort signal, linked into the session (wall-clock + drain). */
   abortSignal?: AbortSignal;
 }

@@ -27,6 +27,7 @@ import {
   createFixSessionHost,
   createGitCloner,
   createImplSessionHost,
+  createMasterSessionHost,
   createReviewSessionHost,
   createRunnerEscalation,
   createRunnerFinalizer,
@@ -94,6 +95,11 @@ async function main(): Promise<void> {
       // the review's worklist is relayed back to the daemon's (unchanged) review loop.
       reviewSession: createReviewSessionHost(target, route),
       fixSession: createFixSessionHost(target, route),
+      // The master adjudication host (ADR-0041): a `kind: "master"` dispatch is routed to this by
+      // `runContainerRunner`. Without it the master run hits the `!deps.masterSession` guard and
+      // reports `failed`, so every master escalation would be dead-on-arrival even though the image
+      // declares `master-escalation` — the contract test below refuses to let that drift ship.
+      masterSession: createMasterSessionHost(target, route),
       transport,
       // `escalate` lands runner-direct (#187): push WIP + post the ralph-question straight to
       // GitHub via the container's own mounted git/gh, so the question survives a dead pipe.

@@ -25,6 +25,11 @@ import { LABEL_AGENT_STUCK, LABEL_AWAITING_ANSWER, LABEL_REVIEW_MAXED } from "..
 import { branchName, worktreeDirName } from "../core/slug";
 import { isUsageLimitError } from "../core/usage";
 import type { EscalationCheckpointer } from "../hitl/escalation-checkpoint";
+import {
+  evidenceFromEscalation,
+  evidenceFromStuck,
+  type MasterTriageRequester,
+} from "../master/request";
 import type { EscalationQuestion } from "../review/escalation";
 import { buildHealGuidance } from "../review/prompts";
 import { findStuckHealGuidance, type StuckHealGuidance } from "../hitl/heal-readmit";
@@ -113,10 +118,26 @@ export interface ExecutorDeps {
    * orphan sweep still works; only web-driven kill-run needs the shared instance).
    */
   abortRegistry?: RunAbortRegistry;
+  /**
+   * The worker→master hand-off (ADR-0041). When present it **replaces** the meaning of both
+   * worker exits: `escalate` becomes internal escalation to the master rather than a human
+   * question, and `stuck` becomes "execution budget exhausted" rather than a terminal. Absent
+   * → the legacy direct-to-human behaviour (`escalation` checkpointer + `agent-stuck`), which
+   * is what the impl-only slices and most unit tests exercise.
+   */
+  masterTriage?: MasterTriageRequester;
 }
 
 /** Default impl-session heartbeat cadence (issue #42); overridable per deps. */
 export const DEFAULT_HEARTBEAT_MS = 30_000;
+
+/**
+ * The run-phase key a worker-origin master escalation is budgeted against (ADR-0041). Both
+ * the fresh impl session and its resumes belong to the same interrupted phase — the *work*
+ * of implementing the issue — so a resume cannot silently reset the two-intervention ceiling
+ * by looking like a new phase.
+ */
+export const MASTER_WORKER_PHASE = "impl";
 
 /** A paused run an operator answer has re-armed, handed to {@link Executor.resume}. */
 export interface ResumeRun {
@@ -819,18 +840,35 @@ export class Executor {
     const { store, github } = this.deps;
     const { issue, mode, runId, agentId, branch, worktreePath, resume, stuckHeal, abortSignal, log } = params;
 
-    // Wire the `escalate` tool if a checkpointer is configured. Calling it
-    // checkpoints WIP to a draft PR and posts a ralph-question; the run pauses.
+    // Wire the `escalate` tool. Its meaning depends on whether a master engine is wired
+    // (ADR-0041): with one, `escalate` means **internal escalation to the master** — the WIP
+    // is checkpointed, the issue is promoted to `complexity:1`, and the run enters
+    // `master-triage` with NO `ralph-question` and NO `awaiting-answer`. Without one, it is
+    // the legacy direct-to-human checkpoint. Either way the worker exits and frees its slot.
     let escalatedPr: number | null = null;
-    const onEscalate = this.deps.escalation
+    const masterTriage = this.deps.masterTriage;
+    const onEscalate = masterTriage
       ? async (question: EscalationQuestion): Promise<void> => {
-          const { prNumber } = await this.deps.escalation!.checkpoint(
+          const { prNumber } = await masterTriage.request(
             { issue, mode, runId, branch, worktreePath, logger: log },
-            question,
+            {
+              source: "escalate",
+              lane: resume ? "resume" : "impl",
+              phase: MASTER_WORKER_PHASE,
+              evidence: evidenceFromEscalation(question),
+            },
           );
           escalatedPr = prNumber;
         }
-      : undefined;
+      : this.deps.escalation
+        ? async (question: EscalationQuestion): Promise<void> => {
+            const { prNumber } = await this.deps.escalation!.checkpoint(
+              { issue, mode, runId, branch, worktreePath, logger: log },
+              question,
+            );
+            escalatedPr = prNumber;
+          }
+        : undefined;
 
     // Emit a periodic heartbeat for live views: the daemon logs nothing
     // else between `pickup` and `agent.result`, so without this the impl phase
@@ -885,6 +923,24 @@ export class Executor {
     }
 
     if (result.stuck) {
+      if (masterTriage) {
+        // Bounded out, but a worker's exhausted budget is no longer a terminal (ADR-0041):
+        // `stuck` is a distinct *signal* ("execution budget exhausted") that enters the same
+        // master queue as `escalate`. The WIP is preserved rather than discarded, because the
+        // master's first move is usually to read what the worker did manage to do. Only the
+        // master may project `agent-stuck` for a worker-origin path after this.
+        const { prNumber } = await masterTriage.request(
+          { issue, mode, runId, branch, worktreePath, logger: log },
+          {
+            source: "stuck",
+            lane: resume ? "resume" : "impl",
+            phase: MASTER_WORKER_PHASE,
+            evidence: evidenceFromStuck(result.stuck),
+          },
+        );
+        log.warn("agent.stuck-to-master", { category: result.stuck.category, prNumber });
+        return { runId, branch, worktreePath, prNumber };
+      }
       // Bounded out (stuck-budget self-stop or wall-clock kill): label the issue
       // `agent-stuck`, no PR, no review. The worktree is torn down by the caller.
       await recordAgentStuck(store, github, { issueNumber: issue.number, runId, report: result.stuck });

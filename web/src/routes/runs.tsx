@@ -19,6 +19,7 @@ const STATUS_META: Record<RunStatusWire, { label: string; variant: BadgeVariant 
   "review-maxed": { label: "Review maxed", variant: "danger" },
   "awaiting-ci": { label: "Awaiting CI", variant: "waiting" },
   "awaiting-merge": { label: "Awaiting merge", variant: "waiting" },
+  "master-triage": { label: "Master triage", variant: "running" },
   merged: { label: "Merged", variant: "success" },
   closed: { label: "Closed", variant: "outline" },
 };

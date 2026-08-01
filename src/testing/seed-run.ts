@@ -58,6 +58,18 @@ export async function seedRun(store: ScopedStore, input: SeedRunInput): Promise<
       // `awaiting-answer` is only reachable via an `Escalated`; seed a placeholder question.
       await store.addQuestion({ ...base, kind: "escalate", headline: "seeded" });
       break;
+    case "master-triage":
+      // Only reachable via `MasterTriageRequested` (ADR-0041); seed a placeholder request so
+      // the run reads back queued. Tests that need real evidence post the fenced comment too.
+      await store.recordMasterTriageRequested({
+        ...base,
+        source: "escalate",
+        phase: "impl",
+        lane: "impl",
+        signature: "seeded",
+        headline: "seeded",
+      });
+      break;
   }
   return run;
 }

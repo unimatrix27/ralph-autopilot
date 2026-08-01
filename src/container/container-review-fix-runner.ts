@@ -29,7 +29,7 @@
  * it back through the next CI gate / re-review exactly as for an in-process fix.
  */
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { Assignment, ContainerDispatch, ContainerRoute, RunToken } from "./assignment";
+import type { Assignment, ContainerDispatch, ContainerRoute, RunToken, SessionProfile } from "./assignment";
 import { ContainerExecution, type DispatchResult, type DockerRunner } from "./container-execution";
 import type { ResultFrame, TelemetryFrame } from "./protocol";
 import { foldRateLimitTelemetry, type RecordRateLimitSignal } from "./record-rate-limit";
@@ -48,7 +48,8 @@ import type { Worklist } from "../review/worklist";
 import { AgentOutputParseError, MAX_PARSE_RETRIES } from "../executor/structured-session";
 import { resolveDispatchRoute, type RouteWorld, type RoutingSource } from "../providers/resolve";
 import { recordDispatchedRoute, type RouteRecordingStore } from "./route-recording";
-import type { AgentType, RoutingPhase } from "../providers/select";
+import { tierGovernsLane, tierProfile, type AgentType, type RoutingPhase, type RoutingTier } from "../providers/select";
+import { readTier } from "../core/labels";
 import { UsageLimitError } from "../core/usage";
 
 /** Construction deps shared by the review and fix container adapters (known at the composition root). */
@@ -103,12 +104,40 @@ function resolveContainerRoute(
   deps: ContainerReviewFixDeps,
   type: AgentType,
   phase: RoutingPhase,
+  tier: RoutingTier | null,
 ): ContainerRoute | null {
-  const resolved = resolveDispatchRoute(deps, type, phase);
+  const resolved = resolveDispatchRoute(deps, type, phase, tier);
   if (resolved && "wait" in resolved) {
     throw new UsageLimitError(`no provider with headroom for a ${type} run (ADR-0037 no-provider)`);
   }
   return resolved;
+}
+
+/**
+ * The **governing tier's** session-budget deltas for a review/fix dispatch (ADR-0041 amending
+ * ADR-0039). A `complexity:1` issue — which is what a master escalation permanently promotes to —
+ * carries its `effort` / `wallClockSeconds` through *every* later lane, not just impl: a promotion
+ * that let the next review run on the standard budget would be a promotion in name only. A
+ * non-governing tier contributes nothing here, so ordinary issues keep uniform review/fix budgets
+ * (ADR-0014). Resolved daemon-side and ridden on the assignment; the runner applies, never
+ * re-derives — exactly the #278 discipline.
+ */
+function governingSessionProfile(
+  deps: ContainerReviewFixDeps,
+  type: AgentType,
+  tier: RoutingTier | null,
+): SessionProfile | undefined {
+  if (!tierGovernsLane(type, tier)) {
+    return undefined;
+  }
+  const profile = tierProfile(deps.routing?.().agent ?? deps.config.agent, tier);
+  if (!profile || (profile.effort === undefined && profile.wallClockSeconds === undefined)) {
+    return undefined;
+  }
+  return {
+    ...(profile.effort !== undefined ? { effort: profile.effort } : {}),
+    ...(profile.wallClockSeconds !== undefined ? { wallClockSeconds: profile.wallClockSeconds } : {}),
+  };
 }
 
 /** A placeholder per-run token — opaque until a later slice scopes the runner's GitHub/LLM access. */
@@ -164,8 +193,13 @@ export class ContainerReviewAgentRunner implements ReviewAgentRunner {
     // Resolve the review route pre-dispatch (ADR-0037 / issue #220); a no-provider wait throws here
     // (resolveContainerRoute) so the run stays resumable rather than maxing the phase out. The
     // review phase (`ctx.phase` = 1 normal / 2 thermo) selects the per-phase routing key (#169).
-    const route = resolveContainerRoute(this.deps, "review", ctx.phase);
+    // The issue's complexity tier, read from the LIVE labels at dispatch. A GOVERNING tier
+    // (tier 1 — where a master escalation permanently promotes an issue) replaces the review
+    // route and budget too (ADR-0041); a non-governing tier is ignored here (ADR-0014).
+    const tier = readTier(ctx.issue.labels);
+    const route = resolveContainerRoute(this.deps, "review", ctx.phase, tier);
     const prompt = buildReviewPrompt(ctx.issue, ctx.mode, ctx.phase, ctx.prNumber, ctx.prComments);
+    const profile = governingSessionProfile(this.deps, "review", tier);
     const assignment: Assignment = {
       kind: "review",
       issueNumber: ctx.issue.number,
@@ -173,6 +207,7 @@ export class ContainerReviewAgentRunner implements ReviewAgentRunner {
       branch: ctx.branch,
       base: this.deps.baseBranch,
       prompt,
+      ...(profile ? { profile } : {}),
     };
     // Record the review phase's route at dispatch (ADR-0037 P3.1, issue #164) — best-effort.
     await recordDispatchedRoute({
@@ -214,8 +249,10 @@ export class ContainerFixAgentRunner implements FixAgentRunner {
   async fix(ctx: FixContext): Promise<FixOutcome> {
     // Resolve the fix route pre-dispatch (ADR-0037 / issue #220); a no-provider wait throws. The
     // fix phase (`ctx.phase` = 0 CI-gate/merge / 1 normal / 2 thermo) selects the per-phase key (#169).
-    const route = resolveContainerRoute(this.deps, "fix", ctx.phase);
+    const tier = readTier(ctx.issue.labels);
+    const route = resolveContainerRoute(this.deps, "fix", ctx.phase, tier);
     const prompt = buildFixPrompt(ctx, this.deps.config.commands.build, this.deps.config.commands.test);
+    const profile = governingSessionProfile(this.deps, "fix", tier);
     const assignment: Assignment = {
       kind: "fix",
       issueNumber: ctx.issue.number,
@@ -223,6 +260,7 @@ export class ContainerFixAgentRunner implements FixAgentRunner {
       branch: ctx.branch,
       base: this.deps.baseBranch,
       prompt,
+      ...(profile ? { profile } : {}),
       // A rebase-conflict fix is owned end-to-end by the container: the agent rebases onto base
       // in its clone and the runner force-pushes the result (the daemon verifies it landed, #273).
       ...(ctx.rebaseConflict ? { rebaseConflict: true } : {}),

@@ -84,6 +84,7 @@ export class ClaudeSessionBackend implements SessionBackend {
       queryFn,
       prompt: req.prompt,
       systemAppend: req.systemAppend,
+      extraHooks: req.extraHooks,
       configDir: this.params.configDir,
       endpoint: this.params.endpoint,
       transcriptSink: this.params.transcriptSink,

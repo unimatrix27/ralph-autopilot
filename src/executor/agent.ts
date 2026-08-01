@@ -9,7 +9,7 @@
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { query, type McpServerConfig, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { query, type HookCallbackMatcher, type McpServerConfig, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { TargetConfig } from "../config/schema";
 import type { Issue } from "../github/types";
 import type { Logger } from "../log/logger";
@@ -216,6 +216,13 @@ export function buildAgentOptions(
     /** In-process SDK MCP servers to merge in (e.g. the `escalate` tool). */
     extraServers?: Record<string, McpServerConfig>;
     /**
+     * Extra `PreToolUse` hooks layered ON TOP of the always-on git guardrails (DESIGN §8) —
+     * never instead of them. The master session adds its harness-invariant hook here
+     * (ADR-0041), so the strongest agent gets a strictly *larger* rule set than a worker,
+     * never a different one.
+     */
+    extraHooks?: HookCallbackMatcher[];
+    /**
      * Custom CLI spawn hook (issue #13): when present, the SDK spawns the `claude`
      * CLI through it so the session owns a reapable process group. Absent → the
      * SDK's default local spawn (used by call sites that don't need reaping).
@@ -275,9 +282,10 @@ export function buildAgentOptions(
       preset: "claude_code",
       append: projectAgents ? `${baseAppend}\n\n${projectAgents}` : baseAppend,
     },
-    // git-guardrails: block dangerous local git ops on every agent session (DESIGN §8).
+    // git-guardrails: block dangerous local git ops on every agent session (DESIGN §8),
+    // plus any session-specific invariant hooks layered on top (ADR-0041's master guardrails).
     hooks: {
-      PreToolUse: [createGitGuardrailsHook()],
+      PreToolUse: [createGitGuardrailsHook(), ...(ctx.extraHooks ?? [])],
     },
   };
   if (ctx.abortController) {
@@ -349,6 +357,8 @@ export interface SessionParams {
   systemAppend?: string;
   /** In-process SDK MCP servers to merge in (e.g. the `escalate` tool). */
   extraServers?: Record<string, McpServerConfig>;
+  /** Extra `PreToolUse` hooks layered on the always-on git guardrails (ADR-0041). */
+  extraHooks?: HookCallbackMatcher[];
   /** `CLAUDE_CONFIG_DIR` of the bound OAuth login (ADR-0028); absent = box default. */
   configDir?: string;
   /**
@@ -413,6 +423,7 @@ export async function runReapedWallClockedSession(params: SessionParams): Promis
       worktreePath: params.worktreePath,
       abortController,
       systemAppend: params.systemAppend,
+      extraHooks: params.extraHooks,
       extraServers: params.extraServers,
       spawn: reaper.spawn,
       configDir: params.configDir,

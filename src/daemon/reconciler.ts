@@ -45,8 +45,14 @@ import {
   LABEL_REVIEW_MAXED,
   LABEL_AGENT_STUCK,
   LABEL_AWAITING_MERGE,
+  LABEL_MASTER_TRIAGE,
+  LABEL_MASTER_TRIAGE_CREATE,
   modeLabelFor,
 } from "../core/labels";
+import { selectMasterTask } from "../master/queue";
+import { foldMasterHistory } from "../master/history";
+import type { MasterLease } from "../master/lease";
+import type { MasterEngine } from "../master/engine";
 import { selectModingCandidates, type ModeClassifier } from "../core/moding";
 import { resolveRoute, type RouteWorld, type RoutingSource } from "../providers/resolve";
 import type { AutoModeSettings, UsageLimitSettings } from "../config/schema";
@@ -54,7 +60,14 @@ import type { ContainerSweeper } from "../container/container-execution";
 import { createRunTranscriptSink } from "../executor/transcript-sink";
 import type { TranscriptRetentionBudget } from "../store/events/transcript";
 import type { UsageMeter } from "./usage-meter";
-import type { ChecksResult, ChecksSnapshot, GitHubClient, Issue, PullRequest } from "../github/types";
+import type {
+  ChecksResult,
+  ChecksSnapshot,
+  GitHubClient,
+  Issue,
+  LabelCreateOptions,
+  PullRequest,
+} from "../github/types";
 import type { Logger } from "../log/logger";
 import type { ScopedStore } from "../store/store";
 import type { BacklogView, DaemonError, Run, RunStatus } from "../store/types";
@@ -102,6 +115,18 @@ const STATUS_EFFECT_LABEL: Partial<Record<RunStatus, string>> = {
   "review-maxed": LABEL_REVIEW_MAXED,
   "agent-stuck": LABEL_AGENT_STUCK,
   "awaiting-merge": LABEL_AWAITING_MERGE,
+  // Queued for / undergoing master escalation (ADR-0041). An automated in-flight marker, not
+  // a human pause: it makes the queued escalation *visible* on GitHub, excludes the issue
+  // from ordinary admission, and lets a cold-store restart rebuild the queue.
+  "master-triage": LABEL_MASTER_TRIAGE,
+};
+
+/**
+ * Self-create cosmetics for the effect labels whose owner supplies them, so the GitHub
+ * adapter keeps no per-label knowledge. Absent → the adapter's neutral defaults.
+ */
+const STATE_EFFECT_LABEL_CREATE: Record<string, LabelCreateOptions> = {
+  [LABEL_MASTER_TRIAGE]: LABEL_MASTER_TRIAGE_CREATE,
 };
 
 /**
@@ -315,6 +340,22 @@ export interface ReconcilerDeps {
    * A thunk read only when something is parked. Absent → no ETA (the wait still shows).
    */
   implProviderResetsAt?: () => string | null;
+  /**
+   * The master escalation engine (ADR-0041). Present → each tick, **before** fresh
+   * admission, the reconciler services the `master-triage` queue: it takes one queued
+   * escalation under the global {@link masterLease}, occupies an ordinary build slot, and
+   * runs the master. Absent → the queue is never serviced (the pre-ADR-0041 behaviour, and
+   * what most unit tests exercise); a `master-triage` run would then simply sit visible.
+   */
+  masterEngine?: MasterEngine;
+  /**
+   * The process-wide master lease (ADR-0041 V1 global serialization). ONE instance is shared
+   * by every per-repo reconciler — the same discipline as the shared build budget — so two
+   * repos can never run masters concurrently and race the decision ledger. Absent → the
+   * master queue is not serviced (a lease is not optional; running unserialized is not a
+   * degraded mode, it is a different design).
+   */
+  masterLease?: MasterLease;
   /** Usage-limit guard settings; when `enabled`, the meter gates new admissions. */
   usageLimit?: UsageLimitSettings;
   /**
@@ -691,6 +732,69 @@ export class Reconciler {
   }
 
   /**
+   * Service the master-escalation queue (ADR-0041): take at most one queued `master-triage`
+   * run, hold the process-wide master lease for its whole session, and run it on an ordinary
+   * build slot.
+   *
+   * Three properties the shape encodes:
+   *   - the lease is taken *before* the slot and released only when the session settles, so
+   *     "one master at a time, globally" holds even across repos;
+   *   - the work runs through `occupySlot`, the single owner of the cap accounting, so a
+   *     master is counted exactly like any other agent and never exceeds the cap;
+   *   - nothing else is blocked: a skip returns immediately and the tick proceeds to fill the
+   *     remaining slots with ordinary admissions.
+   *
+   * Synchronous by construction: `occupySlot` claims the slot before returning, so the slot a
+   * master takes is already counted when admission computes `openSlots` — and an unwired or
+   * empty queue perturbs the tick's scheduling by exactly nothing (no await, no microtask).
+   * The one GitHub read happens *inside* the occupied slot, where a slow read costs the
+   * master's own session rather than the whole tick.
+   */
+  serviceMasterQueue(): void {
+    const { masterEngine, masterLease, store, github, logger } = this.deps;
+    if (!masterEngine || !masterLease) {
+      return;
+    }
+    // A configuration defect no tick can fix (missing / non-tools-capable tier 1) must not burn
+    // a slot on a dispatch that cannot succeed — and, crucially, must not hold the run in flight,
+    // which would mask it from the completeness pass as "the daemon is working on it". Leave it
+    // queued and un-dispatched; `surfaceAnomalies` labels it `daemon-anomaly` naming the defect.
+    if (this.masterRouteUnconfigured()) {
+      return;
+    }
+    const selection = selectMasterTask({
+      queued: store.listRunsByStatus("master-triage"),
+      isBusy: (n) => this.inFlight.has(n) || this.mergeInFlight.has(n),
+      hasCapacity: () => this.deps.budget.hasCapacity(),
+      masterLeaseHeld: () => masterLease.isHeld(),
+    });
+    if ("skip" in selection) {
+      return;
+    }
+    const run = selection.run;
+    const handle = masterLease.acquire(`${this.deps.targetRepo}#${run.issueNumber}`);
+    if (!handle) {
+      return; // lost the race to another repo's reconciler this tick.
+    }
+    logger.info("master.dispatch", { issue: run.issueNumber, runId: run.id });
+    this.occupySlot(run.issueNumber, "master.failed", async () => {
+      try {
+        const issue = await github.getIssue(run.issueNumber);
+        if (!issue) {
+          // The issue vanished under a queued escalation — the ordinary orphan sweep
+          // terminalizes it; the master has nothing left to adjudicate.
+          logger.warn("master.issue-missing", { issue: run.issueNumber });
+          return;
+        }
+        const result = await masterEngine.runIntervention(run, issue);
+        logger.info("master.intervention", { issue: run.issueNumber, ...result });
+      } finally {
+        handle.release();
+      }
+    });
+  }
+
+  /**
    * Service the off-slot pre-review CI gate (ADR-0022 stage 1) — a sibling of the
    * merge worker for the *pre-review* CI wait rather than the *pre-merge* one. For
    * each run parked `awaiting-ci`, take one lean `gh pr checks` read and, on a
@@ -847,6 +951,17 @@ export class Reconciler {
       // in `budget.available()` below. Held back while usage-gated — the review
       // session it starts would only hit the same plan limit.
       await this.serviceCiPoller();
+    }
+
+    // Master escalation outranks fresh admission (ADR-0041): a run that has already been
+    // worked, checkpointed, and handed up is worth more than one not yet started. Serviced
+    // BEFORE `admit` computes open slots — and awaited far enough that the slot it takes is
+    // reflected in `budget.available()` below — so a master and a fresh pickup can never
+    // oversubscribe the cap. Held back while usage-gated, exactly like a resume. It takes at
+    // most ONE slot per tick and returns immediately otherwise, so a second queued master
+    // waits without blocking unrelated slot usage.
+    if (usageGate.admit) {
+      this.serviceMasterQueue();
     }
 
     // Admission owns the whole pickup decision — the label gate, the in-flight /
@@ -1186,6 +1301,9 @@ export class Reconciler {
         gateEligible: this.isGateEligible({ ...issue, labels: effectiveLabels }, depSatisfied),
         resumable: resumable.has(issue.number),
         answered: answeredParked.has(issue.number),
+        // A queued master escalation the tier-1 config cannot dispatch is a defect no tick
+        // fixes — surface it rather than letting it read as in-flight forever (ADR-0041).
+        masterUnroutable: run?.status === "master-triage" && this.masterRouteUnconfigured(),
       };
       await this.reconcileAnomalyLabel(issue.number, effectiveLabels, classifyIssueState(snapshot), run ?? null);
       // Self-heal the #132 wedge in the same pass that surfaces it: an answered pause
@@ -1238,6 +1356,9 @@ export class Reconciler {
         // A closed/gone issue is terminal under the run, never an answered-but-parked
         // wedge (#132 only strands an OPEN paused issue) — the open-issue loop owns that.
         answered: false,
+        // A closed/gone issue under a queued escalation is already the stronger anomaly
+        // (non-terminal-run-on-closed-issue); routing is moot.
+        masterUnroutable: false,
       };
       await this.reconcileAnomalyLabel(run.issueNumber, issue?.labels ?? [], classifyIssueState(snapshot), run);
     }
@@ -1372,7 +1493,11 @@ export class Reconciler {
       const present = labels.includes(label);
       try {
         if (label === desired && !present) {
-          await github.addLabel(issueNumber, label);
+          // Pass the label owner's self-create cosmetics when it supplies them, so a target
+          // repo that has not pre-created e.g. `master-triage` gets it in the right colour
+          // rather than the adapter's neutral default.
+          const create = STATE_EFFECT_LABEL_CREATE[label];
+          await github.addLabel(issueNumber, label, create);
         } else if (label !== desired && present) {
           await github.removeLabel(issueNumber, label);
         }
@@ -1486,7 +1611,14 @@ export class Reconciler {
     }
   }
 
-  /** Resume the answered, re-armed paused runs in `resumable`, up to the cap. */
+  /**
+   * Resume the answered, re-armed paused runs in `resumable`, up to the cap.
+   *
+   * An answer to a **master** `ask-human` resumes the MASTER, not the original worker
+   * (ADR-0041): the master asked the question, so it is the master's adjudication that
+   * continues with the reply injected. Routing it to `executor.resume` would hand a
+   * master-level decision back to the worker that could not make one.
+   */
   private resumeAnswered(resumable: ResumableRun[]): void {
     for (const item of resumable) {
       if (!this.deps.budget.hasCapacity()) {
@@ -1495,8 +1627,58 @@ export class Reconciler {
       if (this.inFlight.has(item.issue.number)) {
         continue;
       }
+      if (this.masterAwaitsAnswerFor(item.run.issueNumber)) {
+        this.launchMasterResume(item);
+        continue;
+      }
       this.launchResume(item);
     }
+  }
+
+  /**
+   * Whether master escalation is wired but cannot route at all — a missing or
+   * non-tools-capable `agent.tiers["1"]` profile (ADR-0041). Cheap and synchronous: the
+   * profile check reads the live routing, never the account pool, so a momentary headroom
+   * wait is deliberately NOT reported here (that is a wait, not a defect).
+   */
+  private masterRouteUnconfigured(): boolean {
+    return this.deps.masterEngine?.routeStatus().kind === "unconfigured";
+  }
+
+  /** Whether the paused run's outstanding question was asked by a master (ADR-0041). */
+  private masterAwaitsAnswerFor(issueNumber: number): boolean {
+    if (!this.deps.masterEngine || !this.deps.masterLease) {
+      return false;
+    }
+    return foldMasterHistory(this.deps.store.readIssueStream(issueNumber)).awaitingHuman !== null;
+  }
+
+  /**
+   * Resume the checkpointed master with the operator's answer injected, under the same
+   * global lease and ordinary slot a fresh master session takes. When the lease is held the
+   * resume simply waits for a later tick — the answer is durable on GitHub, so nothing is
+   * lost by deferring it.
+   */
+  private launchMasterResume(item: ResumableRun): void {
+    const { masterEngine, masterLease, logger } = this.deps;
+    if (!masterEngine || !masterLease) {
+      return;
+    }
+    const handle = masterLease.acquire(`${this.deps.targetRepo}#${item.run.issueNumber}`);
+    if (!handle) {
+      return;
+    }
+    logger.info("master.resume-after-answer", { issue: item.run.issueNumber });
+    this.occupySlot(item.issue.number, "master.resume-failed", async () => {
+      try {
+        const result = await masterEngine.runIntervention(item.run, item.issue, {
+          answer: { question: item.context.question, text: item.answer.text },
+        });
+        logger.info("master.intervention", { issue: item.run.issueNumber, ...result });
+      } finally {
+        handle.release();
+      }
+    });
   }
 
   /** Resume a re-armed run in the background, occupying a slot until it settles. */

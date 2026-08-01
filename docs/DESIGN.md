@@ -620,3 +620,138 @@ runners, for no benefit this slice needs.
 Deliberately **out of scope**: running a master agent, its prompt, any change to
 worker `escalate`/`stuck` behaviour or the human-attention labels, persisting
 free-form master conversation history, and any inference of hierarchy from prose.
+
+---
+
+## 13. Master escalation — complexity-1 adjudication before human attention (issue #42)
+
+Slice §12 built the substrate and ran nothing on it. This section runs the first thing:
+worker-origin `escalate` and `stuck` are adjudicated by a fresh, highest-tier **master**
+before an operator is asked anything. The binding decisions are
+[ADR-0041](adr/0041-master-escalation-complexity-1-adjudication.md); this is the shape.
+
+### 13.1 What the two worker exits now mean
+
+`escalate` means **internal escalation to the master**, not "ask the human". Its schema,
+its quality bar ([ADR-0015](adr/0015-escalation-quality-bar.md)) and its worker-facing
+description are unchanged — only its destination is. `stuck` stays a *distinct signal*
+("execution budget exhausted" rather than "I need a decision"), because that distinction
+is genuine evidence for the master; it enters the same queue and, crucially, **preserves
+the WIP** instead of discarding it.
+
+Both exits: checkpoint the branch (commit + push, ensure the draft PR), promote the issue
+to `complexity:1` in one atomic label patch, post a fenced `ralph-master-request` carrying
+the worker's payload/recommendation/attempted fixes/uncertainty and the normalized failure
+signature, append `MasterTriageRequested`, and return. **No `ralph-question`, no
+`awaiting-answer`, no `agent-stuck`.** The worker frees its ordinary slot; nothing is
+reserved and nothing is handed over.
+
+### 13.2 Scheduling
+
+The run projects to `master-triage` — a run status and a daemon-owned label delivered by
+the ADR-0027 outbox like every other state effect. It is an **automated in-flight** state:
+excluded from ordinary admission, classified as `in-flight` by the completeness pass, never
+`awaiting-human`. The daemon is working; nobody is being paged.
+
+Each tick, **before** `admit` computes open slots, the reconciler services the queue: take
+the oldest queued escalation, acquire the **one process-wide master lease**, and run it on
+an ordinary build slot. Three properties fall out: master work outranks fresh admission (an
+already-worked, checkpointed run is worth more than one not yet started); total sessions
+never exceed `scheduler.maxConcurrentAgents`; and a second queued master simply waits —
+the tick proceeds and ordinary admission fills the remaining slots as usual. V1 serializes
+masters **globally**, across repos, so two masters can never race the §12 decision ledger
+into a fail-closed conflict.
+
+### 13.3 The master's route, and why it fails closed
+
+The master route is derived from `agent.tiers["1"]` — there is deliberately no
+`agent.types.master` key (V1 avoids re-running the mounted-config schema skew of issue
+#19). Tier 1 is now the **governing** tier: its profile applies to every subsequent lane
+for the promoted issue — impl, resume, review, fix, master — amending
+[ADR-0039](adr/0039-complexity-tier-agent-profiles.md)'s impl-only rule. Tiers 2 and 3 stay
+impl-only, so ordinary issues keep the uniform review/fix routing that makes unattended
+merge safe ([ADR-0014](adr/0014-harness-owned-ci-gated-rebase-aware-merge.md)).
+
+The tier→model mapping is **binding**: `complexity:1` → `claude-fable-5`, `complexity:2` →
+`claude-opus-5`, pinned in the shipped example config and in routing tests.
+
+A missing or non-tools-capable tier-1 profile is a **configuration defect**, not a wait: the
+engine refuses to dispatch, surfaces a `daemon-anomaly` naming the defect and the fix, and
+**consumes no intervention budget**. It never falls back to a cheaper master — a master
+weaker than the worker that escalated to it would burn an intervention, produce a confident
+wrong adjudication, and hide the misconfiguration.
+
+### 13.4 What the master sees, and what it must produce
+
+Every invocation is a fresh session ([ADR-0008](adr/0008-oauth-fresh-context.md)). Its
+context packet carries four layers: the worker's evidence (labelled **as a recommendation**,
+before any instruction to act on it); the run's actual state (issue, phase, branch, head SHA,
+WIP status/diff, PR and checks, fix counts, recent log events); the §12 zoom-out (hierarchy
+map, budgeted context packet, inherited **active** decisions); and what has already been
+tried (prior interventions with their resolutions, whether this signature is a *repeat*, and
+the remaining budget). Reads are tolerant — a failed read becomes a stated gap in the packet,
+never a skipped intervention.
+
+The master must state its **own** conclusion and rationale; the outcome schema requires both
+on every arm, so "agreed" is not expressible. It produces exactly one of:
+
+| outcome | what happens |
+| --- | --- |
+| `resolved-and-continue` | the repair/guidance is injected and the interrupted phase re-enters |
+| `redispatch-tier-1` | a fresh tier-1 worker resumes the preserved WIP branch with the master's brief |
+| `retry-pipeline` | one typed harness action re-runs (`ci` / `review` / `merge` / `reconcile`) — the gate runs again, it is never skipped |
+| `ask-human` | a structured `ralph-question` is posted and the run enters `awaiting-answer` |
+| `terminal-stuck` | a self-explaining card, then terminal `agent-stuck` |
+
+`ask-human` is the **only** path in this slice that creates a human question, and answering
+it resumes the **master**, not the original worker.
+
+### 13.5 Capability, and the invariants it does not buy
+
+The master may inspect and edit the exclusive WIP worktree, run commands and tests, commit
+and push the issue branch, inspect GitHub/CI, publish scoped decisions, and delegate a fresh
+tier-1 worker. Capability is the point.
+
+Four invariants are non-bypassable, and are so *because* the master is the strongest model —
+an agent smart enough to argue itself into merging its own repair is the one that most needs
+a mechanical stop: no direct merge or issue close; no CI bypass; no force-push, destructive
+git, or any branch but the issue's own; no host/supervisor control. Enforcement is two-sided:
+the merge/close capabilities are simply **not wired** into a master session, and a
+`PreToolUse` guardrail hook (advisory, exactly like §8's git guardrails) denies the commands
+with a reason the master can act on. Repaired work re-enters the ordinary CI/review/merge
+pipeline.
+
+### 13.6 The loop budget
+
+At most **two** interventions per run phase; a third cannot launch (the harness posts a
+readable card and terminalizes). A repeated **normalized failure signature** forces final
+adjudication: the master may not repeat a resolution already tried for that signature, and
+the harness re-checks its answer — a forbidden repeat is coerced to a human question rather
+than executed. The signature erases SHAs, timestamps, paths, line numbers and counters, so
+**a changed head SHA alone never makes a failure new**. A genuinely new run span resets the
+per-run budget; the prior history stays in context.
+
+A human answer **re-opens the same numbered attempt** once — spending no fresh budget,
+because answering the second intervention's question would otherwise land straight on the
+ceiling and throw the answer away — and that resumed master may not ask again. Ask → answer
+→ ask cannot cycle.
+
+### 13.7 Durability and compatibility
+
+Master queue and attempt state are append-only issue-stream facts; GitHub stays desired-state
+truth. The `master-triage` label says *that* an escalation is queued and the
+`ralph-master-request` comment says *what* must be adjudicated, so a cold store rehydrates
+exactly one pending intervention and duplicates no session or decision comment. Published
+decisions carry deterministic ids, which the §12 fold collapses on a replayed re-post.
+
+Container dispatch/result schemas grow additively (`kind: "master"`, `escalationMode`, the
+`master` result frame). Because a stale runner *ignoring* `escalationMode` would post a human
+question the daemon never asked for, the master path is gated on a **declared runner
+capability**: the image stamps `io.ralph.runner-capabilities`, the daemon reads it
+pre-dispatch, and a stale image fails with one precise, actionable error naming the missing
+capability — never a generic no-result → review-maxed cascade. The onboarding smoke test gates
+on the same label.
+
+Deliberately **out of scope**: automatic triage of `review-maxed`, CI/merge/rebase failures
+and daemon anomalies (the next slice); direct master merge/close; host recovery; persistent
+conversational memory; parallel master sessions.

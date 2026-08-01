@@ -272,6 +272,7 @@ const STATUS_LABELS: Record<RunStatusWire, string> = {
   "review-maxed": "Review maxed",
   "awaiting-ci": "Awaiting CI",
   "awaiting-merge": "Awaiting merge",
+  "master-triage": "Master triage",
   merged: "Merged",
   closed: "Closed",
 };
@@ -283,6 +284,7 @@ const STATUS_TONES: Record<RunStatusWire, RenderTone> = {
   "review-maxed": "danger",
   "awaiting-ci": "waiting",
   "awaiting-merge": "waiting",
+  "master-triage": "running",
   merged: "success",
   closed: "neutral",
 };

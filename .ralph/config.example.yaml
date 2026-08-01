@@ -272,26 +272,41 @@ agent:
   #     phase2: [{ provider: claude, model: opus   }]    # only the thermo pass bumps
   # This object form is equally RUNTIME-MUTABLE via POST /api/routing/edit (#166/#169).
   #
-  # PER-COMPLEXITY-TIER agent profiles (issue #278) — impl ONLY. An operator-applied
-  # `complexity:1|2|3` label on an issue selects a per-tier PROFILE for its impl runs;
-  # LOWER = MORE DEMANDING (the priority:p0 convention): 1 = hard/architectural,
-  # 2 = standard, 3 = routine/mechanical. A tier is a profile, not just a route:
-  #   - routes           REPLACES the impl preference list whole (same semantics as the
-  #                      per-phase merge above; validated at load like any impl route)
+  # PER-COMPLEXITY-TIER agent profiles (issue #278, ADR-0039; amended by ADR-0041). An
+  # operator-applied `complexity:1|2|3` label selects a per-tier PROFILE; LOWER = MORE
+  # DEMANDING (the priority:p0 convention): 1 = hard/architectural, 2 = standard,
+  # 3 = routine/mechanical. A tier is a profile, not just a route:
+  #   - routes           REPLACES the lane's preference list whole (same semantics as the
+  #                      per-phase merge above; validated at load like any route)
   #   - effort           overrides agent.effort for the run's session
   #   - wallClockSeconds overrides agent.wallClockSeconds for the run
   # Every field optional — an absent field inherits the global. An issue with NO
   # complexity label runs on the globals (never an admission stall), and duplicate
-  # labels resolve to the most demanding tier. Review/fix are deliberately untouched:
-  # the review loop is what makes unattended merge safe (ADR-0014). Keys are strict —
-  # a "4" or a typo fails loud at load. Example:
-  # tiers:
-  #   "1": # hard → strongest model, biggest budget
-  #     routes: [{ provider: claude, model: claude-fable-5 }]
-  #     effort: max
-  #     wallClockSeconds: 10800
-  #   "2": # standard
-  #     routes: [{ provider: claude, model: claude-opus-4-8 }]
+  # labels resolve to the most demanding tier. Keys are strict — a "4" or a typo fails
+  # loud at load.
+  #
+  # WHICH LANES A TIER GOVERNS (ADR-0041 amending ADR-0039):
+  #   - tier 1 is GOVERNING: its profile replaces routing for EVERY lane — impl, resume,
+  #     review, fix and the master session. A master escalation permanently promotes its
+  #     issue to `complexity:1`, and that promotion would be meaningless if the next review
+  #     dropped back to a cheaper model.
+  #   - tiers 2 and 3 stay impl-only (plus master dispatch, which is always tier-derived):
+  #     review/fix routing stays uniform, which is what makes unattended merge safe (ADR-0014).
+  #
+  # THE MASTER ROUTE IS DERIVED FROM `tiers."1"` — there is deliberately no
+  # `agent.types.master` key (ADR-0041 V1 avoids the deployed-runner schema skew of #19).
+  # A missing or non-tools-capable tier-1 profile therefore does NOT fall back to a cheaper
+  # master: master escalation refuses to dispatch and surfaces a `daemon-anomaly` naming the
+  # defect. If you run master escalation, tier 1 must be configured and tools-capable.
+  #
+  # The tier→model mapping below is BINDING (ADR-0041), not illustrative:
+  tiers:
+    "1": # hard / promoted-by-master → strongest model, biggest budget, governs every lane
+      routes: [{ provider: claude, model: claude-fable-5 }]
+      effort: max
+      wallClockSeconds: 10800
+    "2": # standard
+      routes: [{ provider: claude, model: claude-opus-5 }]
   #   "3": # routine → cheap and quick
   #     routes: [{ provider: zai }]
   #     effort: medium

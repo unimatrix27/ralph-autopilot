@@ -97,6 +97,10 @@ const resultOutcomeSchema = z.enum([
   "reviewed",
   "fixed",
   "fix-escalate",
+  // A master session's terminal (ADR-0041): the master reached exactly one of its five
+  // resolutions and relays it in `master`. Additive — an older daemon never asks for a
+  // `master` assignment, so it never sees this outcome.
+  "master",
 ]);
 
 /**
@@ -138,6 +142,27 @@ const stuckResultSchema = z
   })
   .strict();
 
+/**
+ * The relayed outcome of an in-container master session (ADR-0041). Carried opaquely as the
+ * validated `MasterSessionResult` shape rather than re-declared here, so the master's outcome
+ * contract lives in exactly one place (`master/outcome.ts`) and the pipe cannot drift from it.
+ * The daemon re-validates it through `parseMasterSessionResult` before acting.
+ */
+const masterResultSchema = z
+  .object({
+    /** The chosen resolution name, so a dropped/garbled payload still names what happened. */
+    resolution: z.enum([
+      "resolved-and-continue",
+      "redispatch-tier-1",
+      "retry-pipeline",
+      "ask-human",
+      "terminal-stuck",
+    ]),
+    /** The full `MasterSessionResult` (outcome + decision drafts), re-validated daemon-side. */
+    result: z.unknown(),
+  })
+  .strict();
+
 const resultFrameSchema = z
   .object({
     kind: z.literal("result"),
@@ -162,6 +187,8 @@ const resultFrameSchema = z
      * it to the phase escalation exactly as it does for an in-process fix escalate.
      */
     fixEscalation: escalationQuestionSchema.optional(),
+    /** Present on a `master` result (ADR-0041) — the master session's relayed outcome. */
+    master: masterResultSchema.optional(),
   })
   .strict();
 
@@ -196,6 +223,8 @@ export type ResultOutcome = z.infer<typeof resultOutcomeSchema>;
 export type EscalationResult = z.infer<typeof escalationResultSchema>;
 /** The relayed self-stop report of an in-container `stuck` (#187): category + reason. */
 export type StuckResult = z.infer<typeof stuckResultSchema>;
+/** The relayed outcome of an in-container master session (ADR-0041). */
+export type MasterResult = z.infer<typeof masterResultSchema>;
 /** The terminal runner→daemon frame: the run ended with this {@link ResultOutcome}. */
 export type ResultFrame = z.infer<typeof resultFrameSchema>;
 /** A daemon→runner control signal. */

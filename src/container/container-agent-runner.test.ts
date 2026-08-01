@@ -112,10 +112,16 @@ function stuckSession(report: StuckReport): SessionHost {
 /** A {@link RunnerEscalation} that records every publish and returns a fixed comment id. */
 class FakeEscalation implements RunnerEscalation {
   readonly published: RunnerEscalationInput[] = [];
+  /** WIP checkpoints taken WITHOUT posting a question — the master-escalation half (ADR-0041). */
+  readonly checkpointed: RunnerEscalationInput[] = [];
   constructor(private readonly result: { commentId: number; prNumber?: number }) {}
   async publish(input: RunnerEscalationInput): Promise<{ commentId: number; prNumber?: number }> {
     this.published.push(input);
     return this.result;
+  }
+  async checkpoint(input: RunnerEscalationInput): Promise<{ prNumber?: number }> {
+    this.checkpointed.push(input);
+    return this.result.prNumber !== undefined ? { prNumber: this.result.prNumber } : {};
   }
 }
 
@@ -771,5 +777,147 @@ describe("ContainerAgentRunner — per-tier agent profiles (issue #278)", () => 
     expect(docker.dispatches[0]?.route).toEqual({ provider: "claude", model: "opus", account: CLAUDE });
     expect(docker.dispatches[0]?.assignment.profile).toBeUndefined();
     expect("profile" in (docker.dispatches[0]?.assignment ?? {})).toBe(false);
+  });
+});
+
+describe("container dispatch under master escalation (ADR-0041)", () => {
+  it("refuses to dispatch into a stale runner image, PRE-DISPATCH and by name", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    const docker = dockerRunning(session(false));
+    const runner = new ContainerAgentRunner({
+      docker,
+      store,
+      config: config(),
+      baseBranch: "main",
+      escalationMode: "master",
+      capabilities: { capabilities: async () => ["impl", "review-fix"] },
+    });
+
+    await expect(
+      runner.run({
+        issue,
+        mode: "tdd",
+        worktreePath: "(unused)",
+        branch: "ralph/185-impl",
+        logger: silent,
+        runId: 1,
+      }),
+    ).rejects.toThrow(/master-escalation/);
+    // The refusal happened BEFORE anything ran — no container was ever started (no no-result cascade).
+    expect(docker.dispatches).toHaveLength(0);
+  });
+
+  it("probes the RESOLVED runner image, not the repo slug (#45)", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    // The image a real `docker run` would launch — distinct from the `acme/widgets` repo slug.
+    const resolvedImage = "ralph/agent/acme-widgets:cachekey";
+    const escalation = new FakeEscalation({ commentId: 900, prNumber: 42 });
+    const docker = new FakeDocker(
+      (runnerTransport, dispatch) =>
+        void runContainerRunner(
+          { cloner, session: escalatingSession(), transport: runnerTransport, escalation },
+          dispatch,
+        ),
+      undefined,
+      resolvedImage,
+    );
+    const probed: string[] = [];
+    const runner = new ContainerAgentRunner({
+      docker,
+      store,
+      config: config(), // config().targetRepo === "acme/widgets"
+      baseBranch: "main",
+      escalationMode: "master",
+      capabilities: {
+        capabilities: async (image) => {
+          probed.push(image);
+          // Only the genuinely-built image declares the capability; the repo slug never would.
+          return image === resolvedImage ? ["impl", "master-escalation"] : [];
+        },
+      },
+    });
+
+    const result = await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "(unused)",
+      branch: "ralph/185-impl",
+      logger: silent,
+      runId: 1,
+      onEscalate: async () => {},
+    });
+
+    // The gate passed BECAUSE it inspected the resolved image — probing the repo slug would have
+    // returned [] and refused every dispatch even on a correctly-built image (the #45 bug).
+    expect(probed).toEqual([resolvedImage]);
+    expect(probed).not.toContain("acme/widgets");
+    expect(result.escalated).toBe(true);
+  });
+
+  it("dispatches with escalationMode when the runner declares the capability", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    const escalation = new FakeEscalation({ commentId: 900, prNumber: 42 });
+    const dispatches: Assignment[] = [];
+    const docker = new FakeDocker((runnerTransport, dispatch) => {
+      dispatches.push(dispatch.assignment);
+      void runContainerRunner(
+        { cloner, session: escalatingSession(), transport: runnerTransport, escalation },
+        dispatch,
+      );
+    });
+    const relayed: EscalationQuestion[] = [];
+
+    const runner = new ContainerAgentRunner({
+      docker,
+      store,
+      config: config(),
+      baseBranch: "main",
+      escalationMode: "master",
+      capabilities: { capabilities: async () => ["impl", "master-escalation"] },
+    });
+    const result = await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "(unused)",
+      branch: "ralph/185-impl",
+      logger: silent,
+      runId: 1,
+      onEscalate: async (q) => {
+        relayed.push(q);
+      },
+    });
+
+    expect(dispatches[0]!.escalationMode).toBe("master");
+    expect(result.escalated).toBe(true);
+    // The runner CHECKPOINTED the WIP and posted NOTHING; the daemon got the relayed question.
+    expect(escalation.checkpointed).toHaveLength(1);
+    expect(escalation.published).toHaveLength(0);
+    expect(relayed).toEqual([escalationQuestion]);
+    // No human question was indexed by this path — the master owns that decision now.
+    expect(store.listOpenQuestions()).toHaveLength(0);
+  });
+
+  it("keeps the runner-direct human escalation when no master engine is wired", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    const escalation = new FakeEscalation({ commentId: 900, prNumber: 42 });
+    const docker = dockerEscalating(escalatingSession(), escalation);
+
+    const runner = new ContainerAgentRunner({ docker, store, config: config(), baseBranch: "main" });
+    await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "(unused)",
+      branch: "ralph/185-impl",
+      logger: silent,
+      runId: 1,
+    });
+
+    expect(escalation.published).toHaveLength(1);
+    expect(escalation.checkpointed).toHaveLength(0);
+    expect(store.listOpenQuestions()).toHaveLength(1);
   });
 });

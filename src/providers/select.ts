@@ -31,10 +31,18 @@ import type {
  * "Thermo review" and "answered questions" are NOT separate types: thermo is `review`/`fix`
  * at Phase 2, and an answered escalation resumes whichever type paused.
  */
-export type AgentType = "impl" | "review" | "fix" | "autoMode";
+export type AgentType = "impl" | "review" | "fix" | "autoMode" | "master";
 
-/** Every configurable agent type, in a stable order (load-time validation iterates it). */
-export const AGENT_TYPES: readonly AgentType[] = ["impl", "review", "fix", "autoMode"];
+/**
+ * Every configurable agent type, in a stable order (load-time validation iterates it).
+ * `master` (ADR-0041) is deliberately NOT configurable under `agent.types` — its route is
+ * *derived* from the `agent.tiers["1"]` profile so V1 adds no new live config key (which
+ * would re-run the deployed-runner schema skew of issue #19). It is excluded from this list
+ * for that reason: load-time validation walks `agent.types`, and there is nothing there to
+ * walk for `master`. {@link masterPreferenceList} is its single route source.
+ */
+export type ConfigurableAgentType = Exclude<AgentType, "master">;
+export const AGENT_TYPES: readonly ConfigurableAgentType[] = ["impl", "review", "fix", "autoMode"];
 
 /**
  * Which review/fix **phase** a dispatch is for, as the per-phase routing-key selector
@@ -64,6 +72,37 @@ export type RoutingTier = 1 | 2 | 3;
  */
 export function tierProfile(agent: AgentSettings, tier: RoutingTier | null | undefined): TierProfile | undefined {
   return tier == null ? undefined : agent.tiers[`${tier}`];
+}
+
+/**
+ * The **governing tier** (ADR-0041, amending ADR-0039): tier 1 is no longer an impl-only
+ * profile. A master escalation permanently promotes its issue to `complexity:1`, and that
+ * promotion is meaningless if the next review or fix session drops back to a cheaper model —
+ * the issue was promoted precisely because it is hard. So a tier-1 profile governs **every**
+ * subsequent agent lane for that issue.
+ */
+export const GOVERNING_TIER: RoutingTier = 1;
+
+/**
+ * Whether `agent.tiers[tier].routes` replaces `type`'s preference list (ADR-0039 as amended
+ * by ADR-0041). Three cases, in precedence order:
+ *
+ *  - `impl` — tier-routed at every tier, unchanged from ADR-0039;
+ *  - `master` — **tier-derived by construction**: there is no `agent.types.master` key to
+ *    fall back to (ADR-0041 V1), so the tier profile is its only route source at any tier;
+ *  - everything else (`review` / `fix` / `autoMode`) — tier-routed **only at the governing
+ *    tier**, so an ordinary `complexity:2`/`3` issue keeps the uniform review/fix routing
+ *    that makes unattended merge safe (ADR-0014), while a promoted tier-1 issue carries its
+ *    profile all the way through.
+ *
+ * Pure; the single definition both {@link providerPreferenceList} and the dispatch profile
+ * fold consult, so route and session budget can never disagree about which lanes a tier owns.
+ */
+export function tierGovernsLane(type: AgentType, tier: RoutingTier | null | undefined): boolean {
+  if (tier == null) {
+    return false;
+  }
+  return type === "impl" || type === "master" || tier === GOVERNING_TIER;
 }
 
 /** The provider chosen for one agent type, plus any per-type model override. */
@@ -149,8 +188,9 @@ export function providerPreferenceList(
   phase?: RoutingPhase,
   tier?: RoutingTier | null,
 ): ProviderSelection[] {
-  const tierRoutes = type === "impl" ? tierProfile(agent, tier)?.routes : undefined;
-  return normaliseRouting(tierRoutes ?? effectiveRouting(agent.types[type], phase), agent.provider);
+  const tierRoutes = tierGovernsLane(type, tier) ? tierProfile(agent, tier)?.routes : undefined;
+  const configured = type === "master" ? undefined : agent.types[type];
+  return normaliseRouting(tierRoutes ?? effectiveRouting(configured, phase), agent.provider);
 }
 
 /**
@@ -163,7 +203,9 @@ export function perPhasePreferenceLists(
   agent: AgentSettings,
   type: AgentType,
 ): { phase1?: ProviderSelection[]; phase2?: ProviderSelection[] } {
-  const routing = agent.types[type];
+  // `master` has no `agent.types` entry (ADR-0041) and is single-phase, so it never has
+  // per-phase deltas to surface.
+  const routing = type === "master" ? undefined : agent.types[type];
   if (routing === undefined || !isPhasedRouting(routing)) {
     return {};
   }
@@ -187,12 +229,11 @@ export function perPhasePreferenceLists(
  */
 export function allPreferenceLists(agent: AgentSettings, type: AgentType): ProviderSelection[] {
   const perPhase = perPhasePreferenceLists(agent, type);
-  const perTier =
-    type === "impl"
-      ? ([1, 2, 3] as const).flatMap((tier) =>
-          agent.tiers[`${tier}`]?.routes ? providerPreferenceList(agent, type, undefined, tier) : [],
-        )
-      : [];
+  const perTier = ([1, 2, 3] as const).flatMap((tier) =>
+    tierGovernsLane(type, tier) && agent.tiers[`${tier}`]?.routes
+      ? providerPreferenceList(agent, type, undefined, tier)
+      : [],
+  );
   return [
     ...providerPreferenceList(agent, type),
     ...(perPhase.phase1 ?? []),
@@ -246,7 +287,26 @@ export function providerToolsCapable(providers: ProvidersSettings, provider: Pro
  * hardcoded four-way switch, so the type set is an **open list**: a future type defaults to
  * "no tools required" until it opts in here.
  */
-const TYPES_REQUIRING_TOOLS: ReadonlySet<string> = new Set<AgentType>(["impl"]);
+const TYPES_REQUIRING_TOOLS: ReadonlySet<string> = new Set<AgentType>(["impl", "master"]);
+
+/**
+ * The `master` lane's ordered preference list — always the `agent.tiers[tier].routes` of the
+ * issue's tier, with **no fallback** (ADR-0041). `null` means the tier profile is missing or
+ * declares no routes, which is a *configuration defect*, not a cheaper default: the master is
+ * the strongest model in the system, so silently running it on `agent.provider` would defeat
+ * the entire escalation. Callers surface the null as an actionable attention state naming the
+ * defect (see {@link import("../master/route").resolveMasterRoute}). Pure.
+ */
+export function masterPreferenceList(
+  agent: AgentSettings,
+  tier: RoutingTier,
+): ProviderSelection[] | null {
+  const routes = tierProfile(agent, tier)?.routes;
+  if (!routes || routes.length === 0) {
+    return null;
+  }
+  return providerPreferenceList(agent, "master", undefined, tier);
+}
 
 /**
  * Whether `type` requires in-session host-callback tools (ADR-0037 capability gate). `impl`

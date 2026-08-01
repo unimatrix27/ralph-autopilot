@@ -21,6 +21,7 @@
 import type { Assignment, ContainerDispatch, RunToken } from "./assignment";
 import { ContainerExecution, type DockerRunner } from "./container-execution";
 import type { ResultFrame } from "./protocol";
+import { assertRunnerSupports, type RunnerCapabilityProbe } from "./capabilities";
 import { createTelemetrySink, type TranscriptRunRecorder } from "./record-telemetry";
 import { foldRateLimitTelemetry, type RecordRateLimitSignal } from "./record-rate-limit";
 import { isUsageLimitError } from "../core/usage";
@@ -90,6 +91,19 @@ export interface ContainerAgentRunnerDeps {
    * (e.g. tests).
    */
   drainSignal?: AbortSignal;
+  /**
+   * What an in-session `escalate` means for this target's runs (ADR-0041). `master` — set when
+   * the daemon wires the master engine — makes the runner relay the escalation so the daemon can
+   * queue a master triage request; absent/`human` keeps the pre-ADR-0041 runner-direct
+   * `ralph-question`. Gated on the runner image's declared `master-escalation` capability.
+   */
+  escalationMode?: "human" | "master";
+  /**
+   * Reads the target agent image's declared runner capabilities, so a stale image fails
+   * **pre-dispatch** with a precise compatibility error. Absent → the check is skipped (an
+   * in-process/test wiring has no image to interrogate).
+   */
+  capabilities?: RunnerCapabilityProbe;
 }
 
 /** A placeholder per-run token — opaque until a later slice scopes the runner's GitHub/LLM access. */
@@ -140,6 +154,22 @@ export class ContainerAgentRunner implements AgentRunner {
             ...(profile.wallClockSeconds !== undefined ? { wallClockSeconds: profile.wallClockSeconds } : {}),
           }
         : undefined;
+    // Under ADR-0041 a worker `escalate` is an INTERNAL escalation to the master, so the runner
+    // must relay the question rather than post one. That is not additively tolerable — a stale
+    // runner ignoring the flag would page a human the daemon never meant to page — so the
+    // capability is asserted pre-dispatch and a stale image fails with one precise error
+    // instead of a generic no-result cascade.
+    const escalationMode = this.deps.escalationMode ?? "human";
+    if (escalationMode === "master") {
+      // Assert against the image `docker run` will actually launch — the resolved content-keyed
+      // tag (or the operator-pinned image), NOT `config.targetRepo`. The repo slug is a GitHub
+      // `owner/repo`, never a local image, so `docker image inspect`-ing it always finds nothing
+      // and would refuse EVERY dispatch even on a correctly-built image (#45). `docker.resolveImage`
+      // is the same resolution `docker.start` runs, so the gate checks exactly what dispatches.
+      await assertRunnerSupports(this.deps.capabilities, await this.deps.docker.resolveImage(), [
+        "master-escalation",
+      ]);
+    }
     const assignment: Assignment = {
       issueNumber: issue.number,
       mode,
@@ -148,6 +178,7 @@ export class ContainerAgentRunner implements AgentRunner {
       prompt,
       ...(ctx.resume ? { answer: ctx.resume.answer.text } : {}),
       ...(sessionProfile ? { profile: sessionProfile } : {}),
+      ...(escalationMode === "master" ? { escalationMode } : {}),
     };
     const dispatch: ContainerDispatch = {
       assignment,
@@ -256,10 +287,11 @@ export class ContainerAgentRunner implements AgentRunner {
       case "reviewed":
       case "fixed":
       case "fix-escalate":
-        // Review/fix terminals (#189) belong to the review-loop's container adapters, never an
-        // impl dispatch. If one ever arrives here it is a misrouted frame — treat it as a failed
-        // run (no PR work product) rather than silently reporting success.
-        ctx.logger.warn("container.unexpected-review-fix-terminal", {
+      case "master":
+        // Review/fix (#189) and master (ADR-0041) terminals belong to their own adapters, never
+        // an impl dispatch. If one ever arrives here it is a misrouted frame — treat it as a
+        // failed run (no PR work product) rather than silently reporting success.
+        ctx.logger.warn("container.unexpected-foreign-terminal", {
           issue: ctx.issue.number,
           outcome: result.outcome,
         });
@@ -277,6 +309,20 @@ export class ContainerAgentRunner implements AgentRunner {
    * container, so this is pure daemon-side bookkeeping — never a re-post.
    */
   private async recordEscalation(result: ResultFrame, ctx: AgentRunContext): Promise<void> {
+    if ((this.deps.escalationMode ?? "human") === "master") {
+      // ADR-0041: the runner posted NOTHING — it pushed WIP and relayed the question. The
+      // daemon owns what happens next (promote to `complexity:1`, post the durable
+      // `ralph-master-request`, append the fact), which is exactly the executor-wired
+      // `onEscalate`. Routing it there keeps the in-process and container paths on one
+      // hand-off instead of two that must be kept in step.
+      const question = result.escalation?.question;
+      if (!question || !ctx.onEscalate) {
+        ctx.logger.warn("container.master-escalation-unrelayed", { issue: ctx.issue.number });
+        return;
+      }
+      await ctx.onEscalate(question);
+      return;
+    }
     if (!result.escalation || ctx.runId == null) {
       // No relayed payload (a dropped frame) or no run to key: the escalation is still on GitHub;
       // the completeness pass reconciles the label rather than this best-effort fast path.

@@ -298,6 +298,11 @@ export {
   LABEL_COMPLEXITY_1,
   LABEL_COMPLEXITY_2,
   LABEL_COMPLEXITY_3,
+  COMPLEXITY_LABELS,
+  needsTierOnePromotion,
+  promoteToTierOnePatch,
+  LABEL_MASTER_TRIAGE,
+  LABEL_MASTER_TRIAGE_CREATE,
 } from "./core/labels";
 export { admit, RE_ADMITTABLE_STATUSES, SPAN_CLOSED_STATUSES } from "./core/admission";
 export type { World, LaunchPlan, ExcludedIssue, ExclusionReason } from "./core/admission";
@@ -938,3 +943,110 @@ export { CompositeNotificationDispatcher, NotificationSink } from "./notify/sink
 export type { NotificationSinkDeps, StallProbe, NotificationDispatchPort } from "./notify/sink";
 export type { NotificationKind, NotificationSeverity, NotificationRequest } from "./notify/types";
 export type { NotificationSettings, NotificationEndpoint, NotificationEndpointKind, WebPushSettings } from "./config/schema";
+
+// ---- master escalation: complexity-1 adjudication (ADR-0041) -------------
+export {
+  MasterEngine,
+  MASTER_PHASE_LABEL,
+} from "./master/engine";
+export type {
+  MasterAgentRunner,
+  MasterEngineDeps,
+  MasterInterventionResult,
+  MasterPipelinePort,
+  MasterSessionInput,
+  MasterSessionOutcome,
+} from "./master/engine";
+export {
+  MasterTriageRequester,
+  buildMasterTriageDraftPr,
+  evidenceFromEscalation,
+  evidenceFromStuck,
+  formatMasterRequestComment,
+  parseMasterRequestComment,
+  RALPH_MASTER_REQUEST_FENCE,
+} from "./master/request";
+export type {
+  MasterRequestContext,
+  MasterRequestPayload,
+  MasterRequestResult,
+  MasterWorkerEvidence,
+} from "./master/request";
+export {
+  AUTONOMOUS_RESOLUTIONS,
+  evaluateMasterBudget,
+  FINAL_ADJUDICATION_RESOLUTIONS,
+  MAX_MASTER_INTERVENTIONS_PER_PHASE,
+  readoptedAttemptBudget,
+  resolutionAllowed,
+  resumeAttempt,
+} from "./master/budget";
+export type { MasterBudgetInput, MasterBudgetVerdict } from "./master/budget";
+export { emptyMasterHistory, foldMasterHistory, interventionsInPhase } from "./master/history";
+export type { MasterHistory, MasterInterventionRecord, PendingMasterRequest } from "./master/history";
+export { normalizeFailureSignature, normalizeFailureText } from "./master/signature";
+export type { FailureSignatureInput } from "./master/signature";
+export {
+  describeMasterRouteDefect,
+  MASTER_TIER,
+  resolveMasterRoute,
+} from "./master/route";
+export type { MasterRouteDefect, MasterRouteResolution } from "./master/route";
+export {
+  isFinalAdjudication,
+  masterDecisionDraftSchema,
+  masterOutcomeSchema,
+  masterSessionResultSchema,
+  MASTER_RESOLUTIONS,
+  parseMasterSessionResult,
+  PIPELINE_RETRY_ACTIONS,
+} from "./master/outcome";
+export type {
+  MasterDecisionDraft,
+  MasterOutcome,
+  MasterSessionResult,
+  PipelineRetryAction,
+} from "./master/outcome";
+export { selectMasterTask } from "./master/queue";
+export type { MasterQueueSelection, MasterQueueSkip, MasterQueueWorld } from "./master/queue";
+export { MasterLease } from "./master/lease";
+export type { MasterLeaseHandle } from "./master/lease";
+export {
+  createMasterGuardrailsHook,
+  inspectMasterCommand,
+  MASTER_GUARDRAILS_MATCHER,
+  MASTER_WITHHELD_CAPABILITIES,
+} from "./master/guardrails";
+export type { MasterGuardrailContext, MasterGuardrailVerdict, MasterInvariant } from "./master/guardrails";
+export {
+  activeDecisions,
+  assembleMasterContext,
+  hasActiveDecisionFor,
+  MASTER_RECENT_EVENT_LIMIT,
+} from "./master/context";
+export type {
+  MasterContext,
+  MasterContextDeps,
+  MasterContextDiagnostic,
+  MasterContextInput,
+  MasterHumanAnswer,
+  MasterWorkspaceRead,
+  MasterWorkspaceReader,
+} from "./master/context";
+export { buildMasterPrompt, MASTER_SYSTEM_APPEND } from "./master/prompt";
+export { createExecutorMasterPipeline, masterBriefQuestion } from "./master/pipeline";
+export type { ExecutorMasterPipelineDeps } from "./master/pipeline";
+export { ContainerMasterAgentRunner } from "./master/container-master-runner";
+export type { ContainerMasterRunnerDeps } from "./master/container-master-runner";
+export {
+  assertRunnerSupports,
+  createDockerCapabilityProbe,
+  CURRENT_RUNNER_CAPABILITIES,
+  formatRunnerCapabilities,
+  parseRunnerCapabilities,
+  RUNNER_CAPABILITIES,
+  RUNNER_CAPABILITY_ENV,
+  RUNNER_CAPABILITY_LABEL,
+  RunnerCompatibilityError,
+} from "./container/capabilities";
+export type { RunnerCapability, RunnerCapabilityProbe } from "./container/capabilities";

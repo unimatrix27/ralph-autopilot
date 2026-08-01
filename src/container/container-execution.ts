@@ -47,6 +47,14 @@ export interface RunningContainer {
  * returns the live {@link RunningContainer}. Faked in tests; the real impl shells `docker`.
  */
 export interface DockerRunner {
+  /**
+   * The image tag a `docker run` for the next dispatch will launch — the SAME per-dispatch
+   * resolution {@link start} uses (the ensured content-keyed per-target tag, or an
+   * operator-pinned image). Exposed so the pre-dispatch capability probe (ADR-0041) inspects
+   * EXACTLY the image that will run, never a proxy for it (e.g. the repo slug): `start` resolves
+   * through this too, so the inspected tag and the run tag cannot drift.
+   */
+  resolveImage(): Promise<string>;
   start(dispatch: ContainerDispatch): Promise<RunningContainer>;
 }
 

@@ -137,13 +137,17 @@ chromium-equipped target image.
 _Avoid_: type, kind, category, and domain modes (`mode:frontend`, `mode:marketing`).
 
 **Complexity tier**:
-How demanding an issue is, stamped as an operator-applied `complexity:1|2|3` label —
-lower = more demanding (the `priority:p0` convention): `1` = hard/architectural, `2` =
-standard, `3` = routine/mechanical. Selects the per-tier **agent profile**
-(`agent.tiers`: impl routes + effort + wall-clock) at impl dispatch. Deliberately NOT
-part of the eligibility gate: an unlabeled issue runs on the globals — never a stall —
-and duplicate labels resolve by precedence to the most demanding tier. Impl-only;
-review/fix stay uniform (ADR-0014). (Issue legacy issue 278, ADR-0039.)
+How demanding an issue is, stamped as a `complexity:1|2|3` label — lower = more demanding
+(the `priority:p0` convention): `1` = hard/architectural, `2` = standard, `3` =
+routine/mechanical. Selects the per-tier **agent profile** (`agent.tiers`: routes + effort
++ wall-clock). Deliberately NOT part of the eligibility gate: an unlabeled issue runs on
+the globals — never a stall — and duplicate labels resolve by precedence to the most
+demanding tier. Operator-applied *or* daemon-applied: the first [[master]] escalation
+permanently promotes its issue to `complexity:1`.
+Tier **1 is governing** — its profile applies to every lane (impl, resume, review, fix,
+master); tiers 2–3 stay impl-only, so ordinary issues keep uniform review/fix (ADR-0014).
+The tier→model mapping is **binding**: `1` → `claude-fable-5`, `2` → `claude-opus-5`.
+(Issue legacy issue 278, ADR-0039 as amended by ADR-0041.)
 _Avoid_: difficulty, size, priority (that's `priority:p0/p1` — orthogonal).
 
 **Moding pass** (auto-mode):
@@ -163,11 +167,64 @@ working tree from the others while sharing one clone's object store. One agent,
 one worktree.
 
 **Escalate**:
-The custom tool an agent calls when it needs a human decision. Asynchronous: it
-checkpoints the agent's work, writes a structured question to GitHub, frees the
-slot, and exits. It is **not** Claude's built-in `AskUserQuestion` and must never
-be conflated with it.
-_Avoid_: ask, AskUserQuestion, ask-user, prompt-the-user.
+The custom tool a **worker** agent calls when it needs a decision it cannot make.
+Asynchronous: it checkpoints the agent's work, hands the decision **up to the
+[[master]]**, frees the slot, and exits. Since ADR-0041 it does *not* ask a human —
+`escalate` means *internal escalation to the master*, and only the master's `ask_human`
+creates a [[ralph-question]]. It is **not** Claude's built-in `AskUserQuestion` and must
+never be conflated with it.
+_Avoid_: ask, AskUserQuestion, ask-user, prompt-the-user; "escalate to the operator".
+
+**Master (master escalation)**:
+The fresh, highest-tier session that **adjudicates** a worker's `escalate` or `stuck`
+before any human is asked (ADR-0041). It reads the worker's evidence, the run's actual
+state, the [[hierarchy-map]] / [[context-packet]], and the active [[decision-ledger]],
+then reaches its **own** conclusion — the worker's recommendation is evidence, never an
+answer. It may repair the WIP worktree, run tests, commit and push the issue branch,
+publish a scoped decision, or delegate a fresh tier-1 worker; it may never merge, close,
+bypass CI, force-push, touch another branch, or control the host. Its route is derived
+from `agent.tiers["1"]` and **fails closed** — there is no cheaper master.
+_Avoid_: supervisor (that is the ops wrapper), orchestrator, senior agent, reviewer.
+
+**Master triage**:
+The projected, **non-human** state of an issue queued for (or undergoing) master
+escalation — run status and daemon-owned label `master-triage`. It excludes the issue
+from ordinary admission and classifies as *in-flight*: the daemon is working, nobody is
+being paged. Distinct from every [[stuck-budget]] / [[review-maxed]] / `awaiting-answer`
+state, all of which mean "a human must look".
+_Avoid_: pending, queued-for-human, escalated (bare).
+
+**Master intervention / loop budget**:
+One numbered master session within a run phase. At most **two** per phase; a third
+cannot launch. A repeated [[failure-signature]] forces final adjudication — a materially
+different resolution, `ask-human`, or `terminal-stuck` — and the harness re-checks the
+master's answer rather than trusting it. A human answer **re-opens** the same numbered
+attempt once (spending no fresh budget) and that resumed master may not ask again.
+
+**Failure signature**:
+The normalized identity of a failure across attempts: the failure text with SHAs,
+timestamps, durations, paths, line numbers and counters erased. Two failures with the same
+signature are "the same failure" for the loop budget — **a changed head SHA alone never
+makes a signature new**. Deliberately lossy in one direction only: it may call two
+different failures the same (costing one forced adjudication), never two identical
+failures different (which would cost an infinite loop).
+_Avoid_: error hash, fingerprint (when you mean this specific normalization).
+
+**Master resolution**:
+The exactly-five terminal dispositions of a master intervention:
+`resolved-and-continue` (repaired or gave authoritative guidance; re-enter the phase),
+`redispatch-tier-1` (fresh worker on the preserved WIP branch with the master's brief),
+`retry-pipeline` (one typed harness retry — CI/review/merge/reconcile — never a gate
+bypass), `ask-human` (the ONLY path to a [[ralph-question]] in this slice), and
+`terminal-stuck` (neither another autonomous action nor a human decision helps). Exactly
+one per intervention; there is no "deferred" arm.
+
+**ralph-master-request**:
+The fenced comment carrying a queued escalation's durable evidence — source
+(`escalate` | `stuck`), lane, phase, normalized signature, and the worker's payload,
+recommendation, attempted fixes and uncertainty. GitHub is the source of truth for the
+master queue, so a lost store rebuilds the escalation from this comment plus the
+`master-triage` label. Not a human-facing question.
 
 **ralph-question / ralph-answer**:
 The two fenced comment formats on a GitHub issue. `ralph-question` is the
@@ -280,9 +337,12 @@ that a human answer can re-enable. To *heal* a run is to answer it so the daemon
 resumes the agent with that guidance injected.
 
 **Stuck budget / agent-stuck**:
-The bounded-effort escape: an agent self-stops (no PR, `agent-stuck` label) after
-too many fix iterations on the same failure, too many edits without a green build,
-or self-judged futility. Distinct from `review-maxed` (which has a PR).
+The bounded-effort escape: a worker self-stops after too many fix iterations on the same
+failure, too many edits without a green build, or self-judged futility. Since ADR-0041 a
+worker `stuck` is a *signal*, not a terminal: it preserves the WIP and enters
+[[master-triage]] as a distinct master-request source ("execution budget exhausted"). Only
+the [[master]] projects the terminal `agent-stuck` for a worker-origin path. Distinct from
+`review-maxed` (which has a PR).
 
 **Completeness invariant**:
 The structural guarantee that no work is *silently* lost. Each tick the reconciler

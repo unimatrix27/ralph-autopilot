@@ -42,6 +42,25 @@ profile** for the issue's impl runs. Decisions, each deliberate:
    where a mislabeled issue would hurt. Tier-aware review is a possible follow-up, with
    evidence.
 
+   > **AMENDED BY ADR-0041 for tier 1 only.** Tier 1 is now the **governing** tier: its
+   > profile replaces routing for *every* lane — impl, resume, review, fix and the master
+   > session. The evidence ADR-0039 asked for arrived with master escalation: a master
+   > escalation *permanently promotes* its issue to `complexity:1`, and a promotion that let
+   > the next review pass drop back to a cheaper model would be a promotion in name only. The
+   > mislabelling risk this decision guarded against does not apply, because tier 1 is now
+   > reached by the daemon's own adjudication, not only by an operator's guess.
+   >
+   > Tiers **2 and 3 remain impl-only**, exactly as decided here — so an ordinary issue keeps
+   > the uniform review/fix routing ADR-0014 depends on. The `master` lane is a third case:
+   > it is *tier-derived by construction* at any tier, because there is no `agent.types.master`
+   > key to fall back to (ADR-0041 decision 10). One predicate, `tierGovernsLane`, spells all
+   > three cases in one place.
+   >
+   > **Routing precedence, explicitly:** a governing tier's `routes` outrank `agent.types[type]`
+   > *and* its per-phase `phase1`/`phase2` overrides (whole-list replacement, never a merge).
+   > An unlabeled issue, or a non-governing tier on a non-impl/non-master lane, resolves
+   > `agent.types[type]` exactly as before.
+
 6. **Resolved daemon-side; the runner applies, never re-derives.** The daemon reads the
    tier from the live labels at dispatch, threads it through route resolution
    (`resolveDispatchRoute(deps, "impl", undefined, tier)`), and rides the resolved
@@ -70,3 +89,7 @@ profile** for the issue's impl runs. Decisions, each deliberate:
   (a target's `tiers` replaces the whole block, like every array/object agent field).
 - The web routing editor (legacy issue 166) does not yet edit tiers; they are config-file-owned for
   now. A follow-up may surface them alongside the per-type lists.
+- Since ADR-0041, the tier→model mapping is **binding** rather than illustrative:
+  `complexity:1` → `claude-fable-5`, `complexity:2` → `claude-opus-5`, pinned in the shipped
+  example config and in routing tests. Tier 1 must also be **tools-capable**, because master
+  escalation dispatches on it and refuses to fall back.

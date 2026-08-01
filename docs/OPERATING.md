@@ -206,6 +206,55 @@ What this means for operating the daemon:
   contradictory state the sweeper cannot mechanically remediate — are the residue that
   needs you.
 
+## 4a. Master escalation: what `master-triage` means for you (ADR-0041)
+
+Since [ADR-0041](adr/0041-master-escalation-complexity-1-adjudication.md), a worker agent's
+`escalate` and `stuck` no longer page you. They hand the decision **up to a master** — a
+fresh, highest-tier session that investigates independently and resolves it if it can. What
+changes operationally:
+
+- **`master-triage` is not a "needs you" state.** It is an automated in-flight state, like
+  `awaiting-ci` and `awaiting-merge`: the work is checkpointed on the issue branch and a
+  master is (or shortly will be) adjudicating it. Do not remove the label by hand — that
+  takes the issue out of the master queue and discards the adjudication in progress.
+- **You will get fewer, better questions.** A `ralph-question` now only ever comes from a
+  master that concluded a human decision is genuinely required — a product/priority call, a
+  contradiction of standing design authority, or an external blocker. Answer it with
+  `ralph-answer` exactly as before; your answer resumes the **master's** adjudication, not the
+  original worker's session.
+- **`agent-stuck` now means more.** A worker cannot reach it on its own for an impl run any
+  more. When you see it, either a master adjudicated and concluded nothing further helps, or
+  the two-interventions-per-phase budget was exhausted. Either way it left a card explaining
+  what was tried — read it before re-arming.
+- **Issues get promoted to `complexity:1` by the daemon.** The first master escalation
+  permanently promotes the issue, and tier 1 then governs every later lane (impl, resume,
+  review, fix, master). Seeing `complexity:1` appear on an issue you labelled `complexity:3`
+  is expected, not a stray edit.
+
+### Configuration you must get right before running this
+
+**Tier 1 must be configured and tools-capable.** The master route is derived from
+`agent.tiers["1"]` and **fails closed** — it will never fall back to a cheaper model, because
+a master weaker than the worker that escalated to it is worse than no master. If tier 1 is
+missing, has no `routes`, or points at a non-tools-capable provider, the queued escalation
+does **not** run: the issue is surfaced as a `daemon-anomaly` whose reason names the exact
+defect and the fix. The shipped `.ralph/config.example.yaml` has a working tier 1
+(`claude-fable-5`) and tier 2 (`claude-opus-5`) — those mappings are binding, not examples.
+
+**Your agent images must be current.** A master dispatch — and any worker `escalate` under a
+master-capable daemon — requires a runner image that declares the `master-escalation`
+capability in its `io.ralph.runner-capabilities` label. The daemon reads that label
+**pre-dispatch** and refuses with a precise error naming the missing capability rather than
+letting a stale runner post a human question the daemon never asked for. If you see
+`RunnerCompatibilityError` in the log, rebuild `ralph/agent-base` and bump your targets'
+`FROM` pin — see [the image-refresh runbook](runbooks/container-image-refresh.md). The
+onboarding smoke test (`ops/smoke-test-agent-image.sh`) gates on the same label.
+
+**Masters are globally serialized.** At most one master session runs across the whole daemon
+at a time (V1), so concurrent decision-ledger writes are impossible. A busy backlog with
+several escalations will work through them one at a time; unrelated issues keep filling the
+remaining slots normally.
+
 ## 5. Self-update: running under the supervisor (legacy issue 30)
 
 Self-update lets the daemon adopt new commits on its own branch — its auto-merged
