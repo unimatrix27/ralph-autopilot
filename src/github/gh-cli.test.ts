@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyChecks,
+  classifyInaccessible,
   commentIdFromUrl,
   GhCliClient,
   isGitHubRateLimitError,
@@ -800,5 +801,362 @@ describe("GhCliClient comment listing", () => {
       { id: 11, author: "octocat", body: "hello" },
       { id: 1, author: "", body: "" },
     ]);
+  });
+});
+
+/**
+ * The **native** parent/sub-issue contract on the real adapter (ADR-0040), driven
+ * entirely through the injected `exec` — the unit suite makes no network call. Two
+ * things are proved here: the argv gh is actually asked to run (so the GraphQL
+ * query, not a REST guess, is what carries the hierarchy), and the pure mapping
+ * from GitHub's payload to a typed {@link HierarchyRead}.
+ */
+describe("GhCliClient native hierarchy reads", () => {
+  const issuePayload = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      data: {
+        repository: {
+          issue: {
+            id: "I_leaf",
+            number: 41,
+            title: "the leaf",
+            state: "OPEN",
+            repository: { nameWithOwner: "owner/repo" },
+            parent: {
+              id: "I_mid",
+              number: 12,
+              title: "the middle",
+              state: "OPEN",
+              repository: { nameWithOwner: "owner/repo" },
+            },
+            subIssues: {
+              nodes: [
+                {
+                  id: "I_kid",
+                  number: 77,
+                  title: "a sub-issue",
+                  state: "CLOSED",
+                  repository: { nameWithOwner: "owner/repo" },
+                },
+              ],
+            },
+            ...over,
+          },
+        },
+      },
+    });
+
+  function makeClient(out: string) {
+    const calls: string[][] = [];
+    const exec = async (args: string[]): Promise<string> => {
+      calls.push(args);
+      return out;
+    };
+    return { client: new GhCliClient("owner/repo", { exec }), calls };
+  }
+
+  it("asks GraphQL for the native parent and sub-issues in one call", async () => {
+    const { client, calls } = makeClient(issuePayload());
+
+    const read = await client.readIssueHierarchy({ repo: "owner/repo", number: 41 });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.slice(0, 2)).toEqual(["api", "graphql"]);
+    const query = calls[0]!.find((a) => a.startsWith("query="))!;
+    expect(query).toContain("parent{");
+    expect(query).toContain("subIssues(");
+    expect(calls[0]).toContain("owner=owner");
+    expect(calls[0]).toContain("name=repo");
+    expect(calls[0]).toContain("number=41");
+    if (read.kind !== "node") throw new Error("expected a node");
+    expect(read.node).toEqual({
+      ref: { repo: "owner/repo", number: 41 },
+      id: "I_leaf",
+      title: "the leaf",
+      state: "OPEN",
+    });
+    expect(read.parent).toEqual({
+      kind: "node",
+      node: {
+        ref: { repo: "owner/repo", number: 12 },
+        id: "I_mid",
+        title: "the middle",
+        state: "OPEN",
+      },
+    });
+    expect(read.children.map((c) => c.ref.number)).toEqual([77]);
+    expect(read.children[0]!.state).toBe("CLOSED");
+  });
+
+  it("represents a cross-repository parent from the node's own repository field", async () => {
+    const { client } = makeClient(
+      issuePayload({
+        parent: {
+          id: "I_prog",
+          number: 3,
+          title: "programme",
+          state: "OPEN",
+          repository: { nameWithOwner: "owner/programme" },
+        },
+      }),
+    );
+
+    const read = await client.readIssueHierarchy({ repo: "owner/repo", number: 41 });
+
+    if (read.kind !== "node" || read.parent.kind !== "node") throw new Error("expected a parent node");
+    expect(read.parent.node.ref).toEqual({ repo: "owner/programme", number: 3 });
+  });
+
+  it("reports a parentless issue as `none` — the only value that means absolute root", async () => {
+    const { client } = makeClient(issuePayload({ parent: null }));
+
+    const read = await client.readIssueHierarchy({ repo: "owner/repo", number: 41 });
+
+    if (read.kind !== "node") throw new Error("expected a node");
+    expect(read.parent).toEqual({ kind: "none" });
+  });
+
+  it("never turns a masked parent into `none`", async () => {
+    const out = JSON.stringify({
+      data: { repository: { issue: { ...JSON.parse(issuePayload()).data.repository.issue, parent: null } } },
+      errors: [{ type: "FORBIDDEN", message: "Resource not accessible", path: ["repository", "issue", "parent"] }],
+    });
+    const { client } = makeClient(out);
+
+    const read = await client.readIssueHierarchy({ repo: "owner/repo", number: 41 });
+
+    if (read.kind !== "node") throw new Error("expected a node");
+    expect(read.parent).toMatchObject({ kind: "inaccessible", reason: "unauthorized" });
+  });
+
+  it("classifies a missing issue as deleted and a masked one as unauthorized", async () => {
+    const deleted = JSON.stringify({
+      data: { repository: { issue: null } },
+      errors: [{ type: "NOT_FOUND", message: "Could not resolve to an Issue with the number 99." }],
+    });
+    const masked = JSON.stringify({
+      data: { repository: null },
+      errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }],
+    });
+
+    expect(await makeClient(deleted).client.readIssueHierarchy({ repo: "owner/repo", number: 99 })).toMatchObject({
+      kind: "inaccessible",
+      reason: "deleted",
+    });
+    expect(await makeClient(masked).client.readIssueHierarchy({ repo: "private/vault", number: 5 })).toMatchObject({
+      kind: "inaccessible",
+      reason: "unauthorized",
+    });
+  });
+
+  it("fails closed to `error` on an empty or unparseable payload", async () => {
+    expect(await makeClient("").client.readIssueHierarchy({ repo: "owner/repo", number: 1 })).toMatchObject({
+      kind: "inaccessible",
+      reason: "error",
+    });
+    expect(await makeClient("<html>").client.readIssueHierarchy({ repo: "owner/repo", number: 1 })).toMatchObject({
+      kind: "inaccessible",
+      reason: "error",
+    });
+  });
+
+  it("classifies inaccessibility from gh's own wording", () => {
+    expect(classifyInaccessible("Could not resolve to an Issue with the number 99.")).toBe("deleted");
+    expect(classifyInaccessible("HTTP 403: Resource not accessible by integration")).toBe("unauthorized");
+    expect(classifyInaccessible("dial tcp: lookup api.github.com: no such host")).toBe("error");
+  });
+});
+
+/**
+ * The cross-repo content + comment surface the context assembler and the decision
+ * ledger read through: `--repo` comes off the ref, so a node in another repository
+ * costs the same one call as a local one.
+ */
+describe("GhCliClient cross-repo node reads and writes", () => {
+  function makeClient(out: (args: string[]) => string) {
+    const calls: string[][] = [];
+    const exec = async (args: string[]): Promise<string> => {
+      calls.push(args);
+      return out(args);
+    };
+    return { client: new GhCliClient("owner/repo", { exec }), calls };
+  }
+
+  it("reads a cross-repo node's body and comments in one `issue view`", async () => {
+    const { client, calls } = makeClient(() =>
+      JSON.stringify({
+        id: "I_other",
+        number: 3,
+        title: "programme",
+        state: "OPEN",
+        body: "the programme body",
+        comments: [
+          {
+            id: "IC_x",
+            author: { login: "octocat" },
+            body: "a decision",
+            url: "https://github.com/owner/programme/issues/3#issuecomment-99",
+          },
+        ],
+      }),
+    );
+
+    const read = await client.readIssueContent({ repo: "owner/programme", number: 3 });
+
+    expect(calls[0]).toEqual([
+      "issue",
+      "view",
+      "3",
+      "--repo",
+      "owner/programme",
+      "--json",
+      "id,number,title,body,state,comments",
+    ]);
+    if (read.kind !== "content") throw new Error("expected content");
+    expect(read.body).toBe("the programme body");
+    expect(read.comments).toEqual([{ id: 99, author: "octocat", body: "a decision" }]);
+    expect(read.node.ref).toEqual({ repo: "owner/programme", number: 3 });
+  });
+
+  it("maps a failed content read to a typed inaccessible result, not a throw", async () => {
+    const exec = async (): Promise<string> => {
+      throw Object.assign(new Error("gh failed"), { stderr: "HTTP 404: Not Found" });
+    };
+    const client = new GhCliClient("owner/repo", { exec });
+
+    expect(await client.readIssueContent({ repo: "owner/gone", number: 1 })).toMatchObject({
+      kind: "inaccessible",
+      reason: "deleted",
+    });
+  });
+
+  it("posts and edits a comment on the node's own repo", async () => {
+    const { client, calls } = makeClient(
+      () => "https://github.com/owner/programme/issues/3#issuecomment-4242\n",
+    );
+
+    expect(await client.postNodeComment({ repo: "owner/programme", number: 3 }, "body")).toEqual({
+      id: 4242,
+    });
+    await client.updateNodeComment({ repo: "owner/programme", number: 3 }, 4242, "new body");
+
+    expect(calls[0]).toEqual([
+      "issue",
+      "comment",
+      "3",
+      "--repo",
+      "owner/programme",
+      "--body",
+      "body",
+    ]);
+    expect(calls[1]).toEqual([
+      "api",
+      "--method",
+      "PATCH",
+      "/repos/owner/programme/issues/comments/4242",
+      "-f",
+      "body=new body",
+    ]);
+  });
+});
+
+/**
+ * The false-root class of defect on the real adapter: a partial GraphQL response —
+ * `parent: null` alongside an error — must never read as "this issue has no
+ * parent". A rate-limited read that manufactured a root would let an
+ * initiative-scoped decision, or the derived index, land on the wrong node.
+ */
+describe("GhCliClient never manufactures a root from a partial response", () => {
+  const withParentNull = (errors: unknown[]) =>
+    JSON.stringify({
+      data: {
+        repository: {
+          issue: {
+            id: "I_leaf",
+            number: 41,
+            title: "the leaf",
+            state: "OPEN",
+            repository: { nameWithOwner: "owner/repo" },
+            parent: null,
+            subIssues: { totalCount: 0, nodes: [] },
+          },
+        },
+      },
+      errors,
+    });
+
+  const read = async (out: string) =>
+    new GhCliClient("owner/repo", { exec: async () => out }).readIssueHierarchy({
+      repo: "owner/repo",
+      number: 41,
+    });
+
+  it("fails closed on an unpathed error (rate limit, node limit, generic fault)", async () => {
+    for (const err of [
+      { type: "RATE_LIMITED", message: "API rate limit exceeded for installation" },
+      { type: "MAX_NODE_LIMIT_EXCEEDED", message: "the query exceeded the node limit" },
+      { message: "Something went wrong while executing your query" },
+    ]) {
+      const result = await read(withParentNull([err]));
+      if (result.kind !== "node") throw new Error("expected a node");
+      expect(result.parent.kind).toBe("inaccessible");
+    }
+  });
+
+  it("fails closed on an error pathed at a prefix of `parent`", async () => {
+    const result = await read(
+      withParentNull([{ type: "FORBIDDEN", message: "Resource not accessible", path: ["repository", "issue"] }]),
+    );
+    if (result.kind !== "node") throw new Error("expected a node");
+    expect(result.parent).toMatchObject({ kind: "inaccessible", reason: "unauthorized" });
+  });
+
+  it("still reports `none` for a clean response with no parent", async () => {
+    const result = await read(withParentNull([]));
+    if (result.kind !== "node") throw new Error("expected a node");
+    expect(result.parent).toEqual({ kind: "none" });
+  });
+});
+
+/**
+ * A sub-issue page tops out server-side, so the adapter must report GitHub's own
+ * total. Without it a node with more children than one page looks complete, and the
+ * compact map's `omitted` count reads 0 while descendants are missing.
+ */
+describe("GhCliClient reports the true sub-issue count", () => {
+  it("asks for `totalCount` and carries it through", async () => {
+    const calls: string[][] = [];
+    const client = new GhCliClient("owner/repo", {
+      exec: async (args) => {
+        calls.push(args);
+        return JSON.stringify({
+          data: {
+            repository: {
+              issue: {
+                id: "I_root",
+                number: 1,
+                title: "root",
+                state: "OPEN",
+                repository: { nameWithOwner: "owner/repo" },
+                parent: null,
+                subIssues: {
+                  totalCount: 120,
+                  nodes: [
+                    { id: "I_a", number: 2, title: "a", state: "OPEN", repository: { nameWithOwner: "owner/repo" } },
+                  ],
+                },
+              },
+            },
+          },
+        });
+      },
+    });
+
+    const result = await client.readIssueHierarchy({ repo: "owner/repo", number: 1 });
+
+    expect(calls[0]!.find((a) => a.startsWith("query="))).toContain("totalCount");
+    if (result.kind !== "node") throw new Error("expected a node");
+    expect(result.childCount).toBe(120);
+    expect(result.children).toHaveLength(1);
   });
 });

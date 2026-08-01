@@ -60,3 +60,26 @@ describe("fenced-payload codec", () => {
     expect(result).toBeNull();
   });
 });
+
+/**
+ * Fence names nest by prefix in practice — `ralph-decision` and
+ * `ralph-decision-index` (ADR-0040) — so a probe for the shorter one must not match
+ * the longer. Without the tag-exact match the derived index comment reads back as a
+ * malformed decision record on every ledger fold.
+ */
+describe("fence names that prefix one another", () => {
+  const inner = renderFencedPayload("ralph-decision-index", { active: [] });
+
+  it("does not detect a shorter fence inside a longer one that starts with it", () => {
+    expect(hasFencedPayload(inner, "ralph-decision-index")).toBe(true);
+    expect(hasFencedPayload(inner, "ralph-decision")).toBe(false);
+    expect(extractFencedPayload(inner, "ralph-decision")).toBeNull();
+    expect(parseFencedPayload(inner, "ralph-decision", (v) => v)).toBeNull();
+  });
+
+  it("still matches the exact fence, whatever info string follows it", () => {
+    const body = "```ralph-decision extra info\n{\"a\":1}\n```";
+    expect(hasFencedPayload(body, "ralph-decision")).toBe(true);
+    expect(parseFencedPayload(body, "ralph-decision", (v) => v)).toEqual({ a: 1 });
+  });
+});

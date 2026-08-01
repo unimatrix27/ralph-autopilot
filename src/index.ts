@@ -156,8 +156,26 @@ export { parseBlockedBy } from "./github/blocked";
 export type { BlockedByRefs } from "./github/blocked";
 export { buildLaunchMarker, parseLaunchMarker } from "./github/marker";
 export type { LaunchMarker } from "./github/marker";
-export { classifyChecks, commentIdFromUrl, isGitHubRateLimitError } from "./github/gh-cli";
+export {
+  classifyChecks,
+  classifyInaccessible,
+  commentIdFromUrl,
+  isGitHubRateLimitError,
+  parseHierarchyResponse,
+} from "./github/gh-cli";
 export type { RawCheck } from "./github/gh-cli";
+export {
+  commentUrl,
+  compareRefs,
+  formatRef,
+  issueUrl,
+  parseIssueRef,
+  refKey,
+  sameRef,
+  sortNodes,
+  sortRefs,
+  splitRepo,
+} from "./github/ref";
 export type {
   Issue,
   IssueState,
@@ -171,7 +189,99 @@ export type {
   AwaitChecksOptions,
   MergeOptions,
   GitHubClient,
+  IssueRef,
+  HierarchyNode,
+  HierarchyRead,
+  ParentEdge,
+  IssueContentRead,
+  InaccessibleReason,
 } from "./github/types";
+
+// ---- native hierarchy zoom-out: compact map + budgeted context packet (ADR-0040) ----
+export {
+  buildHierarchyMap,
+  absoluteRoot,
+  branchFor,
+  isOnPath,
+  pathRefs,
+  HIERARCHY_DEPTH_CEILING,
+  DEFAULT_MAX_CHILDREN_PER_NODE,
+} from "./hierarchy/map";
+export type {
+  HierarchyMap,
+  HierarchyMapOptions,
+  HierarchyBranch,
+  HierarchyReader,
+  RootResolution,
+} from "./hierarchy/map";
+export {
+  assembleContextPacket,
+  packContextPacket,
+  selectContextNodes,
+  extractDesignReferences,
+  DEFAULT_CONTEXT_CHAR_BUDGET,
+  DEFAULT_MAX_COMMENTS_PER_NODE,
+} from "./hierarchy/context-packet";
+export type {
+  ContextPacket,
+  ContextPacketOptions,
+  ContextNode,
+  ContextNodeRole,
+  ContextDiagnostic,
+  ContextReader,
+} from "./hierarchy/context-packet";
+
+// ---- the durable, scoped decision ledger (ADR-0040) ----------------------
+export {
+  decisionRecordSchema,
+  parseDecisionRecord,
+  formatDecisionComment,
+  parseDecisionComment,
+  isDecisionComment,
+  sanitizeDecisionRecord,
+  decisionSummary,
+  storedWhereItClaims,
+  DECISION_SCOPES,
+  RALPH_DECISION_FENCE,
+} from "./ledger/decision";
+export type { DecisionRecord, DecisionScope } from "./ledger/decision";
+export { collectDecisionComments, foldDecisionLedger } from "./ledger/fold";
+export type {
+  StoredDecision,
+  DecisionConflict,
+  LedgerDiagnostic,
+  LedgerFold,
+  LedgerFoldInput,
+} from "./ledger/fold";
+export {
+  resolveStorageNode,
+  appendDecision,
+  readDecisionLedger,
+  readInitiativeLedger,
+  readLedgerForIssue,
+  DEFAULT_CRAWL_MAX_NODES,
+} from "./ledger/ledger";
+export type {
+  AppendDecisionInput,
+  AppendDecisionResult,
+  InitiativeLedgerOptions,
+  LedgerReadPort,
+  LedgerWritePort,
+  LedgerCrawlPort,
+  StorageRejection,
+  StorageResolution,
+} from "./ledger/ledger";
+export {
+  formatDecisionIndex,
+  isDecisionIndexComment,
+  syncDecisionIndex,
+  RALPH_DECISION_INDEX_FENCE,
+} from "./ledger/index-comment";
+export type {
+  DecisionIndexInput,
+  DecisionIndexPort,
+  SyncDecisionIndexResult,
+} from "./ledger/index-comment";
 
 // ---- core loop: admission (gate + scheduling) + label vocabulary --------
 export {
