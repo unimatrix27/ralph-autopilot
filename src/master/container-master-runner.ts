@@ -59,7 +59,11 @@ export class ContainerMasterAgentRunner implements MasterAgentRunner {
 
   async run(input: MasterSessionInput): Promise<MasterSessionOutcome> {
     // Fail loud, pre-dispatch, on a stale runner: `kind: "master"` is not additively tolerable.
-    await assertRunnerSupports(this.deps.capabilities, this.deps.config.targetRepo, ["master-escalation"]);
+    // Inspect the image `docker run` will launch (the resolved content-keyed tag / the pinned
+    // image), NOT `config.targetRepo` — the repo slug is a GitHub `owner/repo`, never a local
+    // image, so probing it always finds nothing and would refuse every master dispatch even on a
+    // correctly-built image (#45). `docker.resolveImage` is the same resolution `docker.start` runs.
+    await assertRunnerSupports(this.deps.capabilities, await this.deps.docker.resolveImage(), ["master-escalation"]);
 
     // The master runs on tier 1 by construction (the escalation promoted the issue), so its
     // session budget is the tier-1 profile's `effort` / `wallClockSeconds` — resolved daemon-side

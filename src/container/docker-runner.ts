@@ -422,16 +422,27 @@ export class DockerCliRunner implements DockerRunner, ContainerSweeper {
     this.stopTimeoutSeconds = config.stopTimeoutSeconds ?? DEFAULT_STOP_TIMEOUT_SECONDS;
   }
 
+  /**
+   * The image a `docker run` will launch for the next dispatch (issue #190 completion, ADR-0041):
+   * the injected `resolveImage` ENSURES the content-keyed per-target image (build-on-cache-miss,
+   * ADR-0038) and returns its exact tag; a static `image` (RALPH_AGENT_IMAGE pin) is used as-is.
+   * {@link start} runs exactly this, and the pre-dispatch runner-capability probe inspects exactly
+   * this — one resolution, so the compatibility check can never gate a different image than runs.
+   */
+  async resolveImage(): Promise<string> {
+    return this.config.resolveImage ? await this.config.resolveImage() : this.config.image;
+  }
+
   async start(dispatch: ContainerDispatch): Promise<RunningContainer> {
     // A per-dispatch-unique name (issue #259): successive review/fix phases and retry attempts of
     // the same branch each get their own name, so a still-removing `--rm` container from the prior
     // phase can never Conflict with this `docker run --name`. The kill handle below closes over THIS
     // concrete name (never recomputed from the branch), so abort/wall-clock reaps the right one.
     const name = uniqueContainerName(dispatch.assignment.branch);
-    // Resolve the image per dispatch (issue #190 completion): the injected `resolveImage` ENSURES
-    // the content-keyed per-target image (build-on-cache-miss, ADR-0038) and returns its exact tag;
-    // a static `image` (RALPH_AGENT_IMAGE pin) is run as-is. Either way the tag run == the tag built.
-    const image = this.config.resolveImage ? await this.config.resolveImage() : this.config.image;
+    // Resolve the image per dispatch (issue #190 completion): the tag run == the tag built. Same
+    // resolution the pre-dispatch capability probe reads (via {@link resolveImage}), so the image
+    // inspected for compatibility is exactly the image launched here.
+    const image = await this.resolveImage();
     const child = this.spawnFn(buildDockerRunArgs({ ...this.config, image }, dispatch, name));
     if (!child.stdout || !child.stdin) {
       throw new Error("docker child process is missing its stdio pipes");

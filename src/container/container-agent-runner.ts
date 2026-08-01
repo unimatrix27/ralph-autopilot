@@ -161,7 +161,12 @@ export class ContainerAgentRunner implements AgentRunner {
     // instead of a generic no-result cascade.
     const escalationMode = this.deps.escalationMode ?? "human";
     if (escalationMode === "master") {
-      await assertRunnerSupports(this.deps.capabilities, this.deps.config.targetRepo, [
+      // Assert against the image `docker run` will actually launch — the resolved content-keyed
+      // tag (or the operator-pinned image), NOT `config.targetRepo`. The repo slug is a GitHub
+      // `owner/repo`, never a local image, so `docker image inspect`-ing it always finds nothing
+      // and would refuse EVERY dispatch even on a correctly-built image (#45). `docker.resolveImage`
+      // is the same resolution `docker.start` runs, so the gate checks exactly what dispatches.
+      await assertRunnerSupports(this.deps.capabilities, await this.deps.docker.resolveImage(), [
         "master-escalation",
       ]);
     }

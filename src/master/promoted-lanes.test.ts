@@ -198,6 +198,53 @@ describe("a promoted complexity:1 issue carries tier 1 through every lane (ADR-0
     expect(recorded[0]!.profile).toEqual({ effort: "max", wallClockSeconds: 10800 });
   });
 
+  it("MASTER probes the RESOLVED runner image, not the repo slug (#45)", async () => {
+    const recorded: Assignment[] = [];
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    store.upsertRun({ issueNumber: 42, mode: "tdd" });
+    // The image a real `docker run` would launch — a per-target tag, distinct from `acme/widgets`.
+    const resolvedImage = "ralph/agent/acme-widgets:cachekey";
+    const docker = new FakeDocker(
+      (transport, dispatch) => {
+        recorded.push(dispatch.assignment);
+        transport.close();
+      },
+      undefined,
+      resolvedImage,
+    );
+    const probed: string[] = [];
+    const runner = new ContainerMasterAgentRunner({
+      docker,
+      store,
+      config: config(), // config().targetRepo === "acme/widgets"
+      baseBranch: "main",
+      routing,
+      capabilities: {
+        capabilities: async (image) => {
+          probed.push(image);
+          return image === resolvedImage ? ["impl", "master-escalation"] : [];
+        },
+      },
+    });
+
+    await runner.run({
+      context: {} as never,
+      prompt: "adjudicate",
+      systemAppend: "sys",
+      route: { provider: "claude", model: "claude-fable-5", account: claudeAccount },
+      branch: "ralph/42-x",
+      worktreePath: "/w",
+      runId: 1,
+      issue: issueAt(LABEL_COMPLEXITY_1),
+      logger: silent,
+    });
+
+    // The gate inspected the resolved image; probing the repo slug would return [] and refuse EVERY
+    // master dispatch even on a correctly-built image (the #45 bug). The dispatch landing proves it passed.
+    expect(probed).toEqual([resolvedImage]);
+    expect(recorded[0]!.kind).toBe("master");
+  });
+
   it("an UNPROMOTED complexity:2 issue keeps the uniform review route and the global budget", async () => {
     const recorded: Assignment[] = [];
     const store = openStore(MEMORY_DB).forRepo("acme/widgets");

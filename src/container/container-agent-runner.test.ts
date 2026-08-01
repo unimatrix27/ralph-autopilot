@@ -785,14 +785,8 @@ describe("container dispatch under master escalation (ADR-0041)", () => {
     const store = openStore(MEMORY_DB).forRepo("acme/widgets");
     store.upsertRun({ issueNumber: 185, mode: "tdd" });
     const docker = dockerRunning(session(false));
-    let dispatched = false;
     const runner = new ContainerAgentRunner({
-      docker: {
-        run: (...args: Parameters<typeof docker.run>) => {
-          dispatched = true;
-          return docker.run(...args);
-        },
-      } as typeof docker,
+      docker,
       store,
       config: config(),
       baseBranch: "main",
@@ -810,8 +804,56 @@ describe("container dispatch under master escalation (ADR-0041)", () => {
         runId: 1,
       }),
     ).rejects.toThrow(/master-escalation/);
-    // The refusal happened BEFORE anything ran — no generic no-result cascade.
-    expect(dispatched).toBe(false);
+    // The refusal happened BEFORE anything ran — no container was ever started (no no-result cascade).
+    expect(docker.dispatches).toHaveLength(0);
+  });
+
+  it("probes the RESOLVED runner image, not the repo slug (#45)", async () => {
+    const store = openStore(MEMORY_DB).forRepo("acme/widgets");
+    store.upsertRun({ issueNumber: 185, mode: "tdd" });
+    // The image a real `docker run` would launch — distinct from the `acme/widgets` repo slug.
+    const resolvedImage = "ralph/agent/acme-widgets:cachekey";
+    const escalation = new FakeEscalation({ commentId: 900, prNumber: 42 });
+    const docker = new FakeDocker(
+      (runnerTransport, dispatch) =>
+        void runContainerRunner(
+          { cloner, session: escalatingSession(), transport: runnerTransport, escalation },
+          dispatch,
+        ),
+      undefined,
+      resolvedImage,
+    );
+    const probed: string[] = [];
+    const runner = new ContainerAgentRunner({
+      docker,
+      store,
+      config: config(), // config().targetRepo === "acme/widgets"
+      baseBranch: "main",
+      escalationMode: "master",
+      capabilities: {
+        capabilities: async (image) => {
+          probed.push(image);
+          // Only the genuinely-built image declares the capability; the repo slug never would.
+          return image === resolvedImage ? ["impl", "master-escalation"] : [];
+        },
+      },
+    });
+
+    const result = await runner.run({
+      issue,
+      mode: "tdd",
+      worktreePath: "(unused)",
+      branch: "ralph/185-impl",
+      logger: silent,
+      runId: 1,
+      onEscalate: async () => {},
+    });
+
+    // The gate passed BECAUSE it inspected the resolved image — probing the repo slug would have
+    // returned [] and refused every dispatch even on a correctly-built image (the #45 bug).
+    expect(probed).toEqual([resolvedImage]);
+    expect(probed).not.toContain("acme/widgets");
+    expect(result.escalated).toBe(true);
   });
 
   it("dispatches with escalationMode when the runner declares the capability", async () => {

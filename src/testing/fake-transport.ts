@@ -48,7 +48,18 @@ export class FakeDocker implements DockerRunner {
     private readonly onStart?: (runner: Transport, dispatch: ContainerDispatch) => void,
     /** The container's post-exit failure detail (issue #220) — surfaced on a synthesized no-result terminal. */
     private readonly failureDetail?: () => string | undefined,
+    /**
+     * The tag {@link resolveImage} reports — the image a real `docker run` would launch (issue #45).
+     * The pre-dispatch capability probe (ADR-0041) inspects THIS, so a test can assert the probe was
+     * asked about the resolved image and not, say, the repo slug. Defaults to a plausible per-target tag.
+     */
+    private readonly image: string = "ralph/agent/acme-widgets:test",
   ) {}
+
+  /** The image a `docker run` would launch — what the capability probe inspects (issue #45). */
+  async resolveImage(): Promise<string> {
+    return this.image;
+  }
 
   async start(dispatch: ContainerDispatch): Promise<RunningContainer> {
     this.dispatches.push(dispatch);
