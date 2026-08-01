@@ -170,8 +170,13 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
         break;
       case "MasterResolutionSelected": {
         const attempt = num(data, "attempt");
+        // Match on (attempt, phase), mirroring `MasterInterventionStarted`: attempt numbers are
+        // per-phase, so an impl and a review intervention in ONE run span both carry attempt 1.
+        // Folding by attempt alone would map this resolution over the OTHER phase's same-numbered
+        // record too, corrupting the loop budget's per-signature `forbiddenResolutions`.
+        const phase = str(data, "phase");
         history.interventions = history.interventions.map((i) =>
-          i.attempt === attempt
+          i.attempt === attempt && i.phase === phase
             ? {
                 ...i,
                 resolution: str(data, "resolution") as MasterResolution,
@@ -179,19 +184,23 @@ export function foldMasterHistory(events: readonly RecordedStreamEvent[]): Maste
               }
             : i,
         );
-        if (history.inProgress?.attempt === attempt) {
-          history.inProgress = history.interventions.find((i) => i.attempt === attempt) ?? null;
+        if (history.inProgress?.attempt === attempt && history.inProgress?.phase === phase) {
+          history.inProgress = history.interventions.find((i) => i.attempt === attempt && i.phase === phase) ?? null;
         }
         break;
       }
       case "MasterInterventionCompleted": {
         const attempt = num(data, "attempt");
+        // Same (attempt, phase) match as the resolution handler above: closing an attempt span by
+        // attempt alone would also clear the other phase's same-numbered record's `inProgress`
+        // guard and overwrite its resolution.
+        const phase = str(data, "phase");
         history.interventions = history.interventions.map((i) =>
-          i.attempt === attempt
+          i.attempt === attempt && i.phase === phase
             ? { ...i, completed: true, resolution: (str(data, "resolution") as MasterResolution) || i.resolution }
             : i,
         );
-        if (history.inProgress?.attempt === attempt) {
+        if (history.inProgress?.attempt === attempt && history.inProgress?.phase === phase) {
           history.inProgress = null;
         }
         break;

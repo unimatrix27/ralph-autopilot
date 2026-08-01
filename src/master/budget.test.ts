@@ -66,6 +66,35 @@ describe("master loop budget (ADR-0041)", () => {
     expect(evaluateMasterBudget({ history, phase: "merge", signature: "x" })).toMatchObject({ spent: 0 });
   });
 
+  it("a review resolution never overwrites the impl attempt's record (cross-phase collision, #45)", () => {
+    // ONE run span with an impl attempt-1 AND a review-1 attempt-1 (attempts are per-phase, so both
+    // are numbered 1) on the SAME signature, each choosing a DIFFERENT autonomous recovery. Folding
+    // by attempt alone would map review-1's resolution over the impl record too — corrupting which
+    // recovery impl is forbidden from repeating (the exact loop the budget exists to prevent).
+    const history = foldMasterHistory([
+      started(),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 1, phase: "impl", signature: "s1" }),
+      ev("MasterResolutionSelected", { runId: "r1", attempt: 1, phase: "impl", resolution: "redispatch-tier-1", rationale: "why" }),
+      ev("MasterInterventionCompleted", { runId: "r1", attempt: 1, phase: "impl", resolution: "redispatch-tier-1" }),
+      ev("MasterInterventionStarted", { runId: "r1", attempt: 1, phase: "review-1", signature: "s1" }),
+      ev("MasterResolutionSelected", { runId: "r1", attempt: 1, phase: "review-1", resolution: "retry-pipeline", rationale: "why" }),
+      ev("MasterInterventionCompleted", { runId: "r1", attempt: 1, phase: "review-1", resolution: "retry-pipeline" }),
+    ]);
+
+    // A second impl escalation on signature s1 must be forbidden from impl's actually-spent recovery
+    // (redispatch-tier-1), NOT the review phase's (retry-pipeline). Under the bug the review event
+    // overwrote the impl record, forbidding the wrong resolution and re-permitting the spent one.
+    const implVerdict = evaluateMasterBudget({ history, phase: "impl", signature: "s1" });
+    expect(implVerdict).toMatchObject({ allowed: true, repeatedSignature: true });
+    expect(implVerdict.allowed && implVerdict.forbiddenResolutions).toEqual(["redispatch-tier-1"]);
+    expect(resolutionAllowed(implVerdict, "redispatch-tier-1")).toBe(false);
+    expect(resolutionAllowed(implVerdict, "retry-pipeline")).toBe(true);
+
+    // And the review phase keeps its own resolution, uncorrupted by the impl record.
+    const reviewVerdict = evaluateMasterBudget({ history, phase: "review-1", signature: "s1" });
+    expect(reviewVerdict.allowed && reviewVerdict.forbiddenResolutions).toEqual(["retry-pipeline"]);
+  });
+
   it("forbids repeating the same resolution for a repeated signature", () => {
     const history = foldMasterHistory([started(), requested("s1"), ...intervention(1, "s1", "redispatch-tier-1")]);
     const verdict = evaluateMasterBudget({ history, phase: "impl", signature: "s1" });
