@@ -97,6 +97,16 @@ One daemon works a **set** of target repos
 The daemon **auto-clones** a target on startup if its clone dir is absent (via
 `gh repo clone`), so adding a target to the config and restarting is enough.
 
+**Do not work in a target clone.** It is the daemon's worktree source *and* the build
+context for that target's content-keyed agent image, so the daemon keeps its base checkout
+current by **fast-forwarding it onto `origin/<base>`** — once at startup and again before
+every image resolve ([ADR-0038](adr/0038-fresh-per-target-agent-containers.md), issue #50).
+It will never push, commit, reset or force there, and it refuses to touch a clone that is
+dirty, on another branch, or diverged: instead it logs a `daemon.target-clone-anomaly`
+(`target-clone-dirty` / `-off-base` / `-diverged` / `-ff-refused`) naming the exact command
+to run, and the dispatches needing that image fail loud rather than building from a stale
+tree. If you want a scratch checkout of a target, clone it somewhere else.
+
 **Peak concurrency** is `cap` build agents **+ up to one merge per repo** — the merge
 lease is free per-repo concurrency, not counted against the build cap (DESIGN §5). When
 sizing your Claude plan budget, account for that small, bounded overage.

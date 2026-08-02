@@ -166,6 +166,19 @@ A per-issue git worktree (`ralph/<n>-<slug>` branch) that isolates one agent's
 working tree from the others while sharing one clone's object store. One agent,
 one worktree.
 
+**Target clone**:
+The one long-lived checkout per target (`paths.targetClone`) that every [[worktree]]
+forks from *and* that is the `docker build` context for the target's content-keyed
+agent image. Because worktrees fork `origin/<base>` and the clone's own checkout is
+advanced by nothing, it drifts — so the daemon **refreshes** it (fetch +
+`merge --ff-only` onto the base branch) before any content-keyed read, under a gate
+shared with worktree preparation. Fast-forward only: a dirty, off-base or diverged
+clone is refused untouched and surfaced as a host-scoped `target-clone-*` anomaly in
+the anomaly log/journal, and the dispatch fails rather than building from a stale
+tree. The daemon never pushes, commits or resets here (ADR-0038, issue #50).
+_Avoid_: "the daemon's checkout" (that is the *daemon's own* repo, which self-update
+owns), "syncing the target" (that reads as writing *to* the target repo).
+
 **Escalate**:
 The custom tool a **worker** agent calls when it needs a decision it cannot make.
 Asynchronous: it checkpoints the agent's work, hands the decision **up to the

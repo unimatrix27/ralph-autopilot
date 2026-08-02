@@ -13,6 +13,7 @@ import { execFileSync } from "node:child_process";
 import { GhCliClient } from "../github/gh-cli";
 import type { GitHubClient } from "../github/types";
 import { detectDefaultBranch, GitWorktreeManager } from "../executor/worktree";
+import { TargetCloneSynchronizer, type CloneSyncAnomalyReport } from "../executor/clone-sync";
 import { type AgentRunner } from "../executor/agent";
 import { ContainerAgentRunner } from "../container/container-agent-runner";
 import { ContainerFixAgentRunner, ContainerReviewAgentRunner } from "../container/container-review-fix-runner";
@@ -49,6 +50,7 @@ import type { Account, RalphConfig, TargetConfig } from "../config/schema";
 import { expandHome, groupAccountsByProvider, resolveAccountPool, resolveTargets } from "../config/load";
 import { RoutingStore } from "../config/routing-store";
 import type { Store } from "../store/store";
+import type { RunLogInput } from "../store/types";
 import { Reconciler, type ReconcileBudget } from "./reconciler";
 import { Orchestrator, type DaemonRunOutcome } from "./orchestrator";
 import { GitUpdateChecker } from "./self-update";
@@ -117,6 +119,55 @@ function ensureTargetClone(repo: string, cloneDir: string, logger: Logger): void
   }
 }
 
+/** The append-only run-log surface the clone-anomaly sink writes its journal row through. */
+export interface CloneAnomalyJournal {
+  appendLog(input: Omit<RunLogInput, "repo">): unknown;
+}
+
+/**
+ * Where a target-clone refusal is surfaced (issue #50).
+ *
+ * A clone anomaly is **host-scoped**: it has no issue behind it, no run to adjudicate, and no
+ * master could repair it even in principle — the daemon deliberately refuses to write to a target
+ * repo, so only a human can clear a dirty/diverged clone. It therefore takes the route
+ * `completeness.ts` already reserves for exactly this class ("host-wide … anomalies never reach
+ * this classifier at all — they have no issue scope and live in the anomaly log/journal"): a
+ * structured error line plus a repo-scoped, **issue-less** `daemon-anomaly` row.
+ *
+ * The row carries the operator action alongside the reason, because `daemon-anomaly` must name
+ * what a human should DO (issue #43) and — with no issue to comment on — this row is the only
+ * place that text can live.
+ */
+export function buildCloneAnomalySink(
+  targetRepo: string,
+  logger: Logger,
+  journal: CloneAnomalyJournal,
+): (report: CloneSyncAnomalyReport) => void {
+  return (report) => {
+    logger.error("daemon.target-clone-anomaly", {
+      repo: targetRepo,
+      reason: report.reason,
+      cloneDir: report.cloneDir,
+      baseBranch: report.baseBranch,
+      detail: report.detail,
+      action: report.action,
+    });
+    journal.appendLog({
+      runId: null,
+      issueNumber: null,
+      level: "error",
+      event: "daemon-anomaly",
+      data: {
+        reason: report.reason,
+        cloneDir: report.cloneDir,
+        baseBranch: report.baseBranch,
+        detail: report.detail,
+        action: report.action,
+      },
+    });
+  };
+}
+
 /** The pool's claude slice, narrowed to the claude account shape (the OAuth meter's source). */
 function claudeAccountsOf(pool: Account[]): Extract<Account, { provider: "claude" }>[] {
   return pool.filter((a): a is Extract<Account, { provider: "claude" }> => a.provider === "claude");
@@ -181,6 +232,15 @@ export interface AssembledDaemon {
    * here so the daemon and the web edge share one overlay (an edit is reflected on the next dispatch).
    */
   routingStore: RoutingStore;
+  /**
+   * Fast-forward every target's base checkout onto its base branch (issue #50). Awaited once by
+   * {@link runDaemon} before the first tick, so a daemon that just restarted onto a new commit
+   * converges on the same contract a steady-state dispatch would — the restart and dispatch paths
+   * run the SAME refresh, they only differ in when. Never throws: a refused clone is already
+   * surfaced through the anomaly log/journal, and the dispatch that needs it fails loud on its
+   * own rather than taking the whole daemon (and every other target) down with it.
+   */
+  refreshTargetClones: () => Promise<void>;
 }
 
 /**
@@ -350,12 +410,16 @@ export function buildUsageRouting(
  * build-on-cache-miss from the target clone's `.ralph/agent.Dockerfile`, keyed on the contract's
  * `depManifests` — and runs exactly that tag (`{@link targetImageRef}`), so the tag the daemon
  * runs is the tag it built (no run/build-tag drift) and a manifest change rebuilds the deps layer.
+ * That resolve now runs inside `cloneSync.withSyncedClone` (issue #50), which fast-forwards the
+ * clone onto its base branch first and holds it for the whole read+build — otherwise the resolver
+ * keys on a checkout nothing ever advances and a merged base-pin bump never reaches a dispatch.
  */
 function containerDockerConfig(
   target: TargetConfig,
   logger: Logger,
   configPath: string | undefined,
   alwaysForwardEnv: string[],
+  cloneSync: TargetCloneSynchronizer,
 ): DockerRunnerConfig {
   const credentials: ContainerCredentialMounts = {
     claudeConfigDir: process.env.RALPH_CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"),
@@ -383,6 +447,9 @@ function containerDockerConfig(
     contextDir,
     loadContract: () => loadAgentContract(join(contextDir, DEFAULT_AGENT_CONTRACT_PATH)),
     sources: fsManifestSources(contextDir),
+    // Refresh the clone onto its base branch before reading the contract/manifests, and hold it
+    // for the whole resolve (issue #50) — coalesced with worktree preparation on the shared gate.
+    withSyncedClone: (read) => cloneSync.withSyncedClone(read),
     builder: new DockerCliImageBuilder(),
     onEnsured: (ensured) =>
       logger.info("daemon.container-image", {
@@ -407,6 +474,9 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
   // lease is free per-repo concurrency (ADR-0017), so it is NOT counted here. Closes
   // over the `reconcilers` array, fully populated below before any tick runs.
   const reconcilers: Reconciler[] = [];
+  // One clone synchronizer per target (issue #50), collected so the process entry can refresh
+  // every base checkout ONCE at startup — before the first tick — as well as per dispatch.
+  const cloneSyncs: Array<{ targetRepo: string; sync: TargetCloneSynchronizer }> = [];
   const globalBuild = (): number => reconcilers.reduce((n, r) => n + r.inFlightCount(), 0);
   const budget: ReconcileBudget = {
     available: () => Math.max(0, cap - globalBuild()),
@@ -468,8 +538,31 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
     const github = deps.githubFor ? deps.githubFor(target) : new GhCliClient(target.targetRepo, { logger });
     const scopedStore = store.forRepo(target.targetRepo);
     const baseBranch = detectDefaultBranch(target.paths.targetClone);
+    // The clone's base-checkout refresh (issue #50). The clone is BOTH the worktree source and
+    // the agent image's `docker build` context, but only the former is ever brought current —
+    // worktrees fork `origin/<base>` after a fetch while the clone's own checkout drifts. This
+    // fast-forwards it (fast-forward-only; a dirty/off-base/diverged clone is refused and
+    // surfaced) before any content-keyed resolve reads it. The gate it owns is shared with the
+    // worktree manager below, so the refresh and `worktree add` are one serialized path.
+    const cloneSync = new TargetCloneSynchronizer({
+      cloneDir: target.paths.targetClone,
+      baseBranch,
+      onSynced: (result) => {
+        if (result.kind === "fast-forward") {
+          logger.info("daemon.target-clone-synced", {
+            repo: target.targetRepo,
+            baseBranch,
+            from: result.previousHead,
+            to: result.head,
+          });
+        }
+      },
+      onAnomaly: buildCloneAnomalySink(target.targetRepo, logger, scopedStore),
+    });
+    cloneSyncs.push({ targetRepo: target.targetRepo, sync: cloneSync });
     const worktrees = new GitWorktreeManager(target.paths.targetClone, target.paths.worktreeRoot, {
       baseBranch,
+      gate: cloneSync.gate,
     });
     // Distinguishability (issue #149): log each agent type's most-preferred configured route
     // (the preference-list head) so a GLM/Codex session is identifiable in the structured log,
@@ -514,7 +607,9 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
     // container. `routing` reads the runtime overlay (ADR-0037 P4.1) live, so a web routing edit is
     // reflected on the next dispatch with no daemon restart; an in-flight container is unaffected.
     const routing: RoutingSource = routingStore.routingSourceFor(target.targetRepo);
-    const docker = new DockerCliRunner(containerDockerConfig(target, logger, deps.configPath, zaiKeyEnvNames));
+    const docker = new DockerCliRunner(
+      containerDockerConfig(target, logger, deps.configPath, zaiKeyEnvNames, cloneSync),
+    );
     // The runner-capability probe (ADR-0041): reads the target agent image's
     // `io.ralph.runner-capabilities` label so a stale image fails PRE-dispatch, by name.
     const capabilities = createDockerCapabilityProbe((args) => docker.inspect(args));
@@ -708,6 +803,15 @@ export function createOrchestrator(deps: DaemonDeps): AssembledDaemon {
     usageMeter,
     targets,
     routingStore,
+    refreshTargetClones: async () => {
+      for (const { targetRepo, sync } of cloneSyncs) {
+        // A refusal has already been surfaced by `onAnomaly`; anything else is a raw git failure
+        // (no network, no remote) that the next dispatch will hit and report against its own run.
+        await sync.sync().catch((err) => {
+          logger.error("daemon.target-clone-refresh-failed", { repo: targetRepo, error: String(err) });
+        });
+      }
+    },
   };
 }
 
@@ -846,7 +950,10 @@ export function startNotificationSink(deps: {
 export async function runDaemon(deps: DaemonDeps, shutdown: ShutdownSignals): Promise<DaemonRunOutcome> {
   // Thread the graceful-drain signal into the orchestrator's executors so a drain-killed
   // Codex session is left resumable, not terminalized to agent-stuck (issue #131).
-  const { orchestrator, usageMeter, targets, routingStore } = createOrchestrator({ ...deps, drain: shutdown.drain });
+  const { orchestrator, usageMeter, targets, routingStore, refreshTargetClones } = createOrchestrator({
+    ...deps,
+    drain: shutdown.drain,
+  });
   const intervalMs = deps.config.scheduler.reconcileIntervalSeconds * 1000;
   const drainTimeoutMs = deps.config.scheduler.drainTimeoutSeconds * 1000;
   deps.logger.info("daemon.start", {
@@ -898,6 +1005,11 @@ export async function runDaemon(deps: DaemonDeps, shutdown: ShutdownSignals): Pr
   let notify: NotificationSinkHandle | null = null;
 
   try {
+    // Bring every target's base checkout current before the first tick (issue #50). The daemon
+    // typically restarts BECAUSE something merged (self-update, ADR-0018), so the very first
+    // dispatch after a restart is the one most likely to read a stale clone. Each dispatch
+    // refreshes again anyway — this only moves the convergence earlier, it is not a second path.
+    await refreshTargetClones();
     await orchestrator.startup();
     notify = startNotificationSink({
       config: deps.config,

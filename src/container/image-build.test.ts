@@ -7,12 +7,15 @@ import {
   resolveImageBuildInput,
   targetImageRef,
   type EnsuredImage,
+  type ImageBuilderDeps,
   type ManifestSources,
   type TargetImageBuildInput,
 } from "./image-build";
 import type { AgentContract } from "./agent-contract";
 import { buildDockerRunArgs } from "./docker-runner";
 import type { ContainerDispatch } from "./assignment";
+import { TargetCloneAnomalyError, TargetCloneSynchronizer } from "../executor/clone-sync";
+import { FakeTargetClone } from "../testing/fake-clone";
 
 const contract: AgentContract = {
   build: "dotnet build",
@@ -260,6 +263,159 @@ describe("createTargetImageResolver — per-dispatch ensure→run-tag wiring (is
     const second = await resolve();
 
     expect(second).not.toBe(first); // a manifest change keys a new, absent tag → a rebuild
+  });
+});
+
+describe("createTargetImageResolver over a stale target clone (issue #50)", () => {
+  const BASE = "master";
+  const cloneContract: AgentContract = {
+    build: "npm run build",
+    test: "npm test",
+    restore: "npm ci",
+    depManifests: ["package-lock.json"],
+    baseBranch: BASE,
+  };
+  const treeAt = (baseTag: string, lock: string): Record<string, string> => ({
+    ".ralph/agent.Dockerfile": `FROM ralph/agent-base:${baseTag}\nRUN install-node\n`,
+    "package-lock.json": lock,
+  });
+
+  /** A clone checked out 282 commits behind origin, exactly like the observed regression. */
+  function staleClone(): FakeTargetClone {
+    return new FakeTargetClone({
+      baseBranch: BASE,
+      history: [
+        { sha: "old", files: treeAt("0.0.6", "{\"v\":1}") },
+        { sha: "bumped", files: treeAt("0.0.7", "{\"v\":1}") },
+      ],
+      checkedOutAt: "old",
+      fetchedAt: "old",
+    });
+  }
+
+  function resolverFor(
+    fake: FakeTargetClone,
+    builder: ImageBuilderDeps,
+    sync: TargetCloneSynchronizer,
+  ): () => Promise<string> {
+    return createTargetImageResolver({
+      targetRepo: "acme/pancake",
+      contextDir: "/srv/clone",
+      loadContract: () => cloneContract,
+      sources: fake.sources(),
+      builder,
+      withSyncedClone: (read) => sync.withSyncedClone(read),
+    });
+  }
+
+  const alwaysBuild: ImageBuilderDeps = { imageExists: async () => false, dockerBuild: async () => {} };
+
+  function syncFor(fake: FakeTargetClone): TargetCloneSynchronizer {
+    return new TargetCloneSynchronizer({ cloneDir: "/srv/clone", baseBranch: BASE, git: fake.git });
+  }
+
+  it("a remote base-pin bump re-keys the image with no operator touching the clone (AC4)", async () => {
+    const fake = staleClone();
+    const staleKey = computeDepsCacheKey({
+      targetRepo: "acme/pancake",
+      contract: cloneContract,
+      dockerfile: ".ralph/agent.Dockerfile",
+      contextDir: "/srv/clone",
+      dockerfileContents: fake.filesAt("old")[".ralph/agent.Dockerfile"]!,
+      manifestContents: [`package-lock.json\0${fake.filesAt("old")["package-lock.json"]!}`],
+    });
+    const bumpedKey = computeDepsCacheKey({
+      targetRepo: "acme/pancake",
+      contract: cloneContract,
+      dockerfile: ".ralph/agent.Dockerfile",
+      contextDir: "/srv/clone",
+      dockerfileContents: fake.filesAt("bumped")[".ralph/agent.Dockerfile"]!,
+      manifestContents: [`package-lock.json\0${fake.filesAt("bumped")["package-lock.json"]!}`],
+    });
+    expect(staleKey).not.toBe(bumpedKey);
+
+    const tag = await resolverFor(fake, alwaysBuild, syncFor(fake))();
+
+    // the resolver refreshed the clone itself: the key it selected is the REMOTE contract's
+    expect(tag).toBe(targetImageRef("acme/pancake", bumpedKey));
+    expect(tag).not.toContain(staleKey);
+    expect(fake.head).toBe("bumped");
+  });
+
+  it("restart and steady-state dispatch converge on the same current contract (AC5)", async () => {
+    // Restart path: a cold process syncs the clone at startup, then dispatches.
+    const restart = staleClone();
+    const restartSync = syncFor(restart);
+    await restartSync.sync();
+    const restartTag = await resolverFor(restart, alwaysBuild, restartSync)();
+
+    // Steady-state path: a long-lived daemon whose clone went stale under it dispatches.
+    const steady = staleClone();
+    const steadyResolve = resolverFor(steady, alwaysBuild, syncFor(steady));
+    const first = await steadyResolve();
+    steady.pushToOrigin({ sha: "bumped-again", files: treeAt("0.0.7", "{\"v\":2}") });
+    const second = await steadyResolve();
+
+    expect(restartTag).toBe(first);
+    expect(second).not.toBe(first); // and it keeps converging as origin moves
+    expect(steady.head).toBe("bumped-again");
+  });
+
+  it("refuses to build from a dirty clone — no stale image, no silent fallback (AC2)", async () => {
+    const fake = new FakeTargetClone({
+      baseBranch: BASE,
+      history: [
+        { sha: "old", files: treeAt("0.0.6", "{}") },
+        { sha: "bumped", files: treeAt("0.0.7", "{}") },
+      ],
+      checkedOutAt: "old",
+      fetchedAt: "old",
+      dirtyPaths: [".ralph/agent.Dockerfile"],
+    });
+    const dockerBuild = vi.fn(async () => {});
+    const resolve = resolverFor(fake, { imageExists: async () => false, dockerBuild }, syncFor(fake));
+
+    await expect(resolve()).rejects.toBeInstanceOf(TargetCloneAnomalyError);
+    expect(dockerBuild).not.toHaveBeenCalled();
+    expect(fake.head).toBe("old");
+  });
+
+  it("keeps the base pin in the key — the refresh never floats the base tag (AC6)", async () => {
+    const fake = staleClone();
+    const dockerBuild = vi.fn(async () => {});
+    await resolverFor(fake, { imageExists: async () => false, dockerBuild }, syncFor(fake))();
+
+    // The Dockerfile the build reads is still the target's own, still pinned to an exact version:
+    // the refresh moved the checkout, it did not rewrite the contract.
+    expect(fake.filesAt(fake.head)[".ralph/agent.Dockerfile"]).toBe("FROM ralph/agent-base:0.0.7\nRUN install-node\n");
+    // and no git command mutated the target repo
+    for (const forbidden of ["push", "commit", "add", "tag"]) {
+      expect(fake.calls.some((c) => c[0] === forbidden)).toBe(false);
+    }
+    expect(dockerBuild).toHaveBeenCalledOnce();
+  });
+
+  it("resolves the contract BEFORE any read, so two dispatches never read a torn tree (AC1/AC3)", async () => {
+    const fake = staleClone();
+    const sync = syncFor(fake);
+    const readHeads: string[] = [];
+    const builder: ImageBuilderDeps = {
+      imageExists: async () => {
+        // origin moves mid-resolve; the in-flight resolve must still see the tree it keyed on
+        fake.pushToOrigin({ sha: "later", files: treeAt("0.0.8", "{}") });
+        readHeads.push(fake.head);
+        return false;
+      },
+      dockerBuild: async () => {
+        readHeads.push(fake.head);
+      },
+    };
+    const resolve = resolverFor(fake, builder, sync);
+
+    const [a, b] = await Promise.all([resolve(), resolve()]);
+
+    expect(readHeads).toEqual(["bumped", "bumped", "later", "later"]);
+    expect(a).not.toBe(b); // the second dispatch legitimately picks up the newer contract
   });
 });
 

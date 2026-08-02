@@ -73,6 +73,34 @@ through the same runner substrate.
 - **L3 — code**: a **fresh clone at run start**, never baked. This is the freshness guarantee: the
   filesystem, deps, and toolchain are all clean and pinned for every run.
 
+### The image contract is read from a refreshed clone (issue #50)
+
+L1/L2 are content-keyed on `.ralph/agent.Dockerfile` + the declared `depManifests`, read from the
+target's **long-lived clone** (`paths.targetClone`) — which is also the `docker build` context. That
+clone is *not* self-refreshing: per-issue worktrees fork `origin/<base>` after a fetch and are always
+current, while the clone's own checked-out branch is advanced by nothing. Left alone it drifts
+arbitrarily far behind, so a merged base-pin bump stays invisible and every dispatch keeps selecting
+— and running — the old content key.
+
+So before any content-keyed read, the daemon **fast-forwards the clone's base checkout onto
+`origin/<base>`** (`executor/clone-sync.ts`), and holds it for the whole read + build. Three
+properties keep this from becoming a second way for the daemon to touch a target repo:
+
+- **Fast-forward only, from an allowlist.** The only permitted git commands on the clone are
+  `fetch`, `merge --ff-only`, and four read-only inspections; the allowlist is enforced at the port,
+  not by convention. There is no `push`, `commit`, `reset` or force — **no autonomous target-repo
+  edits**, and no floating base tag: the refresh moves the checkout, never the Dockerfile's pin.
+- **Refuse, never overwrite.** A dirty, off-base, or diverged clone is left exactly as found and
+  surfaced as a precise host-scoped anomaly naming its operator action (`target-clone-dirty`,
+  `-off-base`, `-diverged`, `-ff-refused`) through the anomaly log/journal — the dispatch fails loud
+  rather than building from a knowingly-stale tree (ADR-0008 no-silent-fallback).
+- **One serialized path.** The refresh shares its gate with worktree preparation (`fetch` +
+  `worktree add`), so concurrent dispatches coalesce onto one clone operation at a time instead of
+  racing the same index and refs.
+
+Restart and steady-state dispatch therefore converge on the same contract: both run this refresh,
+differing only in *when* (once before the first tick, and again per dispatch).
+
 ### The thin in-container runner
 
 A new component shipped in `ralph/agent-base`. Per run it:
